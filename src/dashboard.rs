@@ -232,5 +232,4 @@ impl TimeRange {
 }
 
 #[cfg(test)]
-#[path = "dashboard_tests.rs"]
 mod tests;

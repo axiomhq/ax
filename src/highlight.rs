@@ -375,5 +375,4 @@ fn copy_kind(k: &TokenType) -> TokenType {
 }
 
 #[cfg(test)]
-#[path = "highlight_tests.rs"]
 mod tests;

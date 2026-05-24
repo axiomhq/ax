@@ -118,5 +118,4 @@ fn urlencode(s: &str) -> String {
 }
 
 #[cfg(test)]
-#[path = "share_tests.rs"]
 mod tests;

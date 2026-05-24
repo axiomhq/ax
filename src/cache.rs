@@ -486,5 +486,4 @@ fn unix_now() -> i64 {
 }
 
 #[cfg(test)]
-#[path = "cache_tests.rs"]
 mod tests;

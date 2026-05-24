@@ -495,5 +495,4 @@ pub fn draw_legend(
 }
 
 #[cfg(test)]
-#[path = "chart_tests.rs"]
 mod tests;

@@ -81,5 +81,4 @@ fn config_path() -> Result<PathBuf> {
 }
 
 #[cfg(test)]
-#[path = "config_tests.rs"]
 mod tests;

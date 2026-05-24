@@ -5715,5 +5715,4 @@ fn demo_series() -> Vec<Series> {
 }
 
 #[cfg(test)]
-#[path = "app_tests.rs"]
 mod tests;

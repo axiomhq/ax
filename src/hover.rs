@@ -222,5 +222,4 @@ fn is_byte_escaped(bytes: &[u8], at: usize) -> bool {
 }
 
 #[cfg(test)]
-#[path = "hover_tests.rs"]
 mod tests;

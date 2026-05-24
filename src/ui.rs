@@ -2437,5 +2437,4 @@ fn quickfix_popup_width(picker: &crate::app::QuickFixPicker) -> u16 {
 }
 
 #[cfg(test)]
-#[path = "ui_tests.rs"]
 mod tests;

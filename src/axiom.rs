@@ -714,5 +714,4 @@ fn snippet(s: &str, max: usize) -> String {
 }
 
 #[cfg(test)]
-#[path = "axiom_tests.rs"]
 mod tests;

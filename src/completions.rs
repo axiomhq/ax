@@ -511,5 +511,4 @@ fn escape_string_inner(s: &str) -> String {
 }
 
 #[cfg(test)]
-#[path = "completions_tests.rs"]
 mod tests;

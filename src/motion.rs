@@ -529,5 +529,4 @@ fn is_escaped(bytes: &[u8], at: usize) -> bool {
 }
 
 #[cfg(test)]
-#[path = "motion_tests.rs"]
 mod tests;

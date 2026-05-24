@@ -561,5 +561,4 @@ fn parse_text_object(key: KeyEvent, around: bool) -> Option<TextObject> {
 }
 
 #[cfg(test)]
-#[path = "command_tests.rs"]
 mod tests;

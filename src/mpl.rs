@@ -472,5 +472,4 @@ pub fn byte_offset_to_line_col(text: &str, byte_offset: usize) -> (usize, usize)
 }
 
 #[cfg(test)]
-#[path = "mpl_tests.rs"]
 mod tests;

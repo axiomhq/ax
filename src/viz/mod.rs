@@ -147,5 +147,4 @@ fn draw_monitor_list(
 }
 
 #[cfg(test)]
-#[path = "tests.rs"]
 mod tests;

@@ -269,5 +269,4 @@ fn char_to_byte(s: &str, char_idx: usize) -> usize {
 }
 
 #[cfg(test)]
-#[path = "cmdline_complete_tests.rs"]
 mod tests;
