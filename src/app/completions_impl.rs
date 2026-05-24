@@ -203,20 +203,27 @@ impl App {
             self.quickfix.hide();
             return;
         };
-        let query = self.query_text();
-        let start_byte = action.byte_offset;
-        let end_byte = action.byte_offset + action.byte_length;
-        let (row, start_char) = byte_offset_to_row_col(&query, start_byte);
-        let (_, end_char) = byte_offset_to_row_col(&query, end_byte);
-        let replace_chars = end_char.saturating_sub(start_char);
-
-        self.editor
-            .move_cursor(CursorMove::Jump(row as u16, start_char as u16));
-        self.editor.delete_str(replace_chars);
-        self.editor.insert_str(&action.insert);
+        self.splice_editor_range(
+            (action.byte_offset, action.byte_offset + action.byte_length),
+            &action.insert,
+        );
         self.status = format!("applied: {}", action.name);
         self.quickfix.hide();
         self.recompute_diagnostics();
+    }
+
+    /// Replace the editor's text in the byte range `[start, end)` with
+    /// `insert`, leaving the cursor at the end of the inserted text.
+    /// Shared by quickfix and completion accepts.
+    fn splice_editor_range(&mut self, range: (usize, usize), insert: &str) {
+        let query = self.query_text();
+        let (row, start_char) = byte_offset_to_row_col(&query, range.0);
+        let (_, end_char) = byte_offset_to_row_col(&query, range.1);
+        let replace_chars = end_char.saturating_sub(start_char);
+        self.editor
+            .move_cursor(CursorMove::Jump(row as u16, start_char as u16));
+        self.editor.delete_str(replace_chars);
+        self.editor.insert_str(insert);
     }
 
     pub(super) fn move_completion_selection(&mut self, delta: isize) {
@@ -244,16 +251,7 @@ impl App {
             self.completions.hide();
             return;
         };
-        let (start_byte, end_byte) = self.completions.replace_range_bytes;
-        let query = self.query_text();
-        let (row, start_char) = byte_offset_to_row_col(&query, start_byte);
-        let (_, end_char) = byte_offset_to_row_col(&query, end_byte);
-        let replace_chars = end_char.saturating_sub(start_char);
-
-        self.editor
-            .move_cursor(CursorMove::Jump(row as u16, start_char as u16));
-        self.editor.delete_str(replace_chars);
-        self.editor.insert_str(&item.apply);
+        self.splice_editor_range(self.completions.replace_range_bytes, &item.apply);
         self.completions.hide();
         self.recompute_diagnostics();
 

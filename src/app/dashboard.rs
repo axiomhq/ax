@@ -171,35 +171,23 @@ impl App {
         self.viz_kind = kind;
         self.viz_opts.clear();
         let pragma_line = format!("// @viz {}\n", kind.as_str());
-        match &query {
-            Query::Mpl(mpl) => {
-                let text = format!("{pragma_line}{mpl}");
-                self.editor = editor::editor_with_text(&text);
-                self.recompute_diagnostics();
-                // Pin the editor-side query context to the tile's
-                // (dataset, metric) so the upcoming legend-tag
-                // reload finds the right per-metric cache slot
-                // (and any toggle persists under the tile's keys).
-                // We don't know the AST hash without running the
-                // pipeline; pass empty so `resolve_legend_tags`
-                // falls through to the by-metric store.
-                if let Ok((ds, m)) = crate::mpl::extract_dataset_metric(mpl) {
-                    self.last_query_context = Some(QueryContext {
-                        hash: String::new(),
-                        dataset: ds,
-                        metric: m,
-                    });
-                }
-            }
-            Query::Apl(apl) => {
-                let text = format!(
-                    "{pragma_line}// APL query — execution lands in step 14b\n// {apl}\n",
-                    apl = apl.replace('\n', "\n// ")
-                );
-                self.editor = editor::editor_with_text(&text);
-                self.recompute_diagnostics();
-            }
-            Query::Empty => {}
+        if let Some(text) = Self::build_query_seed(&pragma_line, &query) {
+            self.editor = editor::editor_with_text(&text);
+            self.recompute_diagnostics();
+        }
+        // For MPL tiles, pin the editor-side query context to the
+        // tile's (dataset, metric) so the upcoming legend-tag reload
+        // finds the right per-metric cache slot. We don't know the
+        // AST hash without running the pipeline, so pass empty —
+        // `resolve_legend_tags` falls through to the by-metric store.
+        if let Query::Mpl(mpl) = &query
+            && let Ok((ds, m)) = crate::mpl::extract_dataset_metric(mpl)
+        {
+            self.last_query_context = Some(QueryContext {
+                hash: String::new(),
+                dataset: ds,
+                metric: m,
+            });
         }
         // Adopt the tile's last-known series into the Solo-view
         // `app.series` so the chart pane shows the real data
@@ -260,32 +248,19 @@ impl App {
         self.loaded_dashboard = Some(resource);
 
         let pragma_line = format!("// @viz {}\n", focused_kind.as_str());
-        let mut seeded: Option<String> = None;
-        match &focused_query {
-            Query::Mpl(mpl) => {
-                let text = format!("{pragma_line}{mpl}");
-                self.editor = editor::editor_with_text(&text);
-                self.recompute_diagnostics();
-                seeded = Some(text);
-            }
-            Query::Apl(apl) => {
-                let text = format!(
-                    "{pragma_line}// APL query — execution lands in step 14b\n// {apl}\n",
-                    apl = apl.replace('\n', "\n// ")
-                );
-                self.editor = editor::editor_with_text(&text);
-                self.recompute_diagnostics();
-                seeded = Some(text);
-            }
-            Query::Empty => {
-                // Leave the editor alone; tile renderer surfaces the
-                // note body / placeholder directly.
-            }
+        // Query::Empty leaves the editor alone — the tile renderer
+        // surfaces the note body / placeholder directly.
+        if let Some(text) = Self::build_query_seed(&pragma_line, &focused_query) {
+            self.editor = editor::editor_with_text(&text);
+            self.recompute_diagnostics();
         }
-        // Capture the seed *after* `recompute_diagnostics` so it
-        // matches what `query_text()` will return for an untouched
-        // buffer (line endings normalised by the editor).
-        self.last_adopted_seed = seeded.map(|_| self.query_text());
+        // Capture the seed *after* `recompute_diagnostics` so it matches
+        // what `query_text()` returns for an untouched buffer (line
+        // endings normalised by the editor).
+        self.last_adopted_seed = match &focused_query {
+            Query::Empty => None,
+            _ => Some(self.query_text()),
+        };
         self.auto_switch_view_mode();
         // Adopted; pick up the initially focused tile's saved tags
         // (if any) so the legend renders the right labels from frame
@@ -308,6 +283,23 @@ impl App {
     /// surface alongside MPL diagnostics in the status bar and pane chrome.
     /// On error we keep the previous kind/opts so the chart doesn't
     /// flicker between renders while the user is mid-edit.
+    /// Build the editor seed for `query` using the supplied `// @viz`
+    /// pragma line. Returns `None` for `Query::Empty` (caller leaves
+    /// the editor untouched). APL queries get a `// APL query —
+    /// execution lands in step 14b` banner so the MPL parser doesn't
+    /// flag every line.
+    pub(super) fn build_query_seed(pragma_line: &str, query: &crate::dashboard::Query) -> Option<String> {
+        use crate::dashboard::Query;
+        match query {
+            Query::Mpl(mpl) => Some(format!("{pragma_line}{mpl}")),
+            Query::Apl(apl) => Some(format!(
+                "{pragma_line}// APL query — execution lands in step 14b\n// {}\n",
+                apl.replace('\n', "\n// ")
+            )),
+            Query::Empty => None,
+        }
+    }
+
     pub(super) fn sync_dashboard_from_buffer(&mut self, text: &str) {
         match viz::parse_pragma(text) {
             Ok(Some(spec)) => {
