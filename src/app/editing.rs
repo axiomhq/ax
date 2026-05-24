@@ -43,7 +43,6 @@ impl App {
                 }
             }
             Command::Help => self.open_help(),
-            Command::Quit => self.cmd_quit(false),
             Command::FetchDatasets => self.fetch_datasets(),
             Command::FetchMetrics => self.fetch_metrics_for_current_query(),
             // Esc in Editor Normal mode: dismiss the error overlay if

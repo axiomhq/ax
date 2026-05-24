@@ -33,22 +33,22 @@ fn starts_in_normal_mode() {
 }
 
 #[test]
-fn q_quits_in_normal_but_not_in_insert() {
+fn bare_q_does_not_quit_anywhere() {
+    // After the unification pass, `:q` is the only quit path; bare `q`
+    // is a no-op in Normal mode and an insert in Insert mode.
     let mut app = test_app();
     app.on_key(key(KeyCode::Char('i')));
     app.on_key(key(KeyCode::Char('q')));
-    assert!(
-        !app.should_quit,
-        "q should be inserted, not quit, in Insert mode"
-    );
+    assert!(!app.should_quit, "q in Insert must insert, not quit");
     assert!(app.editor.lines().iter().any(|l| l.contains('q')));
 
     app.on_key(key(KeyCode::Esc));
     assert_eq!(app.mode, Mode::Normal);
-    // Buffer is now dirty (we inserted a `q`), so bare `q` should refuse to
-    // quit and surface the vim-style "no write" error. `:q!` overrides.
     app.on_key(key(KeyCode::Char('q')));
-    assert!(!app.should_quit, "bare q should not quit a dirty buffer");
+    assert!(!app.should_quit, "bare q in Normal must not quit");
+
+    // `:q` (dirty) -> E37; `:q!` overrides.
+    app.execute_command("q");
     assert!(
         app.last_error.as_deref().is_some_and(|e| e.contains("E37")),
         "expected E37 error, got: {:?}",
@@ -1922,11 +1922,13 @@ fn legend_h_also_returns_to_editor() {
 }
 
 #[test]
-fn legend_q_quits_app() {
+fn legend_q_is_a_noop() {
+    // `q` in panes is no longer quit — `:q` is the only quit path.
     let mut app = app_with_series(1);
     app.set_focus(Pane::Legend);
     app.on_key(key(KeyCode::Char('q')));
-    assert!(app.should_quit);
+    assert!(!app.should_quit);
+    assert_eq!(app.focus, Pane::Legend);
 }
 
 #[test]
@@ -3588,7 +3590,7 @@ fn dashinfo_command_toggles_when_dashboard_loaded() {
     app.execute_command("dashinfo");
     assert!(app.dashinfo_visible);
     // Any key dismisses.
-    app.on_key(key(KeyCode::Char('q')));
+    app.on_key(key(KeyCode::Esc));
     assert!(!app.dashinfo_visible);
 }
 

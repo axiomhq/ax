@@ -97,7 +97,6 @@ K	hover docs for symbol under cursor
 D / M	refresh datasets / metrics for current dataset
 :	command line
 ?	show this help
-q	quit
 Esc	dismiss error overlay; otherwise return to dashboard grid when in solo view
 
 ## Insert mode

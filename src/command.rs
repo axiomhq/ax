@@ -142,7 +142,6 @@ pub enum Command {
     Quickfix,
     Hover,
     Help,
-    Quit,
     /// `;` (`reverse: false`) — repeat the last `f`/`F`/`t`/`T` find on the
     /// current line. `,` (`reverse: true`) — same but with direction flipped.
     /// The host stores the last-find arguments; the parser is stateless on
@@ -458,7 +457,6 @@ impl Parser {
             (KeyCode::Char(':'), KeyModifiers::NONE) => Command::EnterCommand,
             (KeyCode::Char('?'), _) => Command::Help,
             (KeyCode::Char('K'), _) => Command::Hover,
-            (KeyCode::Char('q'), KeyModifiers::NONE) => Command::Quit,
             (KeyCode::Char('D'), _) => Command::FetchDatasets,
             (KeyCode::Char('M'), _) => Command::FetchMetrics,
             (KeyCode::Esc, _) => Command::DismissError,

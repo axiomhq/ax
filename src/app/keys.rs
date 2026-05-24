@@ -374,7 +374,6 @@ impl App {
                 }
             }
             (Char('?'), _) => self.open_help(),
-            (Char('q'), M::NONE) => self.cmd_quit(false),
             _ => {}
         }
     }
@@ -443,7 +442,6 @@ impl App {
                 self.details_cursor = 0;
             }
             (Char('?'), _) => self.open_help(),
-            (Char('q'), M::NONE) => self.cmd_quit(false),
             _ => {}
         }
     }
@@ -474,7 +472,7 @@ impl App {
         use KeyCode::*;
         use KeyModifiers as M;
         match (key.code, key.modifiers) {
-            (Esc, _) | (Char('e'), M::NONE) | (Char('q'), M::NONE) =>
+            (Esc, _) | (Char('e'), M::NONE) =>
                 self.legend_details_visible = false,
             (Char('j'), M::NONE) | (Down, _) if tag_count > 0 =>
                 self.details_cursor = (self.details_cursor + 1) % tag_count,
@@ -564,7 +562,7 @@ impl App {
         // The quick-fix picker takes over a small set of keys while visible.
         if self.quickfix.visible {
             match (key.code, key.modifiers) {
-                (Esc, _) | (Char('q'), M::NONE) => return self.quickfix.hide(),
+                (Esc, _) => return self.quickfix.hide(),
                 (Enter, _) => return self.accept_quickfix(),
                 (Up, _) | (Char('p'), M::CONTROL) => return self.move_quickfix_selection(-1),
                 (Down, _) | (Char('n'), M::CONTROL) => return self.move_quickfix_selection(1),
