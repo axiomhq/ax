@@ -29,16 +29,10 @@ impl App {
             Command::EnterInsert(at) => self.enter_insert_at(at),
             Command::EnterCommand => self.enter_command_mode(),
             Command::RunQuery | Command::RefreshQuery => self.run_query(),
-            Command::Undo => {
-                if !self.editor.undo() {
-                    self.status = "nothing to undo".to_string();
-                }
-            }
-            Command::Redo => {
-                if !self.editor.redo() {
-                    self.status = "nothing to redo".to_string();
-                }
-            }
+            Command::Undo if !self.editor.undo() => self.status = "nothing to undo".to_string(),
+            Command::Undo => {}
+            Command::Redo if !self.editor.redo() => self.status = "nothing to redo".to_string(),
+            Command::Redo => {}
             Command::Quickfix => self.open_quickfix(),
             Command::Hover => {
                 let text = self.query_text();
@@ -52,20 +46,15 @@ impl App {
             Command::Quit => self.cmd_quit(false),
             Command::FetchDatasets => self.fetch_datasets(),
             Command::FetchMetrics => self.fetch_metrics_for_current_query(),
-            Command::DismissError => {
-                // Esc in Editor Normal mode: dismiss the error
-                // overlay if there is one; otherwise, when we
-                // arrived in Solo by zooming a dashboard tile, the
-                // same key returns to the grid — mirroring the
-                // "back out" intuition vim users have for Esc.
-                if self.dismiss_error() {
-                    self.status = "error dismissed".to_string();
-                } else if self.view_mode == ViewMode::Solo
-                    && self.loaded_dashboard.is_some()
-                {
-                    self.cmd_grid();
-                }
-            }
+            // Esc in Editor Normal mode: dismiss the error overlay if
+            // present; else, if we arrived in Solo by zooming a tile,
+            // return to the grid (vim's "back out" intuition for Esc).
+            Command::DismissError if self.dismiss_error() =>
+                self.status = "error dismissed".to_string(),
+            Command::DismissError
+                if self.view_mode == ViewMode::Solo && self.loaded_dashboard.is_some() =>
+                self.cmd_grid(),
+            Command::DismissError => {}
             Command::DeleteCharUnder { count } => {
                 for _ in 0..count {
                     self.editor.delete_next_char();

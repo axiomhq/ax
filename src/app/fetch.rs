@@ -33,27 +33,18 @@ impl App {
         let dataset = match mpl::extract_dataset_metric(&mpl) {
             Ok((d, _)) => d,
             Err(e) => {
-                self.tile_results.insert(
-                    id.clone(),
-                    TileQueryResult {
-                        busy: false,
-                        series: vec![],
-                        error: Some(format!("MPL: {e}")),
-                        trace_id: None,
-                    },
-                );
+                self.tile_results.insert(id.clone(), TileQueryResult {
+                    error: Some(format!("MPL: {e}")),
+                    ..Default::default()
+                });
                 return;
             }
         };
         let client = match self.ensure_client() {
             Ok(c) => c.clone(),
-            Err(e) => {
-                self.set_error(format!("tile fetch: {e}"));
-                return;
-            }
+            Err(e) => return self.set_error(format!("tile fetch: {e}")),
         };
-        // Mark the tile busy in-place so the chrome flips to the
-        // spinner pip.
+        // Mark the tile busy in-place so the chrome flips to the spinner pip.
         let entry = self.tile_results.entry(id.clone()).or_default();
         entry.busy = true;
         entry.error = None;
@@ -104,16 +95,11 @@ impl App {
             let route = match resolve_route(&cache, &client, &dataset).await {
                 Ok(r) => r,
                 Err(e) => {
-                    let _ = tx.send(AppEvent::MetricsFetched {
-                        dataset,
-                        result: Err(e),
-                    });
+                    let _ = tx.send(AppEvent::MetricsFetched { dataset, result: Err(e) });
                     return;
                 }
             };
-            let result = client
-                .list_metrics(&route.url, &dataset, &start, &end)
-                .await;
+            let result = client.list_metrics(&route.url, &dataset, &start, &end).await;
             if let Ok(metrics) = &result {
                 cache_save_with(&cache, |c| c.replace_metrics(&dataset, metrics.clone()));
             }
@@ -138,11 +124,7 @@ impl App {
             let route = match resolve_route(&cache, &client, &dataset).await {
                 Ok(r) => r,
                 Err(e) => {
-                    let _ = tx.send(AppEvent::TagsFetched {
-                        dataset,
-                        metric,
-                        result: Err(e),
-                    });
+                    let _ = tx.send(AppEvent::TagsFetched { dataset, metric, result: Err(e) });
                     return;
                 }
             };
@@ -152,11 +134,7 @@ impl App {
             if let Ok(tags) = &result {
                 cache_save_with(&cache, |c| c.replace_tags(&dataset, &metric, tags.clone()));
             }
-            let _ = tx.send(AppEvent::TagsFetched {
-                dataset,
-                metric,
-                result,
-            });
+            let _ = tx.send(AppEvent::TagsFetched { dataset, metric, result });
         });
     }
 
@@ -181,10 +159,7 @@ impl App {
                 Ok(r) => r,
                 Err(e) => {
                     let _ = tx.send(AppEvent::TagValuesFetched {
-                        dataset,
-                        metric,
-                        tag,
-                        result: Err(e),
+                        dataset, metric, tag, result: Err(e),
                     });
                     return;
                 }
@@ -193,14 +168,11 @@ impl App {
                 .list_metric_tag_values(&route.url, &dataset, &metric, &tag, &start, &end)
                 .await;
             if let Ok(values) = &result {
-                cache_save_with(&cache, |c| c.replace_tag_values(&dataset, &metric, &tag, values.clone()));
+                cache_save_with(&cache, |c| {
+                    c.replace_tag_values(&dataset, &metric, &tag, values.clone())
+                });
             }
-            let _ = tx.send(AppEvent::TagValuesFetched {
-                dataset,
-                metric,
-                tag,
-                result,
-            });
+            let _ = tx.send(AppEvent::TagValuesFetched { dataset, metric, tag, result });
         });
     }
 
@@ -281,13 +253,13 @@ impl App {
             self.status = "already busy".to_string();
             return;
         }
-        if self.query_text().trim().is_empty() {
+        let mpl = self.query_text();
+        if mpl.trim().is_empty() {
             self.status = "empty query".to_string();
             return;
         }
         // The MetricsDB server resolves `$__interval` and friends from the
         // request's time window, so we send the buffer verbatim.
-        let mpl = self.query_text();
         let (dataset, metric) = match mpl::extract_dataset_metric(&mpl) {
             Ok(dm) => dm,
             Err(e) => {
@@ -295,17 +267,15 @@ impl App {
                 return;
             }
         };
-        // Snapshot the query's identity now so toggles after the result
-        // arrives persist under stable keys even if the user has since
-        // edited the buffer.
+        // Snapshot the query identity so post-result toggles persist under
+        // stable keys even if the user has since edited the buffer.
         self.last_query_context = Some(QueryContext {
             hash: mpl::query_hash(&mpl, &self.system_params),
             dataset: dataset.clone(),
             metric,
         });
-        // Honour the live diagnostic stream: if there are any errors in the
-        // buffer, refuse to send. Recompute first so we always check against
-        // the latest buffer state, not whatever was cached.
+        // Refuse to send while the buffer carries error-level diagnostics.
+        // Recompute first so the check sees the latest buffer state.
         self.recompute_diagnostics();
         if let Some(first_err) = self.diagnostics.iter().find(|d| d.severity.is_error()) {
             self.status = first_err.header();
@@ -389,38 +359,24 @@ impl App {
         }
         let client = match self.ensure_client() {
             Ok(c) => c.clone(),
-            Err(e) => {
-                self.set_error(format!("tile fetch: {e}"));
-                return;
-            }
+            Err(e) => return self.set_error(format!("tile fetch: {e}")),
         };
         let cache = self.cache.clone();
         let params = self.cli_params.clone();
         let (start, end) = self.active_time_range();
         for (chart_id, mpl) in charts {
-            // Initial busy state — grid renderer reads this to show a
-            // “loading…” hint.
-            self.tile_results.insert(
-                chart_id.clone(),
-                TileQueryResult {
-                    busy: true,
-                    series: vec![],
-                    error: None,
-                    trace_id: None,
-                },
-            );
+            // Initial busy state — grid renderer reads this to show a “loading…” hint.
+            self.tile_results.insert(chart_id.clone(), TileQueryResult {
+                busy: true,
+                ..Default::default()
+            });
             let dataset = match mpl::extract_dataset_metric(&mpl) {
                 Ok((d, _)) => d,
                 Err(e) => {
-                    self.tile_results.insert(
-                        chart_id.clone(),
-                        TileQueryResult {
-                            busy: false,
-                            series: vec![],
-                            error: Some(format!("MPL: {e}")),
-                            trace_id: None,
-                        },
-                    );
+                    self.tile_results.insert(chart_id.clone(), TileQueryResult {
+                        error: Some(format!("MPL: {e}")),
+                        ..Default::default()
+                    });
                     continue;
                 }
             };
@@ -456,45 +412,35 @@ impl App {
     pub fn fetch_dashboard_by_uid(&mut self, uid: String) {
         let client = match self.ensure_client() {
             Ok(c) => c.clone(),
-            Err(e) => {
-                self.set_error(format!("config error: {e}"));
-                return;
+            Err(e) => return self.set_error(format!("config error: {e}")),
+        };
+        // Snappy path: serve cache + refresh in background (Refreshed event).
+        // Cold path: foreground fetch (Opened event, sets busy).
+        let cached = self.cache.read().unwrap().cached_dashboard(&uid);
+        let event_ctor: fn(_, _) -> AppEvent = match cached {
+            Some(resource) => {
+                let name = resource.name().to_string();
+                self.adopt_dashboard(uid.clone(), resource);
+                self.status = format!("loaded `{name}` (cached, refreshing…)");
+                |uid, result| AppEvent::DashboardRefreshed { uid, result }
+            }
+            None => {
+                self.busy = true;
+                self.status = format!("fetching dashboard {uid}…");
+                |uid, result| AppEvent::DashboardOpened { uid, result }
             }
         };
-        let cached = self.cache.read().unwrap().cached_dashboard(&uid);
-        if let Some(resource) = cached {
-            let name = resource.name().to_string();
-            self.adopt_dashboard(uid.clone(), resource);
-            self.status = format!("loaded `{name}` (cached, refreshing…)");
-            let tx = self.events_tx.clone();
-            let cache = self.cache.clone();
-            let uid_for_task = uid.clone();
-            self.runtime.spawn(async move {
-                let result = client.get_dashboard(&uid_for_task).await;
-                if let Ok(resource) = &result {
-                    cache_save_with(&cache, |c| c.replace_dashboard(&uid_for_task, resource.clone()));
-                }
-                let _ = tx.send(AppEvent::DashboardRefreshed {
-                    uid: uid_for_task,
-                    result,
-                });
-            });
-            return;
-        }
-        self.busy = true;
-        self.status = format!("fetching dashboard {uid}…");
         let tx = self.events_tx.clone();
         let cache = self.cache.clone();
         let uid_for_task = uid.clone();
         self.runtime.spawn(async move {
             let result = client.get_dashboard(&uid_for_task).await;
             if let Ok(resource) = &result {
-                cache_save_with(&cache, |c| c.replace_dashboard(&uid_for_task, resource.clone()));
+                cache_save_with(&cache, |c| {
+                    c.replace_dashboard(&uid_for_task, resource.clone())
+                });
             }
-            let _ = tx.send(AppEvent::DashboardOpened {
-                uid: uid_for_task,
-                result,
-            });
+            let _ = tx.send(event_ctor(uid_for_task, result));
         });
     }
 
