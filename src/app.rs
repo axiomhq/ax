@@ -2312,22 +2312,11 @@ impl App {
     }
 
     fn fetch_datasets(&mut self) {
-        if self.busy {
-            self.status = "already busy".to_string();
+        let Some((client, tx, cache)) =
+            self.fetch_prepare(Some("fetching datasets…".to_string()))
+        else {
             return;
-        }
-        let client = match self.ensure_client() {
-            Ok(c) => c.clone(),
-            Err(e) => {
-                self.status = format!("config error: {e}");
-                return;
-            }
         };
-
-        self.busy = true;
-        self.status = "fetching datasets…".to_string();
-        let tx = self.events_tx.clone();
-        let cache = self.cache.clone();
         self.runtime.spawn(async move {
             let result = client.list_datasets().await;
             if let Ok(datasets) = &result {
@@ -2342,10 +2331,6 @@ impl App {
     }
 
     fn fetch_metrics_for_current_query(&mut self) {
-        if self.busy {
-            self.status = "already busy".to_string();
-            return;
-        }
         let mpl = self.query_text();
         let dataset = match axiom::extract_dataset_metric(&mpl).map(|p| p.0) {
             Ok(d) => d,
@@ -2354,18 +2339,11 @@ impl App {
                 return;
             }
         };
-        let client = match self.ensure_client() {
-            Ok(c) => c.clone(),
-            Err(e) => {
-                self.status = format!("config error: {e}");
-                return;
-            }
+        let Some((client, tx, cache)) =
+            self.fetch_prepare(Some(format!("fetching metrics for `{dataset}`…")))
+        else {
+            return;
         };
-
-        self.busy = true;
-        self.status = format!("fetching metrics for `{dataset}`…");
-        let tx = self.events_tx.clone();
-        let cache = self.cache.clone();
         let (start, end) = rfc3339_now_window(DISCOVERY_WINDOW_HOURS);
         self.runtime.spawn(async move {
             let route = match resolve_route(&cache, &client, &dataset).await {
@@ -2401,12 +2379,9 @@ impl App {
         if self.cache.read().unwrap().has_tags(&dataset, &metric) {
             return;
         }
-        let client = match self.ensure_client() {
-            Ok(c) => c.clone(),
-            Err(_) => return,
+        let Some((client, tx, cache)) = self.fetch_prepare(None) else {
+            return;
         };
-        let tx = self.events_tx.clone();
-        let cache = self.cache.clone();
         let (start, end) = rfc3339_now_window(DISCOVERY_WINDOW_HOURS);
         self.runtime.spawn(async move {
             let route = match resolve_route(&cache, &client, &dataset).await {
@@ -2450,12 +2425,9 @@ impl App {
         {
             return;
         }
-        let client = match self.ensure_client() {
-            Ok(c) => c.clone(),
-            Err(_) => return,
+        let Some((client, tx, cache)) = self.fetch_prepare(None) else {
+            return;
         };
-        let tx = self.events_tx.clone();
-        let cache = self.cache.clone();
         let (start, end) = rfc3339_now_window(DISCOVERY_WINDOW_HOURS);
         self.runtime.spawn(async move {
             let route = match resolve_route(&cache, &client, &dataset).await {
@@ -2513,6 +2485,45 @@ impl App {
             self.client = Some(AxiomClient::new(dep)?);
         }
         Ok(self.client.as_ref().unwrap())
+    }
+
+    /// Sync prologue shared by every `runtime.spawn`'d fetch. Builds
+    /// the `(client, tx, cache)` triple suitable to `move` into an
+    /// async block.
+    ///
+    /// `status`:
+    /// - `Some(msg)` — foreground: the busy gate is enforced
+    ///   (returns `None` after setting an "already busy" status),
+    ///   `self.busy` is flipped to `true`, and the status line is
+    ///   set to `msg`. Config errors raise the error overlay.
+    /// - `None` — background: no busy gate, no status change, no
+    ///   error reporting on missing config (silent).
+    ///
+    /// Returns `None` when the caller should bail out; the status
+    /// or error overlay has already been written in that case.
+    fn fetch_prepare(
+        &mut self,
+        status: Option<String>,
+    ) -> Option<(AxiomClient, mpsc::Sender<AppEvent>, Arc<RwLock<Cache>>)> {
+        let foreground = status.is_some();
+        if foreground && self.busy {
+            self.status = "already busy".to_string();
+            return None;
+        }
+        let client = match self.ensure_client() {
+            Ok(c) => c.clone(),
+            Err(e) => {
+                if foreground {
+                    self.set_error(format!("config error: {e}"));
+                }
+                return None;
+            }
+        };
+        if let Some(msg) = status {
+            self.busy = true;
+            self.status = msg;
+        }
+        Some((client, self.events_tx.clone(), self.cache.clone()))
     }
 
     /// Drain background events and apply them to app state.
@@ -4000,20 +4011,11 @@ impl App {
         let kind = self.dashboard.focused_tile().kind;
         let doc = build_dashboard_doc_from_buffer(&name, kind, &mpl);
 
-        if self.busy {
-            self.status = "already busy".to_string();
+        let Some((client, tx, _cache)) =
+            self.fetch_prepare(Some(format!("creating dashboard `{name}`…")))
+        else {
             return;
-        }
-        let client = match self.ensure_client() {
-            Ok(c) => c.clone(),
-            Err(e) => {
-                self.set_error(format!("config error: {e}"));
-                return;
-            }
         };
-        self.busy = true;
-        self.status = format!("creating dashboard `{name}`…");
-        let tx = self.events_tx.clone();
         self.runtime.spawn(async move {
             let result = client.create_dashboard(&doc, None, None).await;
             // The handler doesn't know the uid yet (server assigns it),
@@ -4040,24 +4042,14 @@ impl App {
                 return;
             }
         };
-        if self.busy {
-            self.status = "already busy".to_string();
-            return;
-        }
-        let client = match self.ensure_client() {
-            Ok(c) => c.clone(),
-            Err(e) => {
-                self.set_error(format!("config error: {e}"));
-                return;
-            }
-        };
-        self.busy = true;
-        self.status = if overwrite {
+        let status_msg = if overwrite {
             format!("saving dashboard {uid} (overwrite)…")
         } else {
             format!("saving dashboard {uid}…")
         };
-        let tx = self.events_tx.clone();
+        let Some((client, tx, _cache)) = self.fetch_prepare(Some(status_msg)) else {
+            return;
+        };
         self.runtime.spawn(async move {
             let result = client
                 .put_dashboard(&uid, &doc, version, overwrite, None)
@@ -4080,20 +4072,11 @@ impl App {
                 return;
             }
         };
-        if self.busy {
-            self.status = "already busy".to_string();
+        let Some((client, tx, _cache)) =
+            self.fetch_prepare(Some(format!("deleting dashboard {uid}…")))
+        else {
             return;
-        }
-        let client = match self.ensure_client() {
-            Ok(c) => c.clone(),
-            Err(e) => {
-                self.set_error(format!("config error: {e}"));
-                return;
-            }
         };
-        self.busy = true;
-        self.status = format!("deleting dashboard {uid}…");
-        let tx = self.events_tx.clone();
         let uid_for_task = uid.clone();
         self.runtime.spawn(async move {
             let result = client.delete_dashboard(&uid_for_task).await;
@@ -4115,20 +4098,18 @@ impl App {
     /// Cold path: with no cache, the foreground `DashboardsFetched`
     /// flow runs (sets `busy`, status "fetching dashboards…").
     fn cmd_dashboards(&mut self) {
-        let client = match self.ensure_client() {
-            Ok(c) => c.clone(),
-            Err(e) => {
-                self.set_error(format!("config error: {e}"));
-                return;
-            }
-        };
         let cached = self.cache.read().unwrap().cached_dashboards();
         if let Some(items) = cached {
+            // Snappy path: serve the cache, then refresh in the
+            // background. The refresh is fire-and-forget and uses
+            // the silent (background) prepare so it never trips
+            // the busy gate.
             let n = items.len();
             self.dashboards.open(items);
             self.status = format!("{n} dashboard(s) (cached, refreshing…)");
-            let tx = self.events_tx.clone();
-            let cache = self.cache.clone();
+            let Some((client, tx, cache)) = self.fetch_prepare(None) else {
+                return;
+            };
             self.runtime.spawn(async move {
                 let result = client.list_dashboards().await;
                 if let Ok(items) = &result {
@@ -4142,14 +4123,11 @@ impl App {
             });
             return;
         }
-        if self.busy {
-            self.status = "already busy".to_string();
+        let Some((client, tx, cache)) =
+            self.fetch_prepare(Some("fetching dashboards…".to_string()))
+        else {
             return;
-        }
-        self.busy = true;
-        self.status = "fetching dashboards…".to_string();
-        let tx = self.events_tx.clone();
-        let cache = self.cache.clone();
+        };
         self.runtime.spawn(async move {
             let result = client.list_dashboards().await;
             if let Ok(items) = &result {

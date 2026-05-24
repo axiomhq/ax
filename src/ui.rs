@@ -30,6 +30,37 @@ fn capped(total: u16, pct: u16, min: u16, max: u16) -> u16 {
     target.clamp(min.min(total), max).min(total)
 }
 
+/// Centred sub-rectangle inside `parent`. `width` and `height` are in
+/// terminal cells; if either exceeds the parent's corresponding
+/// dimension, the rectangle collapses on that axis (the `saturating_sub`
+/// keeps things sane).
+fn centered_area(parent: Rect, width: u16, height: u16) -> Rect {
+    Rect {
+        x: parent.x + (parent.width.saturating_sub(width)) / 2,
+        y: parent.y + (parent.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    }
+}
+
+/// Shared modal/overlay chrome: clears whatever's behind `area`, draws
+/// a single-border block tinted with `color` and titled `title` (in the
+/// same colour, bold), and returns the inner rect for the caller to fill
+/// with content.
+fn modal_frame(f: &mut Frame, area: Rect, title: &str, color: Color) -> Rect {
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(color))
+        .title(Span::styled(
+            title.to_string(),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    inner
+}
+
 pub fn draw(f: &mut Frame, app: &mut App) {
     let root = Layout::default()
         .direction(Direction::Vertical)
@@ -861,19 +892,7 @@ fn draw_confirm_delete_overlay(f: &mut Frame, app: &App, screen: Rect) {
     ];
     let width = 50u16.min(screen.width.saturating_sub(4));
     let height = (lines.len() as u16 + 2).min(screen.height.saturating_sub(2));
-    let area = Rect {
-        x: screen.x + (screen.width.saturating_sub(width)) / 2,
-        y: screen.y + (screen.height.saturating_sub(height)) / 2,
-        width,
-        height,
-    };
-    f.render_widget(Clear, area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Red))
-        .title(" delete ");
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = modal_frame(f, centered_area(screen, width, height), " delete ", Color::Red);
     f.render_widget(
         Paragraph::new(lines).alignment(ratatui::layout::Alignment::Center),
         inner,
@@ -886,23 +905,14 @@ fn draw_confirm_delete_overlay(f: &mut Frame, app: &App, screen: Rect) {
 /// returned for a chart (handy when query classification looks wrong
 /// - e.g. MPL queries stored under the `apl` key).
 fn draw_tile_inspect_overlay(f: &mut Frame, json: &str, screen: Rect) {
-    let width = screen.width.saturating_mul(8) / 10;
-    let height = screen.height.saturating_mul(8) / 10;
-    let width = width.clamp(60, 140);
-    let height = height.clamp(15, 50);
-    let area = Rect {
-        x: screen.x + (screen.width.saturating_sub(width)) / 2,
-        y: screen.y + (screen.height.saturating_sub(height)) / 2,
-        width,
-        height,
-    };
-    f.render_widget(Clear, area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Magenta))
-        .title(" tile JSON (any key closes) ");
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let width = (screen.width.saturating_mul(8) / 10).clamp(60, 140);
+    let height = (screen.height.saturating_mul(8) / 10).clamp(15, 50);
+    let inner = modal_frame(
+        f,
+        centered_area(screen, width, height),
+        " tile JSON (any key closes) ",
+        Color::Magenta,
+    );
     f.render_widget(
         Paragraph::new(json.to_string())
             .style(Style::default().fg(Color::Gray))
@@ -941,25 +951,16 @@ fn draw_time_preset_overlay(
     let width = 36u16.min(screen.width.saturating_sub(4));
     // Borders (2) + title pad (1) + rows + hint (2).
     let height = (row_count + 5).min(screen.height.saturating_sub(2));
-    let area = Rect {
-        x: screen.x + (screen.width.saturating_sub(width)) / 2,
-        y: screen.y + (screen.height.saturating_sub(height)) / 2,
-        width,
-        height,
-    };
-    f.render_widget(Clear, area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(Span::styled(
-            format!(
-                " time · {} → {} ",
-                app.dashboard.time_range.start, app.dashboard.time_range.end
-            ),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        ));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let title = format!(
+        " time · {} → {} ",
+        app.dashboard.time_range.start, app.dashboard.time_range.end
+    );
+    let inner = modal_frame(
+        f,
+        centered_area(screen, width, height),
+        &title,
+        Color::Cyan,
+    );
     if inner.height < 3 {
         return;
     }
@@ -1020,22 +1021,12 @@ fn draw_time_custom_overlay(
     // header row showing the two selected dates and a footer hint.
     let width = 60u16.min(screen.width.saturating_sub(4));
     let height = 14u16.min(screen.height.saturating_sub(2));
-    let area = Rect {
-        x: screen.x + (screen.width.saturating_sub(width)) / 2,
-        y: screen.y + (screen.height.saturating_sub(height)) / 2,
-        width,
-        height,
-    };
-    f.render_widget(Clear, area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(Span::styled(
-            " custom range ",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        ));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = modal_frame(
+        f,
+        centered_area(screen, width, height),
+        " custom range ",
+        Color::Cyan,
+    );
     if inner.height < 6 || inner.width < 20 {
         return;
     }
@@ -1134,19 +1125,12 @@ fn draw_add_pick_overlay(f: &mut Frame, cursor: usize, screen: Rect) {
     let kinds = crate::app::add_pick_kinds();
     let width = 30u16.min(screen.width.saturating_sub(4));
     let height = (kinds.len() as u16 + 3).min(screen.height.saturating_sub(2));
-    let area = Rect {
-        x: screen.x + (screen.width.saturating_sub(width)) / 2,
-        y: screen.y + (screen.height.saturating_sub(height)) / 2,
-        width,
-        height,
-    };
-    f.render_widget(Clear, area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Green))
-        .title(" add tile ");
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = modal_frame(
+        f,
+        centered_area(screen, width, height),
+        " add tile ",
+        Color::Green,
+    );
     let items: Vec<ListItem<'_>> = kinds
         .iter()
         .enumerate()
@@ -1169,31 +1153,15 @@ fn draw_add_pick_overlay(f: &mut Frame, cursor: usize, screen: Rect) {
 /// table (id, type, name). Any key dismisses; the dismissal is wired
 /// in `App::on_key`.
 fn draw_dashinfo_overlay(f: &mut Frame, resource: &crate::axiom::DashboardSummary, screen: Rect) {
-    let width = screen.width.saturating_mul(8) / 10;
-    let height = screen.height.saturating_mul(8) / 10;
-    let width = width.clamp(50, 120);
-    let height = height.clamp(12, 40);
-    let x = screen.x + (screen.width.saturating_sub(width)) / 2;
-    let y = screen.y + (screen.height.saturating_sub(height)) / 2;
-    let area = Rect {
-        x,
-        y,
-        width,
-        height,
-    };
-
-    f.render_widget(Clear, area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Magenta))
-        .title(Span::styled(
-            format!(" dashboard · {} ", resource.name()),
-            Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
-        ));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let width = (screen.width.saturating_mul(8) / 10).clamp(50, 120);
+    let height = (screen.height.saturating_mul(8) / 10).clamp(12, 40);
+    let title = format!(" dashboard · {} ", resource.name());
+    let inner = modal_frame(
+        f,
+        centered_area(screen, width, height),
+        &title,
+        Color::Magenta,
+    );
     if inner.width == 0 || inner.height < 4 {
         return;
     }
@@ -1338,35 +1306,19 @@ fn draw_dashboards_picker(f: &mut Frame, app: &App, screen: Rect) {
     let indices = picker.filtered_indices();
 
     // Modal size: 70% wide, 70% tall, capped.
-    let width = screen.width.saturating_mul(7) / 10;
-    let height = screen.height.saturating_mul(7) / 10;
-    let width = width.clamp(40, 100);
-    let height = height.clamp(10, 30);
-    let x = screen.x + (screen.width.saturating_sub(width)) / 2;
-    let y = screen.y + (screen.height.saturating_sub(height)) / 2;
-    let area = Rect {
-        x,
-        y,
-        width,
-        height,
-    };
-
-    f.render_widget(Clear, area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(Span::styled(
-            format!(
-                " dashboards · {}/{}  (Esc closes, Enter selects) ",
-                indices.len(),
-                picker.items.len()
-            ),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let width = (screen.width.saturating_mul(7) / 10).clamp(40, 100);
+    let height = (screen.height.saturating_mul(7) / 10).clamp(10, 30);
+    let title = format!(
+        " dashboards · {}/{}  (Esc closes, Enter selects) ",
+        indices.len(),
+        picker.items.len()
+    );
+    let inner = modal_frame(
+        f,
+        centered_area(screen, width, height),
+        &title,
+        Color::Cyan,
+    );
     if inner.width == 0 || inner.height < 3 {
         return;
     }
@@ -1477,26 +1429,14 @@ fn draw_error_overlay(f: &mut Frame, msg: &str, graph_area: Rect) {
     let width = (inner_width as u16 + 4)
         .min(graph_area.width.saturating_sub(4).max(20))
         .max(20);
-    let x = graph_area.x + (graph_area.width.saturating_sub(width)) / 2;
-    let y = graph_area.y + (graph_area.height.saturating_sub(height)) / 2;
-    let area = Rect {
-        x,
-        y,
-        width,
-        height,
-    };
-    let lines: Vec<Line<'_>> = wrapped.into_iter().map(Line::from).collect();
-    let para = Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Red))
-            .title(Span::styled(
-                " error - Esc to dismiss ",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            )),
+    let inner = modal_frame(
+        f,
+        centered_area(graph_area, width, height),
+        " error - Esc to dismiss ",
+        Color::Red,
     );
-    f.render_widget(Clear, area);
-    f.render_widget(para, area);
+    let lines: Vec<Line<'_>> = wrapped.into_iter().map(Line::from).collect();
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 /// Right-hand pane next to the editor. Lists every CLI/`:param` value
@@ -1704,33 +1644,14 @@ fn draw_legend_details(f: &mut Frame, app: &App, graph_area: Rect) {
         .unwrap_or(0) as u16;
     let width = (body_w.saturating_add(4)).clamp(40, graph_area.width.saturating_sub(2).max(40));
     let height = (lines.len() as u16 + 2).min(graph_area.height);
-    let x = graph_area.x + graph_area.width.saturating_sub(width) / 2;
-    let y = graph_area.y + graph_area.height.saturating_sub(height) / 2;
-    let area = Rect {
-        x,
-        y,
-        width,
-        height,
-    };
-
-    let title = format!(
-        " series details - {}/{} ",
-        idx + 1,
-        series_slice.len()
+    let title = format!(" series details - {}/{} ", idx + 1, series_slice.len());
+    let inner = modal_frame(
+        f,
+        centered_area(graph_area, width, height),
+        &title,
+        Color::Cyan,
     );
-    let para = Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title(Span::styled(
-                title,
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )),
-    );
-    f.render_widget(Clear, area);
-    f.render_widget(para, area);
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 /// Build the `func(arg1: T, *arg2: T*)` span list for the status line. The
@@ -1839,19 +1760,8 @@ fn draw_hover_popup(f: &mut Frame, app: &mut App, editor_area: Rect) {
         return;
     }
 
-    let para = Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title(Span::styled(
-                " hover - any key dismisses ",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )),
-    );
-    f.render_widget(Clear, area);
-    f.render_widget(para, area);
+    let inner = modal_frame(f, area, " hover - any key dismisses ", Color::Cyan);
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 /// Help modal listing the key bindings. Triggered by `:help`; any key
@@ -1873,14 +1783,6 @@ fn draw_help_modal(f: &mut Frame, scroll: u16, graph_area: Rect) {
     let height = (graph_area.height.saturating_mul(9) / 10)
         .clamp(8, 50)
         .min(graph_area.height.saturating_sub(2).max(5));
-    let x = graph_area.x + (graph_area.width.saturating_sub(width)) / 2;
-    let y = graph_area.y + (graph_area.height.saturating_sub(height)) / 2;
-    let area = Rect {
-        x,
-        y,
-        width,
-        height,
-    };
 
     // Clamp the scroll offset so G (= u16::MAX) lands on the last
     // page instead of off-screen.
@@ -1897,21 +1799,13 @@ fn draw_help_modal(f: &mut Frame, scroll: u16, graph_area: Rect) {
             max_scroll + 1
         )
     };
-    let para = Paragraph::new(lines)
-        .scroll((scroll, 0))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan))
-                .title(Span::styled(
-                    title,
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                )),
-        );
-    f.render_widget(Clear, area);
-    f.render_widget(para, area);
+    let inner = modal_frame(
+        f,
+        centered_area(graph_area, width, height),
+        &title,
+        Color::Cyan,
+    );
+    f.render_widget(Paragraph::new(lines).scroll((scroll, 0)), inner);
 }
 
 /// Parse the help-file format into styled `Line`s.

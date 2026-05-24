@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::config::Deployment;
@@ -340,25 +341,41 @@ impl Client {
         r
     }
 
-    pub async fn list_datasets(&self) -> Result<Vec<DatasetSummary>> {
-        let url = format!("{}/v1/datasets", self.inner.base_url);
+    /// Shared GET-JSON path. Builds the request, sends it, reads the
+    /// body once, surfaces non-2xx as a structured `axiom <label>` error
+    /// (with body excerpt) and on success decodes the body as `T`.
+    /// `label` shows up in both the transport-error context and the
+    /// not-success/decode messages so users can tell endpoints apart.
+    async fn get_json<T: DeserializeOwned>(
+        &self,
+        url: &str,
+        accept: &str,
+        label: &str,
+    ) -> Result<T> {
         let resp = self
-            .auth(self.inner.http.get(&url))
-            .header("Accept", "application/json")
+            .auth(self.inner.http.get(url))
+            .header("Accept", accept)
             .send()
             .await
-            .context("sending /v1/datasets request")?;
+            .with_context(|| format!("sending {label} request"))?;
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         if !status.is_success() {
             return Err(anyhow!(
-                "axiom /v1/datasets {} — {}",
+                "axiom {} {} — {}",
+                label,
                 status.as_u16(),
                 snippet(&body, 200)
             ));
         }
-        serde_json::from_str::<Vec<DatasetSummary>>(&body)
-            .with_context(|| format!("decoding datasets response: {}", snippet(&body, 200)))
+        serde_json::from_str::<T>(&body)
+            .with_context(|| format!("decoding {label}: {}", snippet(&body, 200)))
+    }
+
+    pub async fn list_datasets(&self) -> Result<Vec<DatasetSummary>> {
+        let url = format!("{}/v1/datasets", self.inner.base_url);
+        self.get_json(&url, "application/json", "/v1/datasets")
+            .await
     }
 
     /// Create a new dashboard. Hits `POST /v2/dashboards`. Returns
@@ -503,28 +520,8 @@ impl Client {
     /// model; for now callers consume the resource directly.
     pub async fn get_dashboard(&self, uid: &str) -> Result<DashboardSummary> {
         let url = format!("{}/v2/dashboards/uid/{}", self.inner.base_url, uid);
-        let resp = self
-            .auth(self.inner.http.get(&url))
-            .header("Accept", "application/json")
-            .send()
-            .await
-            .context("sending /v2/dashboards/uid request")?;
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(anyhow!(
-                "axiom /v2/dashboards/uid/{} {} — {}",
-                uid,
-                status.as_u16(),
-                snippet(&body, 200)
-            ));
-        }
-        serde_json::from_str::<DashboardSummary>(&body).with_context(|| {
-            format!(
-                "decoding /v2/dashboards/uid/{uid} response: {}",
-                snippet(&body, 200)
-            )
-        })
+        let label = format!("/v2/dashboards/uid/{uid}");
+        self.get_json(&url, "application/json", &label).await
     }
 
     /// Fetch the org's dashboards. Hits `GET /v2/dashboards` with
@@ -537,23 +534,8 @@ impl Client {
     /// dashboards stay invisible. Axiom's docs are explicit about this.
     pub async fn list_dashboards(&self) -> Result<Vec<DashboardSummary>> {
         let url = format!("{}/v2/dashboards?limit=1000", self.inner.base_url);
-        let resp = self
-            .auth(self.inner.http.get(&url))
-            .header("Accept", "application/json")
-            .send()
+        self.get_json(&url, "application/json", "/v2/dashboards")
             .await
-            .context("sending /v2/dashboards request")?;
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(anyhow!(
-                "axiom /v2/dashboards {} — {}",
-                status.as_u16(),
-                snippet(&body, 200)
-            ));
-        }
-        serde_json::from_str::<Vec<DashboardSummary>>(&body)
-            .with_context(|| format!("decoding dashboards response: {}", snippet(&body, 200)))
     }
 
     /// List metrics for `dataset` over `[start, end]`. The metrics-info endpoint
@@ -573,23 +555,12 @@ impl Client {
             urlencoding(start),
             urlencoding(end),
         );
-        let resp = self
-            .auth(self.inner.http.get(&url))
-            .header("Accept", "application/vnd.metrics-info.v2+json")
-            .send()
-            .await
-            .context("sending metrics-info request")?;
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(anyhow!(
-                "axiom metrics-info {} — {}",
-                status.as_u16(),
-                snippet(&body, 200)
-            ));
-        }
-        serde_json::from_str(&body)
-            .with_context(|| format!("decoding metrics-info: {}", snippet(&body, 200)))
+        self.get_json(
+            &url,
+            "application/vnd.metrics-info.v2+json",
+            "metrics-info",
+        )
+        .await
     }
 
     /// List tag names for a specific `(dataset, metric)` pair. The endpoint
@@ -612,23 +583,7 @@ impl Client {
             urlencoding(start),
             urlencoding(end),
         );
-        let resp = self
-            .auth(self.inner.http.get(&url))
-            .header("Accept", "application/json")
-            .send()
-            .await
-            .context("sending tags request")?;
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(anyhow!(
-                "axiom metric-tags {} — {}",
-                status.as_u16(),
-                snippet(&body, 200)
-            ));
-        }
-        serde_json::from_str::<Vec<String>>(&body)
-            .with_context(|| format!("decoding metric-tags: {}", snippet(&body, 200)))
+        self.get_json(&url, "application/json", "metric-tags").await
     }
 
     /// List the observed values for a single tag of a `(dataset, metric)`.
@@ -651,23 +606,7 @@ impl Client {
             urlencoding(start),
             urlencoding(end),
         );
-        let resp = self
-            .auth(self.inner.http.get(&url))
-            .header("Accept", "application/json")
-            .send()
-            .await
-            .context("sending tag-values request")?;
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(anyhow!(
-                "axiom tag-values {} — {}",
-                status.as_u16(),
-                snippet(&body, 200)
-            ));
-        }
-        serde_json::from_str::<Vec<String>>(&body)
-            .with_context(|| format!("decoding tag-values: {}", snippet(&body, 200)))
+        self.get_json(&url, "application/json", "tag-values").await
     }
 
     /// Run an MPL query against the supplied edge URL.
