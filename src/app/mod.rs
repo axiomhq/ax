@@ -472,26 +472,18 @@ impl App {
                 crate::dashboard::extract_query(chart)
             && let Ok((ds, m)) = crate::mpl::extract_dataset_metric(&mpl)
         {
-            let mut cache = self.cache.write().unwrap();
-            cache.set_legend_tags_for_metric(&ds, &m, self.legend_label_tags.clone());
-            if let Err(e) = cache.save() {
-                eprintln!("metrics-tui: cache save failed: {e}");
-            }
+            let tags = self.legend_label_tags.clone();
+            cache_save_with(&self.cache, |c| c.set_legend_tags_for_metric(&ds, &m, tags));
             return;
         }
-        let Some(ctx) = &self.last_query_context else {
-            return;
-        };
-        let mut cache = self.cache.write().unwrap();
-        cache.set_legend_tags(
-            &ctx.hash,
-            &ctx.dataset,
-            &ctx.metric,
+        let Some(ctx) = &self.last_query_context else { return };
+        let (h, d, m, tags) = (
+            ctx.hash.clone(),
+            ctx.dataset.clone(),
+            ctx.metric.clone(),
             self.legend_label_tags.clone(),
         );
-        if let Err(e) = cache.save() {
-            eprintln!("metrics-tui: cache save failed: {e}");
-        }
+        cache_save_with(&self.cache, |c| c.set_legend_tags(&h, &d, &m, tags));
     }
 
     /// Show the help modal, resetting the scroll offset so the next

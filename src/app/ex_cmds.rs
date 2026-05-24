@@ -164,25 +164,17 @@ impl App {
             self.status = "empty query".to_string();
             return;
         }
-        // Dataset is best-effort: the metrics explorer just needs `apl` set,
-        // and `metricsDataset` is a hint that selects the right tab.
+        // Dataset is best-effort: the explorer just needs `apl` set;
+        // `metricsDataset` selects the right tab.
         let dataset = mpl::extract_dataset_metric(&mpl).map(|p| p.0).ok();
-        let (deployment_url, org_id) = match Config::load() {
-            Ok(cfg) => match cfg.active() {
-                Ok((_, dep)) => (dep.url.clone(), dep.org_id.clone()),
-                Err(e) => {
-                    self.set_error(format!("axiom config: {e}"));
-                    return;
-                }
-            },
-            Err(e) => {
-                self.set_error(format!("axiom config: {e}"));
-                return;
-            }
+        let (deployment_url, org_id) = match Config::load()
+            .and_then(|cfg| cfg.active().map(|(_, dep)| (dep.url.clone(), dep.org_id.clone())))
+        {
+            Ok(v) => v,
+            Err(e) => return self.set_error(format!("axiom config: {e}")),
         };
         if org_id.is_empty() {
-            self.set_error("axiom config missing org_id".to_string());
-            return;
+            return self.set_error("axiom config missing org_id".to_string());
         }
         let url = share::build_axiom_url(&deployment_url, &org_id, &mpl, dataset.as_deref());
         match share::open_in_browser(&url) {
@@ -572,15 +564,13 @@ impl App {
     /// the server has no equivalent — the chart's renderer-side
     /// flavour is the TUI's job, not the server's.
     fn cmd_dash_new(&mut self, args: &[&str]) {
-        let source = args.first().copied();
-        if source != Some("from-buffer") {
-            self.set_error(
+        if args.first().copied() != Some("from-buffer") {
+            return self.set_error(
                 ":dash new from-buffer [name]: only `from-buffer` is supported today".to_string(),
             );
-            return;
         }
-        let name = args[1..].join(" ");
-        let name = if name.is_empty() {
+        let joined = args[1..].join(" ");
+        let name = if joined.is_empty() {
             self.current_file
                 .as_ref()
                 .and_then(|p| p.file_stem())
@@ -588,25 +578,16 @@ impl App {
                 .unwrap_or("untitled")
                 .to_string()
         } else {
-            name
+            joined
         };
-        let mpl = self.query_text();
-        let kind = self.viz_kind;
-        let doc = build_dashboard_doc_from_buffer(&name, kind, &mpl);
-
-        let Some((client, tx, _cache)) =
+        let doc = build_dashboard_doc_from_buffer(&name, self.viz_kind, &self.query_text());
+        let Some((client, tx, _)) =
             self.fetch_prepare(Some(format!("creating dashboard `{name}`…")))
-        else {
-            return;
-        };
+        else { return };
         self.runtime.spawn(async move {
+            // Server assigns the uid; pass an empty placeholder.
             let result = client.create_dashboard(&doc, None, None).await;
-            // The handler doesn't know the uid yet (server assigns it),
-            // so we pass a placeholder and let the result carry it.
-            let _ = tx.send(AppEvent::DashboardSaved {
-                uid: String::new(),
-                result,
-            });
+            let _ = tx.send(AppEvent::DashboardSaved { uid: String::new(), result });
         });
     }
 
@@ -615,32 +596,25 @@ impl App {
     /// skipped (`overwrite=true`); otherwise a stale-version response
     /// surfaces as a precise error.
     fn cmd_dash_save(&mut self, overwrite: bool) {
-        // Clone everything we need up-front so we can release the
-        // immutable borrow on `self.loaded_dashboard` before reaching
-        // for `&mut self` via `ensure_client`.
-        let (uid, doc, version) = match self.loaded_dashboard.as_ref() {
-            Some(r) => (r.uid.clone(), r.dashboard.clone(), r.version),
-            None => {
-                self.set_error(":dash save: no dashboard loaded".to_string());
-                return;
-            }
+        // Clone up-front so the immutable borrow on `loaded_dashboard`
+        // ends before `fetch_prepare` reaches `&mut self`.
+        let Some((uid, doc, version)) = self
+            .loaded_dashboard
+            .as_ref()
+            .map(|r| (r.uid.clone(), r.dashboard.clone(), r.version))
+        else {
+            return self.set_error(":dash save: no dashboard loaded".to_string());
         };
         let status_msg = if overwrite {
             format!("saving dashboard {uid} (overwrite)…")
         } else {
             format!("saving dashboard {uid}…")
         };
-        let Some((client, tx, _cache)) = self.fetch_prepare(Some(status_msg)) else {
-            return;
-        };
+        let Some((client, tx, _)) = self.fetch_prepare(Some(status_msg)) else { return };
+        let uid_for_event = uid.clone();
         self.runtime.spawn(async move {
-            let result = client
-                .put_dashboard(&uid, &doc, version, overwrite, None)
-                .await;
-            let _ = tx.send(AppEvent::DashboardSaved {
-                uid: uid.clone(),
-                result,
-            });
+            let result = client.put_dashboard(&uid, &doc, version, overwrite, None).await;
+            let _ = tx.send(AppEvent::DashboardSaved { uid: uid_for_event, result });
         });
     }
 
@@ -648,25 +622,16 @@ impl App {
     /// argument to keep the command from ever firing accidentally
     /// against the loaded dashboard.
     fn cmd_dash_rm(&mut self, uid_arg: Option<&str>) {
-        let uid = match uid_arg {
-            Some(s) => s.trim_matches('"').to_string(),
-            None => {
-                self.set_error(":dash rm <uid>: uid argument required".to_string());
-                return;
-            }
+        let Some(uid_raw) = uid_arg else {
+            return self.set_error(":dash rm <uid>: uid argument required".to_string());
         };
-        let Some((client, tx, _cache)) =
+        let uid = uid_raw.trim_matches('"').to_string();
+        let Some((client, tx, _)) =
             self.fetch_prepare(Some(format!("deleting dashboard {uid}…")))
-        else {
-            return;
-        };
-        let uid_for_task = uid.clone();
+        else { return };
         self.runtime.spawn(async move {
-            let result = client.delete_dashboard(&uid_for_task).await;
-            let _ = tx.send(AppEvent::DashboardDeleted {
-                uid: uid_for_task,
-                result,
-            });
+            let result = client.delete_dashboard(&uid).await;
+            let _ = tx.send(AppEvent::DashboardDeleted { uid, result });
         });
     }
 
@@ -681,53 +646,33 @@ impl App {
     /// Cold path: with no cache, the foreground `DashboardsFetched`
     /// flow runs (sets `busy`, status "fetching dashboards…").
     fn cmd_dashboards(&mut self) {
+        // Snappy path: serve the cache, then refresh in the background
+        // (silent prepare, fire-and-forget). Otherwise fetch foreground.
         let cached = self.cache.read().unwrap().cached_dashboards();
-        if let Some(items) = cached {
-            // Snappy path: serve the cache, then refresh in the
-            // background. The refresh is fire-and-forget and uses
-            // the silent (background) prepare so it never trips
-            // the busy gate.
-            let n = items.len();
-            self.dashboards.open(items);
-            self.status = format!("{n} dashboard(s) (cached, refreshing…)");
-            let Some((client, tx, cache)) = self.fetch_prepare(None) else {
-                return;
-            };
-            self.runtime.spawn(async move {
-                let result = client.list_dashboards().await;
-                if let Ok(items) = &result {
-                    let mut c = cache.write().unwrap();
-                    c.replace_dashboards(items.clone());
-                    if let Err(e) = c.save() {
-                        eprintln!("metrics-tui: cache save failed: {e}");
-                    }
-                }
-                let _ = tx.send(AppEvent::DashboardsRefreshed(result));
-            });
-            return;
-        }
-        let Some((client, tx, cache)) =
-            self.fetch_prepare(Some("fetching dashboards…".to_string()))
-        else {
-            return;
+        let (status, event_ctor): (Option<String>, fn(_) -> AppEvent) = match &cached {
+            Some(items) => {
+                let n = items.len();
+                self.dashboards.open(items.clone());
+                self.status = format!("{n} dashboard(s) (cached, refreshing…)");
+                (None, AppEvent::DashboardsRefreshed)
+            }
+            None => (Some("fetching dashboards…".to_string()), AppEvent::DashboardsFetched),
         };
+        let Some((client, tx, cache)) = self.fetch_prepare(status) else { return };
         self.runtime.spawn(async move {
             let result = client.list_dashboards().await;
             if let Ok(items) = &result {
-                let mut c = cache.write().unwrap();
-                c.replace_dashboards(items.clone());
-                if let Err(e) = c.save() {
-                    eprintln!("metrics-tui: cache save failed: {e}");
-                }
+                cache_save_with(&cache, |c| c.replace_dashboards(items.clone()));
             }
-            let _ = tx.send(AppEvent::DashboardsFetched(result));
+            let _ = tx.send(event_ctor(result));
         });
     }
 
     pub(super) fn cmd_quit(&mut self, force: bool) {
         if !force && self.is_dirty() {
-            self.set_error("E37: No write since last change (add ! to override)".to_string());
-            return;
+            return self.set_error(
+                "E37: No write since last change (add ! to override)".to_string(),
+            );
         }
         self.persist_query();
         self.should_quit = true;
@@ -741,22 +686,23 @@ impl App {
     }
 
     fn cmd_write_quit(&mut self, path: Option<&str>, _force: bool) {
-        if let Err(e) = self.write_file(path.map(std::path::PathBuf::from)) {
-            self.set_error(format!("write failed: {e}"));
-            return;
-        }
-        self.persist_query();
-        self.should_quit = true;
+        self.write_then_quit(path, true);
     }
 
-    /// `:x` — write only when modified, then quit. Equivalent to `:wq` when
-    /// dirty, or `:q` when clean.
+    /// `:x` — write only when modified, then quit. Equivalent to `:wq`
+    /// when dirty, or `:q` when clean.
     fn cmd_update_quit(&mut self, path: Option<&str>) {
-        if (self.is_dirty() || path.is_some())
+        self.write_then_quit(path, self.is_dirty() || path.is_some());
+    }
+
+    /// Shared body for `:wq` / `:x`: optionally write, then quit
+    /// unless the write failed (in which case the error is surfaced
+    /// and `should_quit` stays false).
+    fn write_then_quit(&mut self, path: Option<&str>, write: bool) {
+        if write
             && let Err(e) = self.write_file(path.map(std::path::PathBuf::from))
         {
-            self.set_error(format!("write failed: {e}"));
-            return;
+            return self.set_error(format!("write failed: {e}"));
         }
         self.persist_query();
         self.should_quit = true;
@@ -764,18 +710,14 @@ impl App {
 
     fn cmd_edit(&mut self, path: Option<&str>, force: bool) {
         // `:e!` with no path reloads the current file from disk.
-        if path.is_none() {
-            if !force {
-                self.set_error("E32: No file name".to_string());
-                return;
-            }
-            let Some(current) = self.current_file.clone() else {
-                self.set_error("E32: No file name".to_string());
-                return;
-            };
-            return self.do_open(current, force);
-        }
-        let path = std::path::PathBuf::from(path.unwrap());
+        let path = match (path, force) {
+            (Some(p), _) => std::path::PathBuf::from(p),
+            (None, true) => match self.current_file.clone() {
+                Some(p) => p,
+                None => return self.set_error("E32: No file name".to_string()),
+            },
+            (None, false) => return self.set_error("E32: No file name".to_string()),
+        };
         self.do_open(path, force);
     }
 }

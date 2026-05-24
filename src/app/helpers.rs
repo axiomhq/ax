@@ -190,13 +190,7 @@ pub(super) async fn resolve_route(
         .list_datasets()
         .await
         .map_err(|e| e.context("refreshing dataset list to resolve edge URL"))?;
-    {
-        let mut c = cache.write().unwrap();
-        c.replace_datasets(datasets);
-        if let Err(e) = c.save() {
-            eprintln!("metrics-tui: cache save failed: {e}");
-        }
-    }
+    cache_save_with(cache, |c| c.replace_datasets(datasets));
     cache
         .read()
         .unwrap()
@@ -280,8 +274,18 @@ pub(super) fn pragma_diagnostic(text: &str, line_idx: usize, err: &viz::PragmaEr
     }
 }
 
-/// Ordered list of viz kinds shown in the add-tile picker. Mirrors
-/// [`VizKind::is_implemented`] but in a stable order that's nicer to
+/// Acquire the shared cache for write, run `f` against it, then persist
+/// to disk. The save-failure path logs to stderr (matching the inline
+/// pattern this replaced) so it never fights the UI for the status
+/// line.
+pub(super) fn cache_save_with<F: FnOnce(&mut Cache)>(cache: &Arc<RwLock<Cache>>, f: F) {
+    let mut c = cache.write().unwrap();
+    f(&mut c);
+    if let Err(e) = c.save() {
+        eprintln!("metrics-tui: cache save failed: {e}");
+    }
+}
+
 pub(super) fn default_cache() -> Cache {
     // We don't yet have a base URL — `Cache::load` only needs a fallback for
     // datasets that lack `edgeDeployment`. Use a placeholder; it gets replaced

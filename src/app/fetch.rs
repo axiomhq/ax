@@ -79,11 +79,7 @@ impl App {
         self.runtime.spawn(async move {
             let result = client.list_datasets().await;
             if let Ok(datasets) = &result {
-                let mut c = cache.write().unwrap();
-                c.replace_datasets(datasets.clone());
-                if let Err(e) = c.save() {
-                    eprintln!("metrics-tui: cache save failed: {e}");
-                }
+                cache_save_with(&cache, |c| c.replace_datasets(datasets.clone()));
             }
             let _ = tx.send(AppEvent::DatasetsFetched(result));
         });
@@ -119,11 +115,7 @@ impl App {
                 .list_metrics(&route.url, &dataset, &start, &end)
                 .await;
             if let Ok(metrics) = &result {
-                let mut c = cache.write().unwrap();
-                c.replace_metrics(&dataset, metrics.clone());
-                if let Err(e) = c.save() {
-                    eprintln!("metrics-tui: cache save failed: {e}");
-                }
+                cache_save_with(&cache, |c| c.replace_metrics(&dataset, metrics.clone()));
             }
             let _ = tx.send(AppEvent::MetricsFetched { dataset, result });
         });
@@ -158,11 +150,7 @@ impl App {
                 .list_metric_tags(&route.url, &dataset, &metric, &start, &end)
                 .await;
             if let Ok(tags) = &result {
-                let mut c = cache.write().unwrap();
-                c.replace_tags(&dataset, &metric, tags.clone());
-                if let Err(e) = c.save() {
-                    eprintln!("metrics-tui: cache save failed: {e}");
-                }
+                cache_save_with(&cache, |c| c.replace_tags(&dataset, &metric, tags.clone()));
             }
             let _ = tx.send(AppEvent::TagsFetched {
                 dataset,
@@ -205,11 +193,7 @@ impl App {
                 .list_metric_tag_values(&route.url, &dataset, &metric, &tag, &start, &end)
                 .await;
             if let Ok(values) = &result {
-                let mut c = cache.write().unwrap();
-                c.replace_tag_values(&dataset, &metric, &tag, values.clone());
-                if let Err(e) = c.save() {
-                    eprintln!("metrics-tui: cache save failed: {e}");
-                }
+                cache_save_with(&cache, |c| c.replace_tag_values(&dataset, &metric, &tag, values.clone()));
             }
             let _ = tx.send(AppEvent::TagValuesFetched {
                 dataset,
@@ -488,11 +472,7 @@ impl App {
             self.runtime.spawn(async move {
                 let result = client.get_dashboard(&uid_for_task).await;
                 if let Ok(resource) = &result {
-                    let mut c = cache.write().unwrap();
-                    c.replace_dashboard(&uid_for_task, resource.clone());
-                    if let Err(e) = c.save() {
-                        eprintln!("metrics-tui: cache save failed: {e}");
-                    }
+                    cache_save_with(&cache, |c| c.replace_dashboard(&uid_for_task, resource.clone()));
                 }
                 let _ = tx.send(AppEvent::DashboardRefreshed {
                     uid: uid_for_task,
@@ -509,11 +489,7 @@ impl App {
         self.runtime.spawn(async move {
             let result = client.get_dashboard(&uid_for_task).await;
             if let Ok(resource) = &result {
-                let mut c = cache.write().unwrap();
-                c.replace_dashboard(&uid_for_task, resource.clone());
-                if let Err(e) = c.save() {
-                    eprintln!("metrics-tui: cache save failed: {e}");
-                }
+                cache_save_with(&cache, |c| c.replace_dashboard(&uid_for_task, resource.clone()));
             }
             let _ = tx.send(AppEvent::DashboardOpened {
                 uid: uid_for_task,
@@ -614,11 +590,7 @@ impl App {
                         // server's bumped version so the next session
                         // adopts a current resource immediately.
                         {
-                            let mut c = self.cache.write().unwrap();
-                            c.replace_dashboard(&write.dashboard.uid, write.dashboard.clone());
-                            if let Err(e) = c.save() {
-                                eprintln!("metrics-tui: cache save failed: {e}");
-                            }
+                            cache_save_with(&self.cache, |c| c.replace_dashboard(&write.dashboard.uid, write.dashboard.clone()));
                         }
                         self.loaded_dashboard = Some(write.dashboard);
                         self.dashboard_dirty = false;
@@ -679,11 +651,7 @@ impl App {
                         // re-adopt a tombstoned dashboard on the next
                         // `:open <uid>`.
                         {
-                            let mut c = self.cache.write().unwrap();
-                            c.forget_dashboard(&uid);
-                            if let Err(e) = c.save() {
-                                eprintln!("metrics-tui: cache save failed: {e}");
-                            }
+                            cache_save_with(&self.cache, |c| c.forget_dashboard(&uid));
                         }
                         self.status = format!("deleted dashboard {uid}");
                     }
