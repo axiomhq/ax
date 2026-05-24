@@ -279,11 +279,129 @@ pub fn draw_graph(
     f.render_widget(chart, area);
 }
 
+/// Summary of a series list for legend rendering. Lifts the metric
+/// name (and any tag values that are identical across every series)
+/// into a single `header` line, then leaves per-series `rows` with
+/// only the differentiating bits. Rendered as `<header>\n<rows>` by
+/// `draw_legend`; the inline grid-tile legend uses the same shape.
+///
+/// When the user has picked label-tags (`legend_label_tags` on App),
+/// `rows` is the joined values of those tags per series and shared
+/// tag values aren't lifted into the header — the user already chose
+/// the columns they care about.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LegendSummary {
+    pub header: String,
+    pub rows: Vec<String>,
+}
+
+/// Build a `LegendSummary` from a series slice. Pure / testable.
+pub fn summarize_legend(series: &[Series], picked: &[String]) -> LegendSummary {
+    if series.is_empty() {
+        return LegendSummary::default();
+    }
+
+    // Shared metric across every series, if any (the `format_series_name`
+    // convention is `"metric {tags}"` or just `"metric"`, so we split
+    // on the first ` {`).
+    let first_metric = metric_of(&series[0].name);
+    let shared_metric = series
+        .iter()
+        .all(|s| metric_of(&s.name) == first_metric)
+        .then(|| first_metric.to_string());
+
+    // User-driven picked-tags mode: row label is the joined values
+    // of the picked keys, falling back to the series name when none
+    // of the keys are present on this series.
+    if !picked.is_empty() {
+        let rows: Vec<String> = series
+            .iter()
+            .map(|s| {
+                let vals: Vec<String> = picked
+                    .iter()
+                    .filter_map(|k| {
+                        s.tags
+                            .iter()
+                            .find(|(tk, _)| tk == k)
+                            .map(|(_, v)| v.clone())
+                    })
+                    .collect();
+                if vals.is_empty() {
+                    s.name.clone()
+                } else {
+                    vals.join(", ")
+                }
+            })
+            .collect();
+        return LegendSummary {
+            header: shared_metric.unwrap_or_default(),
+            rows,
+        };
+    }
+
+    // Auto mode: also lift tag (k, v) pairs that are identical across
+    // every series — they're noise on per-row labels.
+    let shared_tags: Vec<(String, String)> = series[0]
+        .tags
+        .iter()
+        .filter(|(k, v)| {
+            series
+                .iter()
+                .all(|s| s.tags.iter().any(|(k2, v2)| k2 == k && v2 == v))
+        })
+        .cloned()
+        .collect();
+
+    let mut header_parts: Vec<String> = Vec::new();
+    if let Some(m) = &shared_metric {
+        header_parts.push(m.clone());
+    }
+    if !shared_tags.is_empty() {
+        let joined = shared_tags
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        header_parts.push(format!("{{{joined}}}"));
+    }
+    let header = header_parts.join(" ");
+
+    let rows: Vec<String> = series
+        .iter()
+        .map(|s| {
+            let differing: Vec<String> = s
+                .tags
+                .iter()
+                .filter(|(k, v)| {
+                    !shared_tags.iter().any(|(sk, sv)| sk == k && sv == v)
+                })
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect();
+            if differing.is_empty() {
+                // No distinguishing tags — the colour bullet alone
+                // identifies this series. Leave the row text empty.
+                String::new()
+            } else {
+                differing.join(", ")
+            }
+        })
+        .collect();
+
+    LegendSummary { header, rows }
+}
+
+/// Extract the metric prefix from a `format_series_name`-shaped
+/// name. Returns the whole input when there's no `" {"` separator
+/// (the no-tags case).
+fn metric_of(name: &str) -> &str {
+    name.split_once(" {").map(|(m, _)| m).unwrap_or(name)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn draw_legend(
     f: &mut Frame,
     series: &[Series],
-    labels: &[String],
+    picked: &[String],
     hidden: &[bool],
     selected: usize,
     focused: bool,
@@ -294,6 +412,51 @@ pub fn draw_legend(
         let placeholder = Paragraph::new("(no series)").block(block);
         f.render_widget(placeholder, area);
         return;
+    }
+
+    let summary = summarize_legend(series, picked);
+
+    // Render the border + title; carve a header row out of the
+    // inner area when the summary has something to lift.
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let (header_area, list_area) = if !summary.header.is_empty() && inner.height >= 2 {
+        (
+            Rect {
+                x: inner.x,
+                y: inner.y,
+                width: inner.width,
+                height: 1,
+            },
+            Rect {
+                x: inner.x,
+                y: inner.y + 1,
+                width: inner.width,
+                height: inner.height - 1,
+            },
+        )
+    } else {
+        (
+            Rect {
+                x: inner.x,
+                y: inner.y,
+                width: 0,
+                height: 0,
+            },
+            inner,
+        )
+    };
+
+    if header_area.height > 0 {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                summary.header.clone(),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ))),
+            header_area,
+        );
     }
 
     let items: Vec<ListItem<'_>> = series
@@ -317,7 +480,11 @@ pub fn draw_legend(
                 }
             }
             let gutter = if is_selected && !focused { ">" } else { " " };
-            let label = labels.get(i).cloned().unwrap_or_else(|| s.name.clone());
+            let label = summary
+                .rows
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| s.name.clone());
             ListItem::new(Line::from(vec![
                 Span::raw(gutter.to_string()),
                 Span::styled(bullet.to_string(), Style::default().fg(bullet_color)),
@@ -326,8 +493,7 @@ pub fn draw_legend(
         })
         .collect();
 
-    let list = List::new(items).block(block);
-    f.render_widget(list, area);
+    f.render_widget(List::new(items), list_area);
 }
 
 #[cfg(test)]
@@ -425,5 +591,115 @@ mod tests {
         let labels = x_axis_labels(0.0, 100.0);
         // Numeric `format_label` outputs decimal-point strings; never colon-only.
         assert!(labels.iter().all(|l| !l.contains(':')));
+    }
+
+    // ----- summarize_legend -----
+
+    fn ts(name: &str, tags: &[(&str, &str)]) -> Series {
+        Series {
+            name: name.to_string(),
+            tags: tags
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            points: vec![],
+            color: Color::Cyan,
+        }
+    }
+
+    #[test]
+    fn summarize_empty_yields_empty() {
+        let got = summarize_legend(&[], &[]);
+        assert_eq!(got.header, "");
+        assert!(got.rows.is_empty());
+    }
+
+    #[test]
+    fn summarize_lifts_shared_metric_and_shared_tags() {
+        let series = vec![
+            ts(
+                "cpu {h1,us}",
+                &[("host", "h1"), ("region", "us")],
+            ),
+            ts(
+                "cpu {h2,us}",
+                &[("host", "h2"), ("region", "us")],
+            ),
+            ts(
+                "cpu {h3,us}",
+                &[("host", "h3"), ("region", "us")],
+            ),
+        ];
+        let got = summarize_legend(&series, &[]);
+        assert_eq!(got.header, "cpu {region=us}");
+        assert_eq!(
+            got.rows,
+            vec![
+                "host=h1".to_string(),
+                "host=h2".to_string(),
+                "host=h3".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn summarize_skips_shared_tags_when_user_picked() {
+        // When the user has explicitly picked label-tags, the row
+        // is just the joined values of those tags, regardless of
+        // what else is shared.
+        let series = vec![
+            ts("cpu {h1}", &[("host", "h1"), ("region", "us")]),
+            ts("cpu {h2}", &[("host", "h2"), ("region", "us")]),
+        ];
+        let got = summarize_legend(&series, &["host".to_string()]);
+        assert_eq!(got.header, "cpu");
+        assert_eq!(got.rows, vec!["h1".to_string(), "h2".to_string()]);
+    }
+
+    #[test]
+    fn summarize_falls_back_when_picked_tag_missing() {
+        // Picked key not on the series — row falls back to s.name
+        // so it's never blank.
+        let series = vec![ts("cpu {us}", &[("region", "us")])];
+        let got = summarize_legend(&series, &["host".to_string()]);
+        assert_eq!(got.rows, vec!["cpu {us}".to_string()]);
+    }
+
+    #[test]
+    fn summarize_mixed_metric_drops_header_metric() {
+        let series = vec![
+            ts("cpu {h1}", &[("host", "h1")]),
+            ts("mem {h1}", &[("host", "h1")]),
+        ];
+        let got = summarize_legend(&series, &[]);
+        // Metric differs — not lifted. host=h1 is shared — lifted.
+        assert_eq!(got.header, "{host=h1}");
+    }
+
+    #[test]
+    fn summarize_single_series_lifts_everything_leaves_empty_rows() {
+        let series = vec![ts(
+            "cpu {h1,us}",
+            &[("host", "h1"), ("region", "us")],
+        )];
+        let got = summarize_legend(&series, &[]);
+        assert_eq!(got.header, "cpu {host=h1, region=us}");
+        // Single series: all tags shared, so the row text is empty
+        // (the bullet colour alone identifies it).
+        assert_eq!(got.rows, vec!["".to_string()]);
+    }
+
+    #[test]
+    fn summarize_no_shared_tags_keeps_full_per_row() {
+        let series = vec![
+            ts("cpu {h1}", &[("host", "h1")]),
+            ts("cpu {h2}", &[("host", "h2")]),
+        ];
+        let got = summarize_legend(&series, &[]);
+        assert_eq!(got.header, "cpu");
+        assert_eq!(
+            got.rows,
+            vec!["host=h1".to_string(), "host=h2".to_string()]
+        );
     }
 }

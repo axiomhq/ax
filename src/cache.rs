@@ -366,6 +366,32 @@ impl Cache {
             .insert(metric.to_string(), tags);
     }
 
+    /// Persist legend tags keyed only by `(dataset, metric)`. Used
+    /// from the dashboard tag picker where there's no editor
+    /// query-hash to scope by — the tile's MPL is the source of
+    /// truth, but its hash isn't the same as the editor's.
+    pub fn set_legend_tags_for_metric(
+        &mut self,
+        dataset: &str,
+        metric: &str,
+        tags: Vec<String>,
+    ) {
+        if tags.is_empty() {
+            if let Some(per_metric) = self.data.legend_tags_by_metric.get_mut(dataset) {
+                per_metric.remove(metric);
+                if per_metric.is_empty() {
+                    self.data.legend_tags_by_metric.remove(dataset);
+                }
+            }
+            return;
+        }
+        self.data
+            .legend_tags_by_metric
+            .entry(dataset.to_string())
+            .or_default()
+            .insert(metric.to_string(), tags);
+    }
+
     pub fn replace_metrics(&mut self, dataset: &str, metrics: BTreeMap<String, MetricInfo>) {
         self.data.metrics_by_dataset.insert(
             dataset.to_string(),

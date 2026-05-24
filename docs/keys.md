@@ -98,7 +98,7 @@ D / M	refresh datasets / metrics for current dataset
 :	command line
 ?	show this help
 q	quit
-Esc	dismiss error overlay
+Esc	dismiss error overlay; otherwise return to dashboard grid when in solo view
 
 ## Insert mode
 Tab / Ctrl-Space	open completion popup
@@ -122,6 +122,7 @@ Esc	close popup / return to Normal
 :time / :range	open the time-range picker (presets + Custom calendar)
 :time reset	restore the default time range (now-1h → now)
 :time <start> [end]	set start (and end) directly — relative or RFC3339
+:grid / :solo	switch between dashboard grid and single-panel view
 :help / :h	show this help
 
 ## Dashboards

@@ -76,15 +76,62 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             top[0],
         );
     }
-    let legend_labels: Vec<String> = app.series.iter().map(|s| app.legend_label_for(s)).collect();
+    // Side legend source switches in Grid view: instead of the
+    // editor's query result, mirror the focused dashboard tile's
+    // series so the legend reflects the panel the user is
+    // navigating. Hidden state isn't tracked per-tile yet, so the
+    // Grid path uses a fresh all-visible mask; selection is
+    // clamped into range.
+    let (legend_series, legend_hidden_owned, legend_selected_for_render, legend_title): (
+        &[crate::chart::Series],
+        Option<Vec<bool>>,
+        usize,
+        String,
+    ) = if app.view_mode == crate::app::ViewMode::Grid
+        && let Some(resource) = app.loaded_dashboard.as_ref()
+        && let Some(chart) = resource
+            .dashboard
+            .charts
+            .get(app.selected_chart_idx)
+    {
+        let label = chart
+            .base()
+            .name
+            .clone()
+            .unwrap_or_else(|| chart.base().id.clone());
+        let series_slice: &[crate::chart::Series] = app
+            .tile_results
+            .get(&chart.base().id)
+            .map(|t| t.series.as_slice())
+            .unwrap_or(&[]);
+        let n = series_slice.len();
+        let selected = if n == 0 { 0 } else { app.legend_selected.min(n - 1) };
+        (
+            series_slice,
+            Some(vec![false; n]),
+            selected,
+            format!("legend · {label}"),
+        )
+    } else {
+        (
+            app.series.as_slice(),
+            None,
+            app.legend_selected,
+            "legend".to_string(),
+        )
+    };
+    let legend_hidden_slice: &[bool] = match legend_hidden_owned.as_ref() {
+        Some(v) => v.as_slice(),
+        None => app.legend_hidden.as_slice(),
+    };
     chart::draw_legend(
         f,
-        &app.series,
-        &legend_labels,
-        &app.legend_hidden,
-        app.legend_selected,
+        legend_series,
+        &app.legend_label_tags,
+        legend_hidden_slice,
+        legend_selected_for_render,
         legend_focused,
-        pane_block("legend", legend_focused),
+        pane_block(&legend_title, legend_focused),
         top[1],
     );
     // Editor row: editor on the left, params on the right - match the
@@ -551,20 +598,64 @@ fn draw_grid_tile(
     match body {
         Body::Viz { series } => {
             // Hand off to the real renderer. Empty hidden mask + no
-            // selection highlight - those are solo-mode UI concerns.
+            // selection highlight — those are solo-mode UI concerns.
+            //
+            // Grid view also gets a 1-row inline legend strip
+            // carved out of the tile's inner bottom row, so each
+            // tile self-documents — the right-hand side legend
+            // only ever shows the focused tile's series, so the
+            // others need their own label strip. Solo view skips
+            // this (the chart owns the whole pane; the side
+            // legend handles labelling).
             let hidden = vec![false; series.len()];
             let body_text = String::new();
-            viz::draw(
-                f,
+            let wants_inline_legend = matches!(
                 viz_kind,
-                series,
-                &hidden,
-                None,
-                &std::collections::BTreeMap::new(),
-                &body_text,
-                block,
-                area,
-            );
+                crate::dashboard::VizKind::Line
+                    | crate::dashboard::VizKind::Bar
+                    | crate::dashboard::VizKind::Area
+                    | crate::dashboard::VizKind::Scatter
+            ) && !series.is_empty();
+            let inner = block.inner(area);
+            if wants_inline_legend && inner.height >= 4 {
+                f.render_widget(block, area);
+                let chart_area = Rect {
+                    x: inner.x,
+                    y: inner.y,
+                    width: inner.width,
+                    height: inner.height - 1,
+                };
+                let strip = Rect {
+                    x: inner.x,
+                    y: inner.y + inner.height - 1,
+                    width: inner.width,
+                    height: 1,
+                };
+                viz::draw(
+                    f,
+                    viz_kind,
+                    series,
+                    &hidden,
+                    None,
+                    &std::collections::BTreeMap::new(),
+                    &body_text,
+                    Block::default(),
+                    chart_area,
+                );
+                draw_inline_legend(f, series, &app.legend_label_tags, strip);
+            } else {
+                viz::draw(
+                    f,
+                    viz_kind,
+                    series,
+                    &hidden,
+                    None,
+                    &std::collections::BTreeMap::new(),
+                    &body_text,
+                    block,
+                    area,
+                );
+            }
         }
         Body::Loading => {
             let inner = block.inner(area);
@@ -629,6 +720,120 @@ fn draw_grid_tile(
             );
         }
     }
+}
+
+/// One-row inline legend strip rendered under time-series-family
+/// tiles in the dashboard grid. Layout:
+///
+///   <metric-header>:  ● label  ● label  ...
+///
+/// The shared metric (plus any tag values identical across every
+/// series) is lifted into the leading header; per-bullet labels
+/// carry only the differentiating bits. When there isn't room for
+/// every entry, the renderer truncates and appends ` ...`. When
+/// there isn't even room for the header + one entry, the header is
+/// dropped so a few bullets can still fit.
+fn draw_inline_legend(
+    f: &mut Frame,
+    series: &[crate::chart::Series],
+    picked: &[String],
+    area: Rect,
+) {
+    if area.width == 0 || area.height == 0 || series.is_empty() {
+        return;
+    }
+    let summary = crate::chart::summarize_legend(series, picked);
+    let labels: Vec<&str> = summary.rows.iter().map(|s| s.as_str()).collect();
+
+    // Try with the header prefix first; fall back to no-prefix if
+    // even one entry can't fit alongside it.
+    let header_prefix_w = if summary.header.is_empty() {
+        0
+    } else {
+        // "<header>: " — trailing 2 spaces matches the inter-entry
+        // separator so the eye reads the prefix as part of the row.
+        summary.header.chars().count() + 2
+    };
+    let mut use_header = header_prefix_w > 0;
+    let mut plan =
+        fit_inline_legend(&labels, (area.width as usize).saturating_sub(header_prefix_w));
+    if use_header && plan.shown.is_empty() {
+        // No room for any bullet alongside the header — drop it.
+        use_header = false;
+        plan = fit_inline_legend(&labels, area.width as usize);
+    }
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    if use_header {
+        spans.push(Span::styled(
+            summary.header.clone(),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw(": ".to_string()));
+    }
+    for (i, &shown_idx) in plan.shown.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(
+            "● ".to_string(),
+            Style::default().fg(series[shown_idx].color),
+        ));
+        spans.push(Span::styled(
+            summary.rows[shown_idx].clone(),
+            Style::default().fg(Color::Gray),
+        ));
+    }
+    if plan.ellipsis {
+        spans.push(Span::styled(
+            " ...".to_string(),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Plan for fitting an inline legend onto a single row of given
+/// `width`. Pure / testable: returns the indices of the entries to
+/// show in order and whether to append `...` to signal more. Width
+/// accounting uses `chars().count()` to match the rest of the
+/// codebase (labels are short, mostly-ASCII tag values).
+fn fit_inline_legend(labels: &[&str], width: usize) -> InlineLegendPlan {
+    const BULLET_W: usize = 2; // "● "
+    const SEP_W: usize = 2; // "  " between entries
+    const ELLIPSIS_W: usize = 4; // " ..."
+    let mut shown: Vec<usize> = Vec::new();
+    let mut used = 0usize;
+    for (i, label) in labels.iter().enumerate() {
+        let label_w = label.chars().count();
+        let sep_w = if shown.is_empty() { 0 } else { SEP_W };
+        let entry_w = sep_w + BULLET_W + label_w;
+        // Reserve room for the ellipsis if at least one more entry
+        // would follow. If this is the last entry, no reservation is
+        // needed — we'd rather show it than ellipsise it away.
+        let more_follow = i + 1 < labels.len();
+        let reserved = if more_follow { ELLIPSIS_W } else { 0 };
+        if used + entry_w + reserved > width {
+            return InlineLegendPlan {
+                shown,
+                ellipsis: true,
+            };
+        }
+        shown.push(i);
+        used += entry_w;
+    }
+    InlineLegendPlan {
+        shown,
+        ellipsis: false,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct InlineLegendPlan {
+    shown: Vec<usize>,
+    ellipsis: bool,
 }
 
 /// Modal overlay for `d` (delete) confirmation. Renders over the
@@ -1405,7 +1610,16 @@ fn draw_params(f: &mut Frame, app: &App, area: Rect, focused: bool) {
 /// a row background; rows whose key is in `legend_label_tags` carry a
 /// `✓` marker.
 fn draw_legend_details(f: &mut Frame, app: &App, graph_area: Rect) {
-    let Some(series) = app.series.get(app.legend_selected) else {
+    // Mirror the legend's source pick: in Grid view the picker
+    // edits tags on the focused dashboard tile's series, not the
+    // editor query's. Without this swap the modal always showed
+    // sin(x) and "(no tags)" in dashboard mode.
+    let series_slice = app.active_legend_series();
+    if series_slice.is_empty() {
+        return;
+    }
+    let idx = app.legend_selected.min(series_slice.len() - 1);
+    let Some(series) = series_slice.get(idx) else {
         return;
     };
 
@@ -1501,8 +1715,8 @@ fn draw_legend_details(f: &mut Frame, app: &App, graph_area: Rect) {
 
     let title = format!(
         " series details - {}/{} ",
-        app.legend_selected + 1,
-        app.series.len()
+        idx + 1,
+        series_slice.len()
     );
     let para = Paragraph::new(lines).block(
         Block::default()
@@ -2408,6 +2622,60 @@ mod row_height_tests {
         for v in &h {
             assert_eq!(*v, MIN_GRID_ROW_HEIGHT);
         }
+    }
+}
+
+#[cfg(test)]
+mod inline_legend_tests {
+    use super::{InlineLegendPlan, fit_inline_legend};
+
+    fn plan(shown: &[usize], ellipsis: bool) -> InlineLegendPlan {
+        InlineLegendPlan {
+            shown: shown.to_vec(),
+            ellipsis,
+        }
+    }
+
+    #[test]
+    fn empty_labels_yields_empty_plan() {
+        assert_eq!(fit_inline_legend(&[], 40), plan(&[], false));
+    }
+
+    #[test]
+    fn single_entry_fits_when_room_for_bullet_plus_label() {
+        // "● foo" = 2 (bullet) + 3 (label) = 5 columns.
+        assert_eq!(fit_inline_legend(&["foo"], 5), plan(&[0], false));
+        assert_eq!(fit_inline_legend(&["foo"], 4), plan(&[], true));
+    }
+
+    #[test]
+    fn all_entries_fit_when_width_is_generous() {
+        let p = fit_inline_legend(&["a", "b", "c"], 40);
+        assert_eq!(p, plan(&[0, 1, 2], false));
+    }
+
+    #[test]
+    fn truncates_with_ellipsis_when_remainder_would_overflow() {
+        let p = fit_inline_legend(&["a", "b", "c"], 10);
+        assert_eq!(p, plan(&[0], true));
+    }
+
+    #[test]
+    fn last_entry_does_not_need_ellipsis_reservation() {
+        let p = fit_inline_legend(&["a", "b"], 8);
+        assert_eq!(p, plan(&[0, 1], false));
+    }
+
+    #[test]
+    fn zero_width_shows_nothing_and_signals_truncation() {
+        let p = fit_inline_legend(&["a", "b"], 0);
+        assert_eq!(p, plan(&[], true));
+    }
+
+    #[test]
+    fn long_label_alone_gets_dropped_in_favour_of_ellipsis() {
+        let p = fit_inline_legend(&["a-very-long-label"], 5);
+        assert_eq!(p, plan(&[], true));
     }
 }
 

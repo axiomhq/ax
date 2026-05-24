@@ -1086,6 +1086,72 @@ impl App {
             .map(|c| c.base().id.clone())
     }
 
+    /// Reload `legend_label_tags` from the cache for the current
+    /// active context, so the picker buffer + render labels reflect
+    /// the focused tile (or editor query) instead of the previous
+    /// one's selection.
+    ///
+    /// Wiring: this is called whenever the active context changes
+    /// — tile focus moves in Grid view, dashboard adoption, view
+    /// mode flips, the focused tile's first data lands, and the
+    /// editor finishes a query. The lookup is cheap (two HashMap
+    /// hits), and the value silently becomes empty when nothing is
+    /// cached for the new context, which clears any stale leftover
+    /// from the previous tile.
+    fn reload_legend_label_tags(&mut self) {
+        let tags = if self.view_mode == ViewMode::Grid
+            && let Some(resource) = self.loaded_dashboard.as_ref()
+            && let Some(chart) = resource
+                .dashboard
+                .charts
+                .get(self.selected_chart_idx)
+            && let crate::dashboard::Query::Mpl(mpl) =
+                crate::dashboard::classify_chart_query(chart)
+            && let Ok((ds, m)) = crate::axiom::extract_dataset_metric(&mpl)
+        {
+            // Tile context: ignore the editor's query-hash store
+            // (the tile's hash isn't the editor's) and key purely
+            // by `(dataset, metric)`. Empty hash misses the
+            // by-hash store; `resolve_legend_tags` then falls
+            // through to the per-metric one.
+            self.cache.read().unwrap().resolve_legend_tags("", &ds, &m)
+        } else if let Some(ctx) = self.last_query_context.clone() {
+            self.cache
+                .read()
+                .unwrap()
+                .resolve_legend_tags(&ctx.hash, &ctx.dataset, &ctx.metric)
+        } else {
+            Vec::new()
+        };
+        self.legend_label_tags = tags;
+    }
+
+    /// Series slice driving the legend pane right now: the focused
+    /// tile's series when a dashboard is loaded in Grid view,
+    /// otherwise the editor's last query result. Matches the source
+    /// `chart::draw_legend` already uses for rendering so the `e`
+    /// tag picker and friends reflect what the user is looking at.
+    pub fn active_legend_series(&self) -> &[Series] {
+        if self.view_mode == ViewMode::Grid
+            && let Some(resource) = self.loaded_dashboard.as_ref()
+            && let Some(chart) = resource
+                .dashboard
+                .charts
+                .get(self.selected_chart_idx)
+            && let Some(tr) = self.tile_results.get(&chart.base().id)
+        {
+            return &tr.series;
+        }
+        &self.series
+    }
+
+    /// `legend_selected` clamped into the active series slice.
+    /// Returns `None` when there's nothing selectable.
+    fn active_legend_index(&self) -> Option<usize> {
+        let n = self.active_legend_series().len();
+        if n == 0 { None } else { Some(self.legend_selected.min(n - 1)) }
+    }
+
     /// Snapshot the selected tile's layout entry, synthesising a
     /// default one if missing so sub-modes always have something to
     /// revert to.
@@ -1356,9 +1422,12 @@ impl App {
         //   +---------+---+
         //   |  editor | P |   (bottom: Params)
         //   +---------+---+
-        // `w` and `h`/`l` cycle Editor → Legend → Params → Editor; the
-        // directional keys use the layout to pick the spatial neighbour
-        // when one exists, falling back to the cycle otherwise.
+        // In Grid view the graph slot is the Dashboard pane, so the
+        // top-left neighbour of Legend is Dashboard (not Editor).
+        // `w` cycles Editor → Legend → Params → (Dashboard if Grid)
+        // → Editor; directional keys use the layout to pick the
+        // spatial neighbour and fall back to the source pane when
+        // there's no neighbour in that direction.
         let cycle = || -> Pane {
             match self.focus {
                 Pane::Editor => Pane::Legend,
@@ -1386,16 +1455,27 @@ impl App {
                 }
             }
             (KeyCode::Char('h'), KeyModifiers::NONE) | (KeyCode::Left, _) => match self.focus {
-                Pane::Legend => Pane::Editor, // graph row → left = editor (the only thing on the left)
+                // In Grid view, Legend's left neighbour is the
+                // Dashboard tile area (the graph slot); in Solo
+                // there's no top-left pane, so fall back to Editor.
+                Pane::Legend => {
+                    if self.view_mode == ViewMode::Grid && self.loaded_dashboard.is_some() {
+                        Pane::Dashboard
+                    } else {
+                        Pane::Editor
+                    }
+                }
                 Pane::Params => Pane::Editor,
                 Pane::Editor => Pane::Editor,
-                Pane::Dashboard => Pane::Editor,
+                // Dashboard is already leftmost — no-op.
+                Pane::Dashboard => Pane::Dashboard,
             },
             (KeyCode::Char('l'), KeyModifiers::NONE) | (KeyCode::Right, _) => match self.focus {
                 Pane::Editor => Pane::Params,
                 Pane::Legend => Pane::Legend,
                 Pane::Params => Pane::Params,
-                Pane::Dashboard => Pane::Dashboard,
+                // Dashboard's right neighbour is the Legend column.
+                Pane::Dashboard => Pane::Legend,
             },
             (KeyCode::Char('j'), KeyModifiers::NONE) | (KeyCode::Down, _) => match self.focus {
                 Pane::Legend => Pane::Params,
@@ -1537,7 +1617,6 @@ impl App {
     }
 
     fn handle_legend_key(&mut self, key: KeyEvent) {
-
         // Details modal owns its own bindings while open.
         if self.legend_details_visible {
             self.handle_legend_details_key(key);
@@ -1559,8 +1638,8 @@ impl App {
                 // parser but the legend has its own little state.
                 self.legend_selected = 0;
             }
-            (KeyCode::Char('G'), _) if !self.series.is_empty() => {
-                self.legend_selected = self.series.len() - 1;
+            (KeyCode::Char('G'), _) if !self.active_legend_series().is_empty() => {
+                self.legend_selected = self.active_legend_series().len() - 1;
             }
             (KeyCode::Char(' '), KeyModifiers::NONE) | (KeyCode::Enter, _) => {
                 self.legend_toggle_current();
@@ -1568,7 +1647,9 @@ impl App {
             (KeyCode::Char('a'), KeyModifiers::NONE) => {
                 self.legend_toggle_all();
             }
-            (KeyCode::Char('e'), KeyModifiers::NONE) if !self.series.is_empty() => {
+            (KeyCode::Char('e'), KeyModifiers::NONE)
+                if !self.active_legend_series().is_empty() =>
+            {
                 self.legend_details_visible = true;
                 self.details_cursor = 0;
             }
@@ -1579,10 +1660,11 @@ impl App {
     }
 
     fn move_legend_selection(&mut self, delta: i32) {
-        if self.series.is_empty() {
+        let n = self.active_legend_series().len();
+        if n == 0 {
             return;
         }
-        let n = self.series.len() as i32;
+        let n = n as i32;
         let cur = self.legend_selected as i32;
         let next = (cur + delta).rem_euclid(n);
         self.legend_selected = next as usize;
@@ -1596,8 +1678,8 @@ impl App {
 
     fn handle_legend_details_key(&mut self, key: KeyEvent) {
         let tag_count = self
-            .series
-            .get(self.legend_selected)
+            .active_legend_index()
+            .and_then(|i| self.active_legend_series().get(i))
             .map(|s| s.tags.len())
             .unwrap_or(0);
         match (key.code, key.modifiers) {
@@ -1628,64 +1710,70 @@ impl App {
     }
 
     fn toggle_label_tag_at_cursor(&mut self) {
-        let Some(series) = self.series.get(self.legend_selected) else {
-            return;
+        // Clone the key first so we don't hold a borrow across the
+        // mutation of `legend_label_tags`.
+        let key = {
+            let Some(idx) = self.active_legend_index() else {
+                return;
+            };
+            let series_slice = self.active_legend_series();
+            let Some(series) = series_slice.get(idx) else {
+                return;
+            };
+            let Some((k, _)) = series.tags.get(self.details_cursor) else {
+                return;
+            };
+            k.clone()
         };
-        let Some((key, _)) = series.tags.get(self.details_cursor) else {
-            return;
-        };
-        if let Some(pos) = self.legend_label_tags.iter().position(|k| k == key) {
+        if let Some(pos) = self.legend_label_tags.iter().position(|kk| kk == &key) {
             self.legend_label_tags.remove(pos);
         } else {
-            self.legend_label_tags.push(key.clone());
+            self.legend_label_tags.push(key);
         }
         self.persist_legend_label_tags();
     }
 
-    /// Write the current `legend_label_tags` to the cache under both the
-    /// AST-hash and `(dataset, metric)` keys, and flush to disk. Silent
-    /// no-op when no query has been run yet (no context to key by).
+    /// Write the current `legend_label_tags` to the cache and flush
+    /// to disk. Two keying modes:
+    ///
+    ///   * **Grid view, dashboard tile focused** — key by the tile's
+    ///     `(dataset, metric)` extracted from its MPL. The tile's
+    ///     query hash isn't the editor's, so we deliberately skip
+    ///     the by-hash store and rely on the per-metric one.
+    ///   * **Solo / editor view** — key by `last_query_context`'s
+    ///     hash + `(dataset, metric)`, same as before.
+    ///
+    /// Silent no-op when neither path yields a key.
     fn persist_legend_label_tags(&self) {
-        let Some(ctx) = &self.last_query_context else {
-            return;
-        };
+        if self.view_mode == ViewMode::Grid
+            && let Some(resource) = self.loaded_dashboard.as_ref()
+            && let Some(chart) = resource
+                .dashboard
+                .charts
+                .get(self.selected_chart_idx)
+            && let crate::dashboard::Query::Mpl(mpl) =
+                crate::dashboard::classify_chart_query(chart)
+            && let Ok((ds, m)) = crate::axiom::extract_dataset_metric(&mpl)
         {
             let mut cache = self.cache.write().unwrap();
-            cache.set_legend_tags(
-                &ctx.hash,
-                &ctx.dataset,
-                &ctx.metric,
-                self.legend_label_tags.clone(),
-            );
+            cache.set_legend_tags_for_metric(&ds, &m, self.legend_label_tags.clone());
             if let Err(e) = cache.save() {
                 eprintln!("metrics-tui: cache save failed: {e}");
             }
+            return;
         }
-    }
-
-    /// The label to display in the legend for `series`. When the user has
-    /// picked label-tags, build a comma-joined list of their values from
-    /// this series. If none of the chosen keys exist on the series, fall
-    /// back to the auto-generated `series.name` so the row is never blank.
-    pub fn legend_label_for(&self, series: &Series) -> String {
-        if self.legend_label_tags.is_empty() {
-            return series.name.clone();
-        }
-        let parts: Vec<String> = self
-            .legend_label_tags
-            .iter()
-            .filter_map(|k| {
-                series
-                    .tags
-                    .iter()
-                    .find(|(tk, _)| tk == k)
-                    .map(|(_, v)| v.clone())
-            })
-            .collect();
-        if parts.is_empty() {
-            series.name.clone()
-        } else {
-            parts.join(", ")
+        let Some(ctx) = &self.last_query_context else {
+            return;
+        };
+        let mut cache = self.cache.write().unwrap();
+        cache.set_legend_tags(
+            &ctx.hash,
+            &ctx.dataset,
+            &ctx.metric,
+            self.legend_label_tags.clone(),
+        );
+        if let Err(e) = cache.save() {
+            eprintln!("metrics-tui: cache save failed: {e}");
         }
     }
 
@@ -1831,8 +1919,17 @@ impl App {
             Command::FetchDatasets => self.fetch_datasets(),
             Command::FetchMetrics => self.fetch_metrics_for_current_query(),
             Command::DismissError => {
+                // Esc in Editor Normal mode: dismiss the error
+                // overlay if there is one; otherwise, when we
+                // arrived in Solo by zooming a dashboard tile, the
+                // same key returns to the grid — mirroring the
+                // "back out" intuition vim users have for Esc.
                 if self.dismiss_error() {
                     self.status = "error dismissed".to_string();
+                } else if self.view_mode == ViewMode::Solo
+                    && self.loaded_dashboard.is_some()
+                {
+                    self.cmd_grid();
                 }
             }
             Command::DeleteCharUnder { count } => {
@@ -3553,15 +3650,23 @@ impl App {
         if self.selected_chart_idx >= n {
             self.selected_chart_idx = 0;
         }
+        self.reload_legend_label_tags();
     }
 
     /// `:solo` — return to single-tile view. Focus drops back to the
     /// editor so the user can type immediately.
     pub fn cmd_solo(&mut self) {
         self.view_mode = ViewMode::Solo;
+        // Dashboard tile grid isn't rendered in Solo — redirect
+        // focus to the Editor so the user isn't stranded on an
+        // invisible pane. Legend stays addressable because the
+        // side column is still drawn.
         if self.focus == Pane::Dashboard {
             self.focus = Pane::Editor;
         }
+        // Switch back to the editor's cached tags so the legend
+        // doesn't keep the last-focused tile's selection.
+        self.reload_legend_label_tags();
     }
 
     /// Move the dashboard-pane selection by `delta`. Wraps within the
@@ -3581,6 +3686,7 @@ impl App {
         let i = self.selected_chart_idx as isize + delta;
         let wrapped = ((i % n as isize) + n as isize) % n as isize;
         self.selected_chart_idx = wrapped as usize;
+        self.reload_legend_label_tags();
     }
 
     /// Spatial navigation in the dashboard grid: pick the chart whose
@@ -3606,9 +3712,11 @@ impl App {
             dir,
         ) {
             self.selected_chart_idx = next;
+            self.reload_legend_label_tags();
             return;
         }
         // No spatial match — fall back to row-major cycle.
+        // `move_dashboard_selection` already reloads tags.
         let delta = match dir {
             SpatialDir::Right | SpatialDir::Down => 1,
             SpatialDir::Left | SpatialDir::Up => -1,
@@ -3650,6 +3758,20 @@ impl App {
                 let text = format!("{pragma_line}{mpl}");
                 self.editor = editor::editor_with_text(&text);
                 self.recompute_diagnostics();
+                // Pin the editor-side query context to the tile's
+                // (dataset, metric) so the upcoming legend-tag
+                // reload finds the right per-metric cache slot
+                // (and any toggle persists under the tile's keys).
+                // We don't know the AST hash without running the
+                // pipeline; pass empty so `resolve_legend_tags`
+                // falls through to the by-metric store.
+                if let Ok((ds, m)) = crate::axiom::extract_dataset_metric(mpl) {
+                    self.last_query_context = Some(QueryContext {
+                        hash: String::new(),
+                        dataset: ds,
+                        metric: m,
+                    });
+                }
             }
             Query::Apl(apl) => {
                 let text = format!(
@@ -3661,8 +3783,37 @@ impl App {
             }
             Query::Note(_) | Query::Empty => {}
         }
+        // Adopt the tile's last-known series into the Solo-view
+        // `app.series` so the chart pane shows the real data
+        // immediately instead of the sin(x) demo placeholder. The
+        // tile data is already in `tile_results` from the dashboard
+        // background fetch — we just promote it. A subsequent `:r`
+        // (or the editor's run-on-Enter) will refresh it if the
+        // user wants a fresh point-in-time.
+        let chart_id = chart.base().id.clone();
+        if let Some(tile) = self.tile_results.get(&chart_id) {
+            self.series = tile.series.clone();
+            self.legend_hidden = vec![false; self.series.len()];
+            if self.legend_selected >= self.series.len() {
+                self.legend_selected = 0;
+            }
+            if let Some(tid) = tile.trace_id.clone() {
+                self.last_trace_id = Some(tid);
+            }
+        } else {
+            // No tile data yet (zoom raced the fetch, or the tile
+            // has no MPL). Clear so the user doesn't see stale
+            // demo data labelled with a different tile's title.
+            self.series.clear();
+            self.legend_hidden.clear();
+            self.legend_selected = 0;
+        }
         self.view_mode = ViewMode::Solo;
         self.focus = Pane::Editor;
+        // Now that `last_query_context` is pinned to the tile and
+        // view mode is Solo, pick up that metric's saved tag
+        // selection (or clear if there's nothing cached).
+        self.reload_legend_label_tags();
         let title = if new_tile.title.is_empty() {
             kind.as_str().to_string()
         } else {
@@ -3709,6 +3860,10 @@ impl App {
         // buffer (line endings normalised by the editor).
         self.last_adopted_seed = seeded.map(|_| self.query_text());
         self.auto_switch_view_mode();
+        // Adopted; pick up the initially focused tile's saved tags
+        // (if any) so the legend renders the right labels from frame
+        // zero, before any tile data lands.
+        self.reload_legend_label_tags();
         // Kick off per-tile fetches so the grid renders live data.
         // Solo mode also benefits when the focused chart turns out to
         // have an MPL query — the existing single-tile flow runs on
@@ -4414,6 +4569,18 @@ impl App {
                         entry.error = Some(format!("{e}"));
                     }
                 }
+                // If the finished tile is the currently-focused one,
+                // reload tags now — `adopt_dashboard` ran the lookup
+                // before any tile data was around, but the lookup is
+                // metric-keyed and doesn't depend on data, so this is
+                // a cheap no-op in the steady state. It still matters
+                // for the case where the dashboard adopted from
+                // cache, the user toggled tags, then the background
+                // refresh landed and could have stomped buffer
+                // state — keeping things in sync defensively.
+                if self.current_chart_id().as_deref() == Some(&chart_id) {
+                    self.reload_legend_label_tags();
+                }
             }
             AppEvent::DashboardDeleted { uid, result } => {
                 self.busy = false;
@@ -4524,21 +4691,12 @@ impl App {
                             if self.legend_selected >= count {
                                 self.legend_selected = 0;
                             }
-                            // Restore the user's tag-label choice from
-                            // cache via the two-step fallback: exact AST
-                            // hash first, then `(dataset, metric)`.
-                            // Falls back to empty (=> default series
-                            // names) when neither is cached.
-                            if let Some(ctx) = &self.last_query_context {
-                                let tags = self.cache.read().unwrap().resolve_legend_tags(
-                                    &ctx.hash,
-                                    &ctx.dataset,
-                                    &ctx.metric,
-                                );
-                                self.legend_label_tags = tags;
-                            } else {
-                                self.legend_label_tags.clear();
-                            }
+                            // Restore the user's tag-label choice
+                            // from cache for the current active
+                            // context (Solo here = editor's last
+                            // query). Centralised so Grid-view
+                            // focus changes use the same path.
+                            self.reload_legend_label_tags();
                             self.status = format!("{count} series");
                         }
                     }
@@ -6833,6 +6991,48 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_w_l_from_dashboard_goes_to_legend_in_grid() {
+        // After loading a dashboard the app lands focused on the
+        // Dashboard pane in Grid view; Ctrl-w l should hop right
+        // into the Legend column.
+        let mut app = app_with_series(2);
+        app.handle_event(AppEvent::DashboardOpened {
+            uid: "u".into(),
+            result: Ok(multi_chart_resource()),
+        });
+        assert_eq!(app.focus, Pane::Dashboard);
+        app.on_key(ctrl(KeyCode::Char('w')));
+        app.on_key(key(KeyCode::Char('l')));
+        assert_eq!(app.focus, Pane::Legend);
+    }
+
+    #[test]
+    fn ctrl_w_h_from_legend_goes_to_dashboard_in_grid() {
+        // Mirror of the `l` test: from the Legend column, Ctrl-w h
+        // should land back on the Dashboard tile area.
+        let mut app = app_with_series(2);
+        app.handle_event(AppEvent::DashboardOpened {
+            uid: "u".into(),
+            result: Ok(multi_chart_resource()),
+        });
+        app.set_focus(Pane::Legend);
+        app.on_key(ctrl(KeyCode::Char('w')));
+        app.on_key(key(KeyCode::Char('h')));
+        assert_eq!(app.focus, Pane::Dashboard);
+    }
+
+    #[test]
+    fn ctrl_w_h_from_legend_goes_to_editor_in_solo() {
+        // Without a loaded dashboard the previous behaviour stands:
+        // Ctrl-w h from Legend falls back to Editor.
+        let mut app = app_with_series(2);
+        app.set_focus(Pane::Legend);
+        app.on_key(ctrl(KeyCode::Char('w')));
+        app.on_key(key(KeyCode::Char('h')));
+        assert_eq!(app.focus, Pane::Editor);
+    }
+
+    #[test]
     fn ctrl_w_to_legend_refused_when_no_series() {
         let mut app = test_app();
         app.series.clear();
@@ -6905,7 +7105,8 @@ mod tests {
         // Toggle host as a label tag.
         app.on_key(key(KeyCode::Char(' ')));
         assert_eq!(app.legend_label_tags, vec!["host".to_string()]);
-        assert_eq!(app.legend_label_for(&app.series[0]), "db-01".to_string());
+        let summary = crate::chart::summarize_legend(&app.series, &app.legend_label_tags);
+        assert_eq!(summary.rows, vec!["db-01".to_string()]);
         // Move down to `region` and toggle.
         app.on_key(key(KeyCode::Char('j')));
         app.on_key(key(KeyCode::Char(' ')));
@@ -6913,10 +7114,8 @@ mod tests {
             app.legend_label_tags,
             vec!["host".to_string(), "region".to_string()]
         );
-        assert_eq!(
-            app.legend_label_for(&app.series[0]),
-            "db-01, us".to_string()
-        );
+        let summary = crate::chart::summarize_legend(&app.series, &app.legend_label_tags);
+        assert_eq!(summary.rows, vec!["db-01, us".to_string()]);
         // Untoggle host: cursor is on `region` (idx 2), `k` moves to `host` (1).
         app.on_key(key(KeyCode::Char('k')));
         app.on_key(key(KeyCode::Char(' ')));
@@ -7110,13 +7309,332 @@ mod tests {
     }
 
     #[test]
+    fn legend_details_picker_reads_focused_dashboard_tile_series() {
+        // Regression: opening the `e` tag picker in Grid view used
+        // to render `app.series` (the demo sin(x)/(no tags)). It
+        // must read the focused tile's series from `tile_results`
+        // instead, and toggles must persist `legend_label_tags`.
+        let mut app = app_with_series(1); // editor has sin(x) demo
+        app.handle_event(AppEvent::DashboardOpened {
+            uid: "u".into(),
+            result: Ok(multi_chart_resource()),
+        });
+        // Inject a faux tile result for `tl` with two tagged series.
+        let tile_series = vec![
+            crate::chart::Series {
+                name: "top-left {h1,us}".into(),
+                tags: vec![
+                    ("host".into(), "h1".into()),
+                    ("region".into(), "us".into()),
+                ],
+                points: vec![],
+                color: crate::chart::color_for(0),
+            },
+            crate::chart::Series {
+                name: "top-left {h2,us}".into(),
+                tags: vec![
+                    ("host".into(), "h2".into()),
+                    ("region".into(), "us".into()),
+                ],
+                points: vec![],
+                color: crate::chart::color_for(1),
+            },
+        ];
+        app.tile_results.insert(
+            "tl".into(),
+            TileQueryResult {
+                busy: false,
+                series: tile_series,
+                error: None,
+                trace_id: None,
+            },
+        );
+        assert_eq!(app.selected_chart_idx, 0); // `tl`
+
+        // active_legend_series should now point at the tile, not the editor.
+        let active = app.active_legend_series();
+        assert_eq!(active.len(), 2);
+        assert_eq!(active[0].tags.len(), 2);
+
+        // Move into the Legend pane and open the picker.
+        app.set_focus(Pane::Legend);
+        app.on_key(key(KeyCode::Char('e')));
+        assert!(app.legend_details_visible);
+        assert_eq!(app.details_cursor, 0);
+
+        // Toggle `host` (cursor on row 0) — expect it to land in
+        // legend_label_tags.
+        app.on_key(key(KeyCode::Char(' ')));
+        assert_eq!(app.legend_label_tags, vec!["host".to_string()]);
+
+        // Move to row 1 and toggle `region` too.
+        app.on_key(key(KeyCode::Char('j')));
+        assert_eq!(app.details_cursor, 1);
+        app.on_key(key(KeyCode::Char(' ')));
+        assert_eq!(
+            app.legend_label_tags,
+            vec!["host".to_string(), "region".to_string()]
+        );
+
+        // `summarize_legend` of the active slice with the picked
+        // tags now produces clean per-series labels.
+        let summary = crate::chart::summarize_legend(
+            app.active_legend_series(),
+            &app.legend_label_tags,
+        );
+        assert_eq!(
+            summary.rows,
+            vec!["h1, us".to_string(), "h2, us".to_string()]
+        );
+    }
+
+    #[test]
+    fn legend_e_opens_picker_for_dashboard_tile_even_when_editor_empty() {
+        // The `e` opener used to gate on `!self.series.is_empty()`;
+        // in Grid view the editor may be empty/demo but the focused
+        // tile has data, so the gate must read `active_legend_series`.
+        let mut app = test_app();
+        app.series.clear();
+        app.legend_hidden.clear();
+        app.handle_event(AppEvent::DashboardOpened {
+            uid: "u".into(),
+            result: Ok(multi_chart_resource()),
+        });
+        app.tile_results.insert(
+            "tl".into(),
+            TileQueryResult {
+                busy: false,
+                series: vec![crate::chart::Series {
+                    name: "top-left {h1}".into(),
+                    tags: vec![("host".into(), "h1".into())],
+                    points: vec![],
+                    color: crate::chart::color_for(0),
+                }],
+                error: None,
+                trace_id: None,
+            },
+        );
+        // set_focus(Legend) refuses on empty editor series; route
+        // through Pane mutation directly for this test.
+        app.focus = Pane::Legend;
+        app.on_key(key(KeyCode::Char('e')));
+        assert!(app.legend_details_visible);
+    }
+
+    #[test]
+    fn esc_from_solo_with_dashboard_returns_to_grid() {
+        // Zooming a tile lands in Solo with focus on Editor.
+        // Pressing Esc in Normal mode should flip back to Grid —
+        // mirroring the "back out" intuition vim users have for
+        // Esc, and removing the need for `:grid` after every zoom.
+        let mut app = app_with_series(2);
+        app.handle_event(AppEvent::DashboardOpened {
+            uid: "u".into(),
+            result: Ok(multi_chart_resource()),
+        });
+        app.tile_results.insert(
+            "tl".into(),
+            TileQueryResult {
+                busy: false,
+                series: vec![crate::chart::Series {
+                    name: "top-left".into(),
+                    tags: vec![],
+                    points: vec![(0.0, 1.0)],
+                    color: crate::chart::color_for(0),
+                }],
+                error: None,
+                trace_id: None,
+            },
+        );
+        app.zoom_selected_chart();
+        assert_eq!(app.view_mode, ViewMode::Solo);
+        assert_eq!(app.focus, Pane::Editor);
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.view_mode, ViewMode::Grid);
+        assert_eq!(app.focus, Pane::Dashboard);
+    }
+
+    #[test]
+    fn esc_prefers_dismissing_error_over_returning_to_grid() {
+        // If there's an active error overlay, Esc dismisses it
+        // first; the next Esc returns to grid. Otherwise users
+        // would silently lose error context on view switches.
+        let mut app = app_with_series(1);
+        app.handle_event(AppEvent::DashboardOpened {
+            uid: "u".into(),
+            result: Ok(multi_chart_resource()),
+        });
+        app.zoom_selected_chart();
+        app.set_error("boom".into());
+        assert_eq!(app.view_mode, ViewMode::Solo);
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.last_error.is_none());
+        assert_eq!(app.view_mode, ViewMode::Solo);
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.view_mode, ViewMode::Grid);
+    }
+
+    #[test]
+    fn esc_in_solo_without_dashboard_stays_in_solo() {
+        // Plain editing session (no dashboard): Esc has no
+        // "back" target, so it falls back to its existing
+        // behaviour (dismiss-error / no-op).
+        let mut app = app_with_series(1);
+        assert_eq!(app.view_mode, ViewMode::Solo);
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.view_mode, ViewMode::Solo);
+    }
+
+    #[test]
+    fn zoom_promotes_tile_series_into_solo_view_not_sin_demo() {
+        // Regression: zooming a tile re-seeded the editor with the
+        // tile's MPL but left `app.series` as the sin(x) demo, so
+        // the Solo chart pane showed the placeholder until the user
+        // hit `:r`. Zoom must promote `tile_results[chart].series`
+        // into `app.series` synchronously.
+        let mut app = app_with_series(1); // editor starts with sin demo
+        app.handle_event(AppEvent::DashboardOpened {
+            uid: "u".into(),
+            result: Ok(multi_chart_resource()),
+        });
+        let tile_series = vec![crate::chart::Series {
+            name: "top-left {h1}".into(),
+            tags: vec![("host".into(), "h1".into())],
+            points: vec![(0.0, 1.0), (1.0, 2.0)],
+            color: crate::chart::color_for(0),
+        }];
+        app.tile_results.insert(
+            "tl".into(),
+            TileQueryResult {
+                busy: false,
+                series: tile_series.clone(),
+                error: None,
+                trace_id: Some("abc123".into()),
+            },
+        );
+        // tl is selected by default.
+        app.zoom_selected_chart();
+        assert_eq!(app.view_mode, ViewMode::Solo);
+        assert_eq!(app.focus, Pane::Editor);
+        // Solo chart now reads tile data, not the sin demo.
+        assert_eq!(app.series.len(), 1);
+        assert_eq!(app.series[0].tags, tile_series[0].tags);
+        assert_eq!(app.series[0].points, tile_series[0].points);
+        // Trace id picked up so `:trace` reports the tile's id.
+        assert_eq!(app.last_trace_id.as_deref(), Some("abc123"));
+        // Legend bookkeeping resized to match new series.
+        assert_eq!(app.legend_hidden, vec![false]);
+    }
+
+    #[test]
+    fn zoom_without_tile_data_clears_series_instead_of_keeping_sin_demo() {
+        // No `tile_results` entry (race: zoom before first fetch).
+        // Better to clear than to mislead the user with the
+        // sin demo labelled as the zoomed tile.
+        let mut app = app_with_series(1);
+        app.handle_event(AppEvent::DashboardOpened {
+            uid: "u".into(),
+            result: Ok(multi_chart_resource()),
+        });
+        app.tile_results.clear();
+        app.zoom_selected_chart();
+        assert_eq!(app.view_mode, ViewMode::Solo);
+        assert!(app.series.is_empty());
+        assert!(app.legend_hidden.is_empty());
+    }
+
+    #[test]
+    fn legend_label_tags_swap_per_tile_when_switching_focus() {
+        // Per-tile state: editing tags on tile A and switching to
+        // tile B must show B's (empty) selection, not A's. Returning
+        // to A restores its selection from cache.
+        let mut app = app_with_series(1);
+        app.handle_event(AppEvent::DashboardOpened {
+            uid: "u".into(),
+            result: Ok(multi_chart_resource()),
+        });
+        // Tile A (tl, idx 0): two tagged series.
+        let series_a = vec![crate::chart::Series {
+            name: "top-left {h1}".into(),
+            tags: vec![
+                ("host".into(), "h1".into()),
+                ("region".into(), "us".into()),
+            ],
+            points: vec![],
+            color: crate::chart::color_for(0),
+        }];
+        let series_b = vec![crate::chart::Series {
+            name: "top-right {e1}".into(),
+            tags: vec![
+                ("env".into(), "prod".into()),
+                ("zone".into(), "a".into()),
+            ],
+            points: vec![],
+            color: crate::chart::color_for(0),
+        }];
+        app.tile_results.insert(
+            "tl".into(),
+            TileQueryResult {
+                busy: false,
+                series: series_a,
+                error: None,
+                trace_id: None,
+            },
+        );
+        app.tile_results.insert(
+            "tr".into(),
+            TileQueryResult {
+                busy: false,
+                series: series_b,
+                error: None,
+                trace_id: None,
+            },
+        );
+        // Pick `host` on tile A via the picker (cursor starts at 0).
+        app.set_focus(Pane::Legend);
+        app.on_key(key(KeyCode::Char('e')));
+        app.on_key(key(KeyCode::Char(' ')));
+        assert_eq!(app.legend_label_tags, vec!["host".to_string()]);
+        app.on_key(key(KeyCode::Esc));
+
+        // Switch to tile B — its (env, zone) tags shouldn't inherit
+        // A's `host` selection.
+        app.set_focus(Pane::Dashboard);
+        app.move_dashboard_selection(1);
+        assert_eq!(app.selected_chart_idx, 1);
+        assert!(
+            app.legend_label_tags.is_empty(),
+            "expected empty tag selection for tile B, got {:?}",
+            app.legend_label_tags
+        );
+
+        // Pick `env` on tile B.
+        app.set_focus(Pane::Legend);
+        app.on_key(key(KeyCode::Char('e')));
+        app.on_key(key(KeyCode::Char(' ')));
+        assert_eq!(app.legend_label_tags, vec!["env".to_string()]);
+        app.on_key(key(KeyCode::Esc));
+
+        // Back to A — must restore the previously-picked `host`.
+        app.set_focus(Pane::Dashboard);
+        app.move_dashboard_selection(-1);
+        assert_eq!(app.selected_chart_idx, 0);
+        assert_eq!(app.legend_label_tags, vec!["host".to_string()]);
+
+        // And forward to B again — `env` is still set.
+        app.move_dashboard_selection(1);
+        assert_eq!(app.legend_label_tags, vec!["env".to_string()]);
+    }
+
+    #[test]
     fn legend_label_falls_back_when_tag_missing() {
         let mut app = app_with_series(1);
         app.series[0].tags = vec![("region".to_string(), "us".to_string())];
         app.legend_label_tags = vec!["host".to_string()];
-        // No host tag — fall back to the series.name.
-        let got = app.legend_label_for(&app.series[0]);
-        assert_eq!(got, app.series[0].name);
+        // No host tag — fall back to the series.name so the row is
+        // never blank.
+        let summary = crate::chart::summarize_legend(&app.series, &app.legend_label_tags);
+        assert_eq!(summary.rows, vec![app.series[0].name.clone()]);
     }
 
     #[test]
