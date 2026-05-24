@@ -13,73 +13,34 @@ use super::*;
 impl App {
 
     pub fn on_key(&mut self, key: KeyEvent) {
-        // Dashboard picker takes precedence over every other key handler
-        // when it's visible. Owns its own keymap (arrows + Enter +
-        // printable for the filter); only Esc closes it.
-        if self.dashboards.visible {
-            self.handle_dashboards_picker_key(key);
-            return;
-        }
-
-        // `:time` quick-select overlay. Owns its own modal keymap so
-        // motion keys don't bleed through to the editor/dashboard.
-        if self.time_picker.is_some() {
-            self.handle_time_picker_key(key);
-            return;
-        }
-
-        // Help modal: owns its own scroll-friendly keymap. j/k/Ctrl-d/u
-        // scroll, g/G jump to top/bottom, any other key dismisses.
-        // Handled here so the modal works from every pane and mode,
-        // not just the few that had ad-hoc guards before.
-        if self.help_visible {
-            self.handle_help_key(key);
-            return;
-        }
-
-        // `:dashinfo` overlay: any key dismisses. Sits above the picker
-        // logically but below it in priority — they're mutually
-        // exclusive in practice (picker hides itself on Enter).
-        if self.dashinfo_visible {
-            self.dashinfo_visible = false;
-            return;
-        }
-
-        // `:tile json` inspect overlay: any key dismisses.
-        if self.tile_inspect_json.is_some() {
-            self.tile_inspect_json = None;
-            return;
-        }
+        // Overlays own their keymap entirely when visible; checked
+        // before pane / mode dispatch so motion keys don't bleed
+        // through. Picker > time > help > dashinfo > tile-inspect.
+        if self.dashboards.visible { return self.handle_dashboards_picker_key(key); }
+        if self.time_picker.is_some() { return self.handle_time_picker_key(key); }
+        if self.help_visible { return self.handle_help_key(key); }
+        if self.dashinfo_visible { self.dashinfo_visible = false; return; }
+        if self.tile_inspect_json.is_some() { self.tile_inspect_json = None; return; }
 
         // `Ctrl-w` is the window-prefix in any mode; the next key picks
-        // the target pane. Handled before mode dispatch so it works from
-        // Insert, Visual, and the legend itself.
+        // the target pane. Handled before pane/mode dispatch so it works
+        // from Insert, Visual, and the legend itself.
         if self.pending_ctrl_w {
             self.pending_ctrl_w = false;
-            self.handle_ctrl_w_followup(key);
-            return;
+            return self.handle_ctrl_w_followup(key);
         }
         if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('w') {
             self.pending_ctrl_w = true;
             return;
         }
 
-        // Legend / params / dashboard own their own bindings when
-        // focused; the modal editor's mode is irrelevant on those
-        // surfaces.
-        if self.focus == Pane::Legend {
-            self.handle_legend_key(key);
-            return;
+        // Legend / params / dashboard own their own bindings when focused.
+        match self.focus {
+            Pane::Legend => return self.handle_legend_key(key),
+            Pane::Params => return self.handle_params_key(key),
+            Pane::Dashboard => return self.handle_dashboard_key(key),
+            Pane::Editor => {}
         }
-        if self.focus == Pane::Params {
-            self.handle_params_key(key);
-            return;
-        }
-        if self.focus == Pane::Dashboard {
-            self.handle_dashboard_key(key);
-            return;
-        }
-
         match self.mode {
             Mode::Insert => self.handle_insert_key(key),
             Mode::Normal => self.handle_normal_key(key),
@@ -103,76 +64,47 @@ impl App {
             TileSubMode::AddPick { cursor } => return self.handle_add_pick_key(key, cursor),
             TileSubMode::Idle => {}
         }
+        // `:` drops into the ex-command line while preserving the
+        // current pane so Enter/Esc returns to the grid; `?` opens
+        // the help modal (dismissal is centralised in `on_key`).
+        // `j`/`k` are owned by spatial nav, so vertical scroll uses
+        // vim's by-screen bindings; the renderer clamps each frame.
+        use KeyCode::*;
+        use KeyModifiers as M;
         match (key.code, key.modifiers) {
-            (KeyCode::Esc, _) => {
-                self.focus = Pane::Editor;
-            }
-            (KeyCode::Left, _) | (KeyCode::Char('h'), KeyModifiers::NONE) => {
-                self.move_dashboard_selection_spatial(SpatialDir::Left);
-            }
-            (KeyCode::Right, _) | (KeyCode::Char('l'), KeyModifiers::NONE) => {
-                self.move_dashboard_selection_spatial(SpatialDir::Right);
-            }
-            (KeyCode::Up, _) | (KeyCode::Char('k'), KeyModifiers::NONE) => {
-                self.move_dashboard_selection_spatial(SpatialDir::Up);
-            }
-            (KeyCode::Down, _) | (KeyCode::Char('j'), KeyModifiers::NONE) => {
-                self.move_dashboard_selection_spatial(SpatialDir::Down);
-            }
-            (KeyCode::Tab, _) => {
-                self.move_dashboard_selection(1);
-            }
-            (KeyCode::BackTab, _) => {
-                self.move_dashboard_selection(-1);
-            }
-            (KeyCode::Enter, _) | (KeyCode::Char('v'), KeyModifiers::NONE) => {
-                self.zoom_selected_chart();
-            }
-            // `:` drops into the ex-command line while preserving the
-            // current pane so Enter/Esc returns to the grid. Without
-            // this arm the colon was silently swallowed by the final
-            // `_ => {}` and the user had to Esc back to the editor to
-            // run any `:` command from grid view.
-            (KeyCode::Char(':'), KeyModifiers::NONE)
-            | (KeyCode::Char(':'), KeyModifiers::SHIFT) => self.prefill_command(""),
-            // `?` opens the help modal. Centralised dismissal in
-            // `on_key` means we just trigger here — scrolling and
-            // closing happen above pane dispatch.
-            (KeyCode::Char('?'), _) => self.open_help(),
-            (KeyCode::Char('m'), KeyModifiers::NONE) => self.enter_tile_move(),
-            (KeyCode::Char('s'), KeyModifiers::NONE) => self.enter_tile_resize(),
-            (KeyCode::Char('d'), KeyModifiers::NONE) => self.enter_tile_confirm_delete(),
-            (KeyCode::Char('a'), KeyModifiers::NONE) => self.enter_tile_add_pick(),
-            (KeyCode::Char('R'), KeyModifiers::SHIFT)
-            | (KeyCode::Char('R'), KeyModifiers::NONE) => {
-                self.run_focused_tile_query();
-            }
-            (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
+            (Esc, _) => self.focus = Pane::Editor,
+            (Left, _) | (Char('h'), M::NONE) =>
+                self.move_dashboard_selection_spatial(SpatialDir::Left),
+            (Right, _) | (Char('l'), M::NONE) =>
+                self.move_dashboard_selection_spatial(SpatialDir::Right),
+            (Up, _) | (Char('k'), M::NONE) =>
+                self.move_dashboard_selection_spatial(SpatialDir::Up),
+            (Down, _) | (Char('j'), M::NONE) =>
+                self.move_dashboard_selection_spatial(SpatialDir::Down),
+            (Tab, _) => self.move_dashboard_selection(1),
+            (BackTab, _) => self.move_dashboard_selection(-1),
+            (Enter, _) | (Char('v'), M::NONE) => self.zoom_selected_chart(),
+            (Char(':'), M::NONE) | (Char(':'), M::SHIFT) => self.prefill_command(""),
+            (Char('?'), _) => self.open_help(),
+            (Char('m'), M::NONE) => self.enter_tile_move(),
+            (Char('s'), M::NONE) => self.enter_tile_resize(),
+            (Char('d'), M::NONE) => self.enter_tile_confirm_delete(),
+            (Char('a'), M::NONE) => self.enter_tile_add_pick(),
+            (Char('R'), M::SHIFT) | (Char('R'), M::NONE) => self.run_focused_tile_query(),
+            (Char('r'), M::CONTROL) => {
                 self.run_tile_queries();
                 self.status = format!("refetching {} tile(s)…", self.tile_results.len().max(1));
             }
-            // Vertical scroll. `j`/`k` are owned by spatial nav above
-            // so we use vim's scroll-by-screen bindings here. The
-            // renderer clamps to valid range each frame.
-            (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
-                self.dashboard_scroll = self.dashboard_scroll.saturating_add(10);
-            }
-            (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
-                self.dashboard_scroll = self.dashboard_scroll.saturating_sub(10);
-            }
-            (KeyCode::Char('f'), KeyModifiers::CONTROL) => {
-                self.dashboard_scroll = self.dashboard_scroll.saturating_add(20);
-            }
-            (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
-                self.dashboard_scroll = self.dashboard_scroll.saturating_sub(20);
-            }
-            (KeyCode::Char('g'), KeyModifiers::NONE) => {
-                self.dashboard_scroll = 0;
-            }
-            (KeyCode::Char('G'), KeyModifiers::NONE)
-            | (KeyCode::Char('G'), KeyModifiers::SHIFT) => {
-                self.dashboard_scroll = u16::MAX; // renderer clamps to max
-            }
+            (Char('d'), M::CONTROL) =>
+                self.dashboard_scroll = self.dashboard_scroll.saturating_add(10),
+            (Char('u'), M::CONTROL) =>
+                self.dashboard_scroll = self.dashboard_scroll.saturating_sub(10),
+            (Char('f'), M::CONTROL) =>
+                self.dashboard_scroll = self.dashboard_scroll.saturating_add(20),
+            (Char('b'), M::CONTROL) =>
+                self.dashboard_scroll = self.dashboard_scroll.saturating_sub(20),
+            (Char('g'), M::NONE) => self.dashboard_scroll = 0,
+            (Char('G'), M::NONE) | (Char('G'), M::SHIFT) => self.dashboard_scroll = u16::MAX,
             _ => {}
         }
     }
@@ -220,28 +152,24 @@ impl App {
             return;
         };
         let mut translate = |dx: i32, dy: i32| {
-            let Some(resource) = self.loaded_dashboard.as_mut() else {
-                return;
-            };
+            let Some(resource) = self.loaded_dashboard.as_mut() else { return };
             match tile_ops::translate(&mut resource.dashboard.layout, &id, dx, dy) {
-                Ok(()) => {
-                    self.dashboard_dirty = true;
-                }
-                Err(reason) => {
-                    self.status = format!("move blocked: {reason}");
-                }
+                Ok(()) => self.dashboard_dirty = true,
+                Err(reason) => self.status = format!("move blocked: {reason}"),
             }
         };
+        use KeyCode::*;
+        use KeyModifiers as M;
         match (key.code, key.modifiers) {
-            (KeyCode::Left, _) | (KeyCode::Char('h'), KeyModifiers::NONE) => translate(-1, 0),
-            (KeyCode::Right, _) | (KeyCode::Char('l'), KeyModifiers::NONE) => translate(1, 0),
-            (KeyCode::Up, _) | (KeyCode::Char('k'), KeyModifiers::NONE) => translate(0, -1),
-            (KeyCode::Down, _) | (KeyCode::Char('j'), KeyModifiers::NONE) => translate(0, 1),
-            (KeyCode::Enter, _) => {
+            (Left, _) | (Char('h'), M::NONE) => translate(-1, 0),
+            (Right, _) | (Char('l'), M::NONE) => translate(1, 0),
+            (Up, _) | (Char('k'), M::NONE) => translate(0, -1),
+            (Down, _) | (Char('j'), M::NONE) => translate(0, 1),
+            (Enter, _) => {
                 self.tile_submode = TileSubMode::Idle;
                 self.status = "move committed".to_string();
             }
-            (KeyCode::Esc, _) => self.revert_layout(original),
+            (Esc, _) => self.revert_layout(original),
             _ => {}
         }
     }
@@ -252,80 +180,70 @@ impl App {
             return;
         };
         let mut resize = |dw: i32, dh: i32| {
-            let Some(resource) = self.loaded_dashboard.as_mut() else {
-                return;
-            };
+            let Some(resource) = self.loaded_dashboard.as_mut() else { return };
             match tile_ops::resize(&mut resource.dashboard.layout, &id, dw, dh) {
-                Ok(()) => {
-                    self.dashboard_dirty = true;
-                }
-                Err(reason) => {
-                    self.status = format!("resize blocked: {reason}");
-                }
+                Ok(()) => self.dashboard_dirty = true,
+                Err(reason) => self.status = format!("resize blocked: {reason}"),
             }
         };
+        use KeyCode::*;
+        use KeyModifiers as M;
         match (key.code, key.modifiers) {
-            (KeyCode::Right, _) | (KeyCode::Char('l'), KeyModifiers::NONE) => resize(1, 0),
-            (KeyCode::Left, _) | (KeyCode::Char('h'), KeyModifiers::NONE) => resize(-1, 0),
-            (KeyCode::Down, _) | (KeyCode::Char('j'), KeyModifiers::NONE) => resize(0, 1),
-            (KeyCode::Up, _) | (KeyCode::Char('k'), KeyModifiers::NONE) => resize(0, -1),
-            (KeyCode::Enter, _) => {
+            (Right, _) | (Char('l'), M::NONE) => resize(1, 0),
+            (Left, _) | (Char('h'), M::NONE) => resize(-1, 0),
+            (Down, _) | (Char('j'), M::NONE) => resize(0, 1),
+            (Up, _) | (Char('k'), M::NONE) => resize(0, -1),
+            (Enter, _) => {
                 self.tile_submode = TileSubMode::Idle;
                 self.status = "resize committed".to_string();
             }
-            (KeyCode::Esc, _) => self.revert_layout(original),
+            (Esc, _) => self.revert_layout(original),
             _ => {}
         }
     }
 
     fn handle_confirm_delete_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                let Some(id) = self.current_chart_id() else {
-                    self.tile_submode = TileSubMode::Idle;
-                    return;
-                };
-                if let Some(resource) = self.loaded_dashboard.as_mut()
-                    && let Ok(()) = tile_ops::delete(
-                        &mut resource.dashboard.charts,
-                        &mut resource.dashboard.layout,
-                        &id,
-                    )
-                {
-                    self.dashboard_dirty = true;
-                    let n = resource.dashboard.charts.len();
-                    if self.selected_chart_idx >= n {
-                        self.selected_chart_idx = n.saturating_sub(1);
-                    }
-                    self.status = format!("deleted tile {id}");
-                }
-                self.tile_submode = TileSubMode::Idle;
-            }
-            _ => {
-                self.tile_submode = TileSubMode::Idle;
-                self.status = "delete cancelled".to_string();
-            }
+        if !matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+            self.tile_submode = TileSubMode::Idle;
+            self.status = "delete cancelled".to_string();
+            return;
         }
+        let Some(id) = self.current_chart_id() else {
+            self.tile_submode = TileSubMode::Idle;
+            return;
+        };
+        if let Some(resource) = self.loaded_dashboard.as_mut()
+            && tile_ops::delete(
+                &mut resource.dashboard.charts,
+                &mut resource.dashboard.layout,
+                &id,
+            )
+            .is_ok()
+        {
+            self.dashboard_dirty = true;
+            let n = resource.dashboard.charts.len();
+            if self.selected_chart_idx >= n {
+                self.selected_chart_idx = n.saturating_sub(1);
+            }
+            self.status = format!("deleted tile {id}");
+        }
+        self.tile_submode = TileSubMode::Idle;
     }
 
     fn handle_add_pick_key(&mut self, key: KeyEvent, cursor: usize) {
-        // The picker shows every implemented `VizKind`.
         let kinds = add_pick_kinds();
         let n = kinds.len();
+        use KeyCode::*;
         match (key.code, key.modifiers) {
-            (KeyCode::Esc, _) => {
+            (Esc, _) => {
                 self.tile_submode = TileSubMode::Idle;
                 self.status = "add cancelled".to_string();
             }
-            (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
-                let next = (cursor + n - 1) % n;
-                self.tile_submode = TileSubMode::AddPick { cursor: next };
-            }
-            (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
-                let next = (cursor + 1) % n;
-                self.tile_submode = TileSubMode::AddPick { cursor: next };
-            }
-            (KeyCode::Enter, _) => {
+            (Up, _) | (Char('k'), _) =>
+                self.tile_submode = TileSubMode::AddPick { cursor: (cursor + n - 1) % n },
+            (Down, _) | (Char('j'), _) =>
+                self.tile_submode = TileSubMode::AddPick { cursor: (cursor + 1) % n },
+            (Enter, _) => {
                 let kind = kinds[cursor];
                 if let Some(resource) = self.loaded_dashboard.as_mut() {
                     let id = tile_ops::insert_tile(
@@ -357,74 +275,49 @@ impl App {
         // → Editor; directional keys use the layout to pick the
         // spatial neighbour and fall back to the source pane when
         // there's no neighbour in that direction.
-        let cycle = || -> Pane {
-            match self.focus {
-                Pane::Editor => Pane::Legend,
-                Pane::Legend => Pane::Params,
-                Pane::Params => {
-                    if self.view_mode == ViewMode::Grid {
-                        Pane::Dashboard
-                    } else {
-                        Pane::Editor
-                    }
-                }
-                Pane::Dashboard => Pane::Editor,
-            }
+        use KeyCode::*;
+        use KeyModifiers as M;
+        use Pane::*;
+        let grid = self.view_mode == ViewMode::Grid;
+        let has_dash = grid && self.loaded_dashboard.is_some();
+        // `w` cycles Editor → Legend → Params → (Dashboard if Grid) → Editor.
+        let cycle = || match self.focus {
+            Editor => Legend,
+            Legend => Params,
+            Params => if grid { Dashboard } else { Editor },
+            Dashboard => Editor,
         };
         let next = match (key.code, key.modifiers) {
-            (KeyCode::Char('w'), _) => cycle(),
-            // `Ctrl-w d` jumps straight to the dashboard pane. No-op if
-            // no dashboard is loaded.
-            (KeyCode::Char('d'), _) => {
-                if self.loaded_dashboard.is_some() && self.view_mode == ViewMode::Grid {
-                    Pane::Dashboard
-                } else {
-                    self.status = ":Ctrl-w d: no grid view".to_string();
-                    return;
-                }
+            (Char('w'), _) => cycle(),
+            // `Ctrl-w d` jumps straight to the dashboard pane.
+            (Char('d'), _) if has_dash => Dashboard,
+            (Char('d'), _) => {
+                self.status = ":Ctrl-w d: no grid view".to_string();
+                return;
             }
-            (KeyCode::Char('h'), KeyModifiers::NONE) | (KeyCode::Left, _) => match self.focus {
-                // In Grid view, Legend's left neighbour is the
-                // Dashboard tile area (the graph slot); in Solo
-                // there's no top-left pane, so fall back to Editor.
-                Pane::Legend => {
-                    if self.view_mode == ViewMode::Grid && self.loaded_dashboard.is_some() {
-                        Pane::Dashboard
-                    } else {
-                        Pane::Editor
-                    }
-                }
-                Pane::Params => Pane::Editor,
-                Pane::Editor => Pane::Editor,
-                // Dashboard is already leftmost — no-op.
-                Pane::Dashboard => Pane::Dashboard,
+            // Directional moves: in Grid, Legend's left is Dashboard;
+            // otherwise Editor. Dashboard's right is Legend.
+            (Char('h'), M::NONE) | (Left, _) => match self.focus {
+                Legend if has_dash => Dashboard,
+                Legend | Params => Editor,
+                p => p,
             },
-            (KeyCode::Char('l'), KeyModifiers::NONE) | (KeyCode::Right, _) => match self.focus {
-                Pane::Editor => Pane::Params,
-                Pane::Legend => Pane::Legend,
-                Pane::Params => Pane::Params,
-                // Dashboard's right neighbour is the Legend column.
-                Pane::Dashboard => Pane::Legend,
+            (Char('l'), M::NONE) | (Right, _) => match self.focus {
+                Editor => Params,
+                Dashboard => Legend,
+                p => p,
             },
-            (KeyCode::Char('j'), KeyModifiers::NONE) | (KeyCode::Down, _) => match self.focus {
-                Pane::Legend => Pane::Params,
-                Pane::Editor => Pane::Editor,
-                Pane::Params => Pane::Params,
-                Pane::Dashboard => Pane::Editor,
+            (Char('j'), M::NONE) | (Down, _) => match self.focus {
+                Legend => Params,
+                Dashboard => Editor,
+                p => p,
             },
-            (KeyCode::Char('k'), KeyModifiers::NONE) | (KeyCode::Up, _) => match self.focus {
-                Pane::Params => Pane::Legend,
-                Pane::Editor => {
-                    if self.view_mode == ViewMode::Grid {
-                        Pane::Dashboard
-                    } else {
-                        Pane::Legend
-                    }
-                }
-                Pane::Legend => Pane::Legend,
-                Pane::Dashboard => Pane::Dashboard,
+            (Char('k'), M::NONE) | (Up, _) => match self.focus {
+                Params => Legend,
+                Editor if grid => Dashboard,
+                Editor => Legend,
+                p => p,
             },
-            (KeyCode::Esc, _) => return,
             _ => return,
         };
         self.set_focus(next);
@@ -453,47 +346,35 @@ impl App {
 
     fn handle_params_key(&mut self, key: KeyEvent) {
         let rows = self.param_rows();
+        use KeyCode::*;
+        use KeyModifiers as M;
         match (key.code, key.modifiers) {
-            (KeyCode::Esc, _) | (KeyCode::Char('h'), KeyModifiers::NONE) | (KeyCode::Left, _) => {
-                self.set_focus(Pane::Editor);
-            }
-            (KeyCode::Char('j'), KeyModifiers::NONE) | (KeyCode::Down, _) => {
-                self.move_params_selection(1, &rows);
-            }
-            (KeyCode::Char('k'), KeyModifiers::NONE) | (KeyCode::Up, _) => {
-                self.move_params_selection(-1, &rows);
-            }
-            (KeyCode::Char('g'), KeyModifiers::NONE) => {
-                self.params_selected = 0;
-            }
-            (KeyCode::Char('G'), _) if !rows.is_empty() => {
-                self.params_selected = rows.len() - 1;
-            }
-            // `a` / `i` — add new param. Drop into command mode with a
-            // bare `p ` prefix so the user types `NAME=VALUE`.
-            (KeyCode::Char('a'), KeyModifiers::NONE) | (KeyCode::Char('i'), KeyModifiers::NONE) => {
-                self.prefill_command("p ");
-            }
-            // `e` / `Enter` — edit selected row. Pre-fills with the
-            // current value so the user can tweak in place.
-            (KeyCode::Char('e'), KeyModifiers::NONE) | (KeyCode::Enter, _) => {
+            (Esc, _) | (Char('h'), M::NONE) | (Left, _) => self.set_focus(Pane::Editor),
+            (Char('j'), M::NONE) | (Down, _) => self.move_params_selection(1, &rows),
+            (Char('k'), M::NONE) | (Up, _) => self.move_params_selection(-1, &rows),
+            (Char('g'), M::NONE) => self.params_selected = 0,
+            (Char('G'), _) if !rows.is_empty() => self.params_selected = rows.len() - 1,
+            // `a` / `i` — add new param. Drop into `:p ` and type `NAME=VALUE`.
+            (Char('a'), M::NONE) | (Char('i'), M::NONE) => self.prefill_command("p "),
+            // `e` / `Enter` — edit selected row, pre-filled with current value.
+            (Char('e'), M::NONE) | (Enter, _) => {
                 if let Some(row) = rows.get(self.params_selected) {
                     let v = row.value.as_deref().unwrap_or("");
                     self.prefill_command(&format!("p {}={}", row.name, v));
                 }
             }
-            // `x` / `dd` — clear the selected value.
-            (KeyCode::Char('x'), KeyModifiers::NONE) => {
+            // `x` clears the selected value.
+            (Char('x'), M::NONE) => {
                 if let Some(row) = rows.get(self.params_selected).cloned() {
-                    if self.cli_params.remove(&row.name).is_some() {
-                        self.status = format!("cleared ${}", row.name);
+                    self.status = if self.cli_params.remove(&row.name).is_some() {
+                        format!("cleared ${}", row.name)
                     } else {
-                        self.status = format!("${} not set", row.name);
-                    }
+                        format!("${} not set", row.name)
+                    };
                 }
             }
-            (KeyCode::Char('?'), _) => self.open_help(),
-            (KeyCode::Char('q'), KeyModifiers::NONE) => self.cmd_quit(false),
+            (Char('?'), _) => self.open_help(),
+            (Char('q'), M::NONE) => self.cmd_quit(false),
             _ => {}
         }
     }
@@ -545,38 +426,24 @@ impl App {
             return;
         }
 
+        use KeyCode::*;
+        use KeyModifiers as M;
         match (key.code, key.modifiers) {
-            (KeyCode::Esc, _) | (KeyCode::Char('h'), KeyModifiers::NONE) | (KeyCode::Left, _) => {
-                self.set_focus(Pane::Editor)
-            }
-            (KeyCode::Char('j'), KeyModifiers::NONE) | (KeyCode::Down, _) => {
-                self.move_legend_selection(1);
-            }
-            (KeyCode::Char('k'), KeyModifiers::NONE) | (KeyCode::Up, _) => {
-                self.move_legend_selection(-1);
-            }
-            (KeyCode::Char('g'), KeyModifiers::NONE) => {
-                // `gg` to top — simple two-key here; pending_g lives in the
-                // parser but the legend has its own little state.
-                self.legend_selected = 0;
-            }
-            (KeyCode::Char('G'), _) if !self.active_legend_series().is_empty() => {
-                self.legend_selected = self.active_legend_series().len() - 1;
-            }
-            (KeyCode::Char(' '), KeyModifiers::NONE) | (KeyCode::Enter, _) => {
-                self.legend_toggle_current();
-            }
-            (KeyCode::Char('a'), KeyModifiers::NONE) => {
-                self.legend_toggle_all();
-            }
-            (KeyCode::Char('e'), KeyModifiers::NONE)
-                if !self.active_legend_series().is_empty() =>
-            {
+            (Esc, _) | (Char('h'), M::NONE) | (Left, _) => self.set_focus(Pane::Editor),
+            (Char('j'), M::NONE) | (Down, _) => self.move_legend_selection(1),
+            (Char('k'), M::NONE) | (Up, _) => self.move_legend_selection(-1),
+            // `gg` to top is just `g` here — legend's own one-key state.
+            (Char('g'), M::NONE) => self.legend_selected = 0,
+            (Char('G'), _) if !self.active_legend_series().is_empty() =>
+                self.legend_selected = self.active_legend_series().len() - 1,
+            (Char(' '), M::NONE) | (Enter, _) => self.legend_toggle_current(),
+            (Char('a'), M::NONE) => self.legend_toggle_all(),
+            (Char('e'), M::NONE) if !self.active_legend_series().is_empty() => {
                 self.legend_details_visible = true;
                 self.details_cursor = 0;
             }
-            (KeyCode::Char('?'), _) => self.open_help(),
-            (KeyCode::Char('q'), KeyModifiers::NONE) => self.cmd_quit(false),
+            (Char('?'), _) => self.open_help(),
+            (Char('q'), M::NONE) => self.cmd_quit(false),
             _ => {}
         }
     }
@@ -604,29 +471,18 @@ impl App {
             .and_then(|i| self.active_legend_series().get(i))
             .map(|s| s.tags.len())
             .unwrap_or(0);
+        use KeyCode::*;
+        use KeyModifiers as M;
         match (key.code, key.modifiers) {
-            (KeyCode::Esc, _)
-            | (KeyCode::Char('e'), KeyModifiers::NONE)
-            | (KeyCode::Char('q'), KeyModifiers::NONE) => {
-                self.legend_details_visible = false;
-            }
-            (KeyCode::Char('j'), KeyModifiers::NONE) | (KeyCode::Down, _) if tag_count > 0 => {
-                self.details_cursor = (self.details_cursor + 1) % tag_count;
-            }
-            (KeyCode::Char('k'), KeyModifiers::NONE) | (KeyCode::Up, _) if tag_count > 0 => {
-                self.details_cursor = if self.details_cursor == 0 {
-                    tag_count - 1
-                } else {
-                    self.details_cursor - 1
-                };
-            }
-            (KeyCode::Char('g'), KeyModifiers::NONE) => self.details_cursor = 0,
-            (KeyCode::Char('G'), _) if tag_count > 0 => {
-                self.details_cursor = tag_count - 1;
-            }
-            (KeyCode::Char(' '), KeyModifiers::NONE) | (KeyCode::Enter, _) => {
-                self.toggle_label_tag_at_cursor();
-            }
+            (Esc, _) | (Char('e'), M::NONE) | (Char('q'), M::NONE) =>
+                self.legend_details_visible = false,
+            (Char('j'), M::NONE) | (Down, _) if tag_count > 0 =>
+                self.details_cursor = (self.details_cursor + 1) % tag_count,
+            (Char('k'), M::NONE) | (Up, _) if tag_count > 0 =>
+                self.details_cursor = self.details_cursor.checked_sub(1).unwrap_or(tag_count - 1),
+            (Char('g'), M::NONE) => self.details_cursor = 0,
+            (Char('G'), _) if tag_count > 0 => self.details_cursor = tag_count - 1,
+            (Char(' '), M::NONE) | (Enter, _) => self.toggle_label_tag_at_cursor(),
             _ => {}
         }
     }
@@ -669,45 +525,28 @@ impl App {
     }
 
     fn handle_insert_key(&mut self, key: KeyEvent) {
+        use KeyCode::*;
+        use KeyModifiers as M;
         // Completion popup intercepts a small set of keys.
         if self.completions.visible {
             match (key.code, key.modifiers) {
-                (KeyCode::Esc, _) => {
-                    self.completions.hide();
-                    return;
-                }
-                (KeyCode::Tab, KeyModifiers::NONE) | (KeyCode::Enter, KeyModifiers::NONE) => {
-                    self.accept_completion();
-                    return;
-                }
-                (KeyCode::Up, _) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
-                    self.move_completion_selection(-1);
-                    return;
-                }
-                (KeyCode::Down, _) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
-                    self.move_completion_selection(1);
-                    return;
-                }
+                (Esc, _) => return self.completions.hide(),
+                (Tab, M::NONE) | (Enter, M::NONE) => return self.accept_completion(),
+                (Up, _) | (Char('p'), M::CONTROL) => return self.move_completion_selection(-1),
+                (Down, _) | (Char('n'), M::CONTROL) => return self.move_completion_selection(1),
                 _ => {}
             }
         }
 
         // Trigger keys: Tab and Ctrl-Space.
-        if matches!(
-            (key.code, key.modifiers),
-            (KeyCode::Tab, KeyModifiers::NONE) | (KeyCode::Char(' '), KeyModifiers::CONTROL),
-        ) {
-            self.open_completions();
-            return;
+        if matches!((key.code, key.modifiers), (Tab, M::NONE) | (Char(' '), M::CONTROL)) {
+            return self.open_completions();
         }
-
-        if key.code == KeyCode::Esc {
+        if key.code == Esc {
             self.mode = Mode::Normal;
             return;
         }
-
-        let consumed = self.editor.input(key);
-        if consumed {
+        if self.editor.input(key) {
             if self.completions.visible {
                 self.refresh_completions();
             }
@@ -716,36 +555,22 @@ impl App {
     }
 
     fn handle_normal_key(&mut self, key: KeyEvent) {
-
-        // Hover popup: any key other than `K` dismisses it (so the user can
-        // also re-trigger by pressing `K` over a different ident).
-        if self.hover.is_some() && !matches!((key.code, key.modifiers), (KeyCode::Char('K'), _)) {
+        use KeyCode::*;
+        use KeyModifiers as M;
+        // Hover popup: any key other than `K` dismisses it.
+        if self.hover.is_some() && !matches!((key.code, key.modifiers), (Char('K'), _)) {
             self.hover = None;
         }
-
         // The quick-fix picker takes over a small set of keys while visible.
         if self.quickfix.visible {
             match (key.code, key.modifiers) {
-                (KeyCode::Esc, _) | (KeyCode::Char('q'), KeyModifiers::NONE) => {
-                    self.quickfix.hide();
-                    return;
-                }
-                (KeyCode::Enter, _) => {
-                    self.accept_quickfix();
-                    return;
-                }
-                (KeyCode::Up, _) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
-                    self.move_quickfix_selection(-1);
-                    return;
-                }
-                (KeyCode::Down, _) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
-                    self.move_quickfix_selection(1);
-                    return;
-                }
+                (Esc, _) | (Char('q'), M::NONE) => return self.quickfix.hide(),
+                (Enter, _) => return self.accept_quickfix(),
+                (Up, _) | (Char('p'), M::CONTROL) => return self.move_quickfix_selection(-1),
+                (Down, _) | (Char('n'), M::CONTROL) => return self.move_quickfix_selection(1),
                 _ => return,
             }
         }
-
         match self.cmd_parser.feed(key) {
             Step::Pending | Step::Cancel => {}
             Step::Emit(cmd) => self.run_command(cmd),
@@ -759,21 +584,15 @@ impl App {
     /// (we only consume `Command::Move` emissions); operator keys collapse
     /// the current selection into a range and apply it.
     fn handle_visual_key(&mut self, key: KeyEvent) {
-        // Direct overrides.
+        use KeyCode::*;
+        use KeyModifiers as M;
         match (key.code, key.modifiers) {
-            (KeyCode::Esc, _) => {
-                self.exit_visual();
-                return;
-            }
-            (KeyCode::Char('v'), KeyModifiers::NONE) => {
-                self.exit_visual();
-                return;
-            }
-            (KeyCode::Char('V'), _) => {
+            (Esc, _) | (Char('v'), M::NONE) => return self.exit_visual(),
+            (Char('V'), _) => {
                 self.mode = Mode::VisualLine;
                 return;
             }
-            (KeyCode::Char(op), _) if matches!(op, 'd' | 'c' | 'y' | 'x' | '>' | '<') => {
+            (Char(op), _) if matches!(op, 'd' | 'c' | 'y' | 'x' | '>' | '<') => {
                 let operator = match op {
                     'd' | 'x' => Operator::Delete,
                     'c' => Operator::Change,
@@ -782,14 +601,12 @@ impl App {
                     '<' => Operator::IndentLeft,
                     _ => unreachable!(),
                 };
-                self.apply_visual(operator);
-                return;
+                return self.apply_visual(operator);
             }
             _ => {}
         }
         // Otherwise: feed the parser but only honour pure-motion emissions.
-        // Anything else (operators, find-char, etc.) is dropped — the user
-        // can always Esc and re-key in Normal mode.
+        // Operators / find-char / etc. are dropped — user can Esc back to Normal.
         if let Step::Emit(Command::Move { motion, count }) = self.cmd_parser.feed(key) {
             self.apply_motion(motion, count);
         }
@@ -806,124 +623,70 @@ impl App {
     /// g/G jump to top/bottom; any other key dismisses (including
     /// Esc, q, and `?` itself — the modal behaves like a peek).
     fn handle_help_key(&mut self, key: KeyEvent) {
+        use KeyCode::*;
+        use KeyModifiers as M;
+        let scroll = &mut self.help_scroll;
         match (key.code, key.modifiers) {
-            (KeyCode::Down, _) | (KeyCode::Char('j'), KeyModifiers::NONE) => {
-                self.help_scroll = self.help_scroll.saturating_add(1);
-            }
-            (KeyCode::Up, _) | (KeyCode::Char('k'), KeyModifiers::NONE) => {
-                self.help_scroll = self.help_scroll.saturating_sub(1);
-            }
-            (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
-                self.help_scroll = self.help_scroll.saturating_add(10);
-            }
-            (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
-                self.help_scroll = self.help_scroll.saturating_sub(10);
-            }
-            (KeyCode::PageDown, _) | (KeyCode::Char('f'), KeyModifiers::CONTROL) => {
-                self.help_scroll = self.help_scroll.saturating_add(20);
-            }
-            (KeyCode::PageUp, _) | (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
-                self.help_scroll = self.help_scroll.saturating_sub(20);
-            }
-            (KeyCode::Char('g'), KeyModifiers::NONE) => {
-                self.help_scroll = 0;
-            }
-            (KeyCode::Char('G'), _) => {
-                self.help_scroll = u16::MAX;
-            }
-            _ => {
-                self.help_visible = false;
-            }
+            (Down, _) | (Char('j'), M::NONE) => *scroll = scroll.saturating_add(1),
+            (Up, _) | (Char('k'), M::NONE) => *scroll = scroll.saturating_sub(1),
+            (Char('d'), M::CONTROL) => *scroll = scroll.saturating_add(10),
+            (Char('u'), M::CONTROL) => *scroll = scroll.saturating_sub(10),
+            (PageDown, _) | (Char('f'), M::CONTROL) => *scroll = scroll.saturating_add(20),
+            (PageUp, _) | (Char('b'), M::CONTROL) => *scroll = scroll.saturating_sub(20),
+            (Char('g'), M::NONE) => *scroll = 0,
+            (Char('G'), _) => *scroll = u16::MAX,
+            _ => self.help_visible = false,
         }
     }
 
     fn handle_command_key(&mut self, key: KeyEvent) {
-        // Tab / Shift-Tab drive the completion popup; handled before
-        // anything else so they never reach the printable-char path
-        // below. Every other key resets the popup so successive
-        // insert + tab cycles always start from a fresh candidate set.
+        use KeyCode::*;
+        use KeyModifiers as M;
+        // Tab / Shift-Tab drive the completion popup. Every other key
+        // (besides navigation/accept) hides it so successive insert +
+        // tab cycles always start from a fresh candidate set.
         match (key.code, key.modifiers) {
-            (KeyCode::Tab, _) => {
-                self.handle_cmdline_tab(false);
-                return;
-            }
-            (KeyCode::BackTab, _) => {
-                self.handle_cmdline_tab(true);
-                return;
-            }
-            _ => {
-                // Hide the popup the moment the user does anything
-                // other than navigation/accept keys. Up/Down navigate
-                // the popup; Enter accepts; Esc/Ctrl-c hide it
-                // explicitly via their own arms below.
-                if !matches!(
-                    (key.code, key.modifiers),
-                    (KeyCode::Up, _) | (KeyCode::Down, _) | (KeyCode::Enter, _) | (KeyCode::Esc, _)
-                ) && !matches!(
-                    (key.code, key.modifiers),
-                    (KeyCode::Char('c'), KeyModifiers::CONTROL)
-                ) {
-                    self.cmdline_completions.hide();
-                }
-            }
+            (Tab, _) => return self.handle_cmdline_tab(false),
+            (BackTab, _) => return self.handle_cmdline_tab(true),
+            (Up, _) | (Down, _) | (Enter, _) | (Esc, _) | (Char('c'), M::CONTROL) => {}
+            _ => self.cmdline_completions.hide(),
         }
         match (key.code, key.modifiers) {
-            (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+            (Esc, _) | (Char('c'), M::CONTROL) => {
                 self.cmdline.reset();
                 self.cmdline_completions.hide();
                 self.mode = Mode::Normal;
                 self.restore_cmdline_focus();
             }
-            (KeyCode::Up, _) if self.cmdline_completions.visible => {
-                self.move_cmdline_completion(-1);
-            }
-            (KeyCode::Down, _) if self.cmdline_completions.visible => {
-                self.move_cmdline_completion(1);
-            }
-            (KeyCode::Enter, _) => {
-                // Enter accepts the highlighted completion if the
-                // popup is up; otherwise it executes the cmdline.
-                if self.cmdline_completions.visible {
-                    self.accept_cmdline_completion();
-                    return;
-                }
+            (Up, _) if self.cmdline_completions.visible => self.move_cmdline_completion(-1),
+            (Down, _) if self.cmdline_completions.visible => self.move_cmdline_completion(1),
+            (Enter, _) if self.cmdline_completions.visible => self.accept_cmdline_completion(),
+            (Enter, _) => {
                 let cmd = std::mem::take(&mut self.cmdline.buf);
                 self.cmdline.cursor = 0;
                 self.mode = Mode::Normal;
                 self.execute_command(cmd.trim());
                 self.restore_cmdline_focus();
             }
-            (KeyCode::Backspace, _) => {
-                if self.cmdline.buf.is_empty() {
-                    // Empty cmdline + Backspace cancels, like vim.
-                    self.mode = Mode::Normal;
-                } else {
-                    self.cmdline.backspace();
-                }
-            }
-            (KeyCode::Delete, _) => self.cmdline.delete_forward(),
-            (KeyCode::Left, _) => self.cmdline.move_left(),
-            (KeyCode::Right, _) => self.cmdline.move_right(),
-            (KeyCode::Home, _) | (KeyCode::Char('a'), KeyModifiers::CONTROL) => {
-                self.cmdline.move_home();
-            }
-            (KeyCode::End, _) | (KeyCode::Char('e'), KeyModifiers::CONTROL) => {
-                self.cmdline.move_end();
-            }
-            (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
-                // Clear from cursor to start — standard readline behaviour.
+            // Empty cmdline + Backspace cancels, like vim.
+            (Backspace, _) if self.cmdline.buf.is_empty() => self.mode = Mode::Normal,
+            (Backspace, _) => self.cmdline.backspace(),
+            (Delete, _) => self.cmdline.delete_forward(),
+            (Left, _) => self.cmdline.move_left(),
+            (Right, _) => self.cmdline.move_right(),
+            (Home, _) | (Char('a'), M::CONTROL) => self.cmdline.move_home(),
+            (End, _) | (Char('e'), M::CONTROL) => self.cmdline.move_end(),
+            (Char('u'), M::CONTROL) => {
+                // Clear from cursor to start — readline standard.
                 let to = self.cmdline.byte_cursor();
                 self.cmdline.buf.drain(..to);
                 self.cmdline.cursor = 0;
             }
-            (KeyCode::Char('k'), KeyModifiers::CONTROL) => {
-                // Clear from cursor to end.
+            (Char('k'), M::CONTROL) => {
                 let from = self.cmdline.byte_cursor();
                 self.cmdline.buf.truncate(from);
             }
-            (KeyCode::Char(c), m) if m == KeyModifiers::NONE || m == KeyModifiers::SHIFT => {
-                self.cmdline.insert_char(c);
-            }
+            (Char(c), m) if m == M::NONE || m == M::SHIFT => self.cmdline.insert_char(c),
             _ => {}
         }
     }
@@ -977,86 +740,49 @@ impl App {
                 self.set_time_range(format!("now-{duration}"), "now".to_string());
                 return;
             }
-            (KeyCode::Up, _)
-            | (KeyCode::Char('k'), KeyModifiers::NONE)
-            | (KeyCode::BackTab, _) => {
-                next_cursor = (cursor + n - 1) % n;
-            }
-            (KeyCode::Down, _)
-            | (KeyCode::Char('j'), KeyModifiers::NONE)
-            | (KeyCode::Tab, _) => {
-                next_cursor = (cursor + 1) % n;
-            }
-            (KeyCode::Char('g'), KeyModifiers::NONE) => {
-                next_cursor = 0;
-            }
-            (KeyCode::Char('G'), _) => {
-                next_cursor = n - 1;
-            }
+            (KeyCode::Up, _) | (KeyCode::Char('k'), KeyModifiers::NONE) | (KeyCode::BackTab, _) =>
+                next_cursor = (cursor + n - 1) % n,
+            (KeyCode::Down, _) | (KeyCode::Char('j'), KeyModifiers::NONE) | (KeyCode::Tab, _) =>
+                next_cursor = (cursor + 1) % n,
+            (KeyCode::Char('g'), KeyModifiers::NONE) => next_cursor = 0,
+            (KeyCode::Char('G'), _) => next_cursor = n - 1,
             _ => {}
         }
         self.time_picker = Some(TimePickerState::Presets { cursor: next_cursor });
     }
 
     fn handle_time_custom_key(&mut self, mut picker: CustomRangePicker, key: KeyEvent) {
-        match (key.code, key.modifiers) {
-            (KeyCode::Esc, _) => {
-                // Step back to the preset list rather than closing
-                // outright — lets the user undo Custom without losing
-                // their place in the picker.
-                self.time_picker = Some(TimePickerState::Presets {
-                    cursor: TIME_PRESET_CUSTOM_INDEX,
-                });
-            }
-            (KeyCode::Enter, _) => {
+        use KeyCode::*;
+        use KeyModifiers as M;
+        // Day/week/month shifts and Tab all keep the overlay open;
+        // factored into a closure to avoid repeating the wrap+return.
+        let keep = |p: CustomRangePicker| Some(TimePickerState::Custom(p));
+        self.time_picker = match (key.code, key.modifiers) {
+            // Esc steps back to the preset list rather than closing,
+            // so the user can undo Custom without losing their place.
+            (Esc, _) => Some(TimePickerState::Presets { cursor: TIME_PRESET_CUSTOM_INDEX }),
+            (Enter, _) => {
                 let (start, end) = picker.to_range();
                 self.set_time_range(start, end);
-                // set_time_range doesn't touch time_picker; explicit None.
-                self.time_picker = None;
+                None
             }
-            (KeyCode::Tab, _)
-            | (KeyCode::BackTab, _)
-            | (KeyCode::Char('\t'), _) => {
+            (Tab, _) | (BackTab, _) | (Char('\t'), _) => {
                 picker.focus = match picker.focus {
                     CustomField::Start => CustomField::End,
                     CustomField::End => CustomField::Start,
                 };
-                self.time_picker = Some(TimePickerState::Custom(picker));
+                keep(picker)
             }
-            (KeyCode::Left, _) | (KeyCode::Char('h'), KeyModifiers::NONE) => {
-                picker.shift_days(-1);
-                self.time_picker = Some(TimePickerState::Custom(picker));
-            }
-            (KeyCode::Right, _) | (KeyCode::Char('l'), KeyModifiers::NONE) => {
-                picker.shift_days(1);
-                self.time_picker = Some(TimePickerState::Custom(picker));
-            }
-            (KeyCode::Up, _) | (KeyCode::Char('k'), KeyModifiers::NONE) => {
-                picker.shift_days(-7);
-                self.time_picker = Some(TimePickerState::Custom(picker));
-            }
-            (KeyCode::Down, _) | (KeyCode::Char('j'), KeyModifiers::NONE) => {
-                picker.shift_days(7);
-                self.time_picker = Some(TimePickerState::Custom(picker));
-            }
-            (KeyCode::Char('<'), _)
-            | (KeyCode::Char(','), KeyModifiers::SHIFT)
-            | (KeyCode::Char('['), KeyModifiers::NONE) => {
-                picker.shift_month(-1);
-                self.time_picker = Some(TimePickerState::Custom(picker));
-            }
-            (KeyCode::Char('>'), _)
-            | (KeyCode::Char('.'), KeyModifiers::SHIFT)
-            | (KeyCode::Char(']'), KeyModifiers::NONE) => {
-                picker.shift_month(1);
-                self.time_picker = Some(TimePickerState::Custom(picker));
-            }
-            _ => {
-                // Unrecognised key — keep the overlay open and the
-                // picker state intact.
-                self.time_picker = Some(TimePickerState::Custom(picker));
-            }
-        }
+            (Left, _) | (Char('h'), M::NONE) => { picker.shift_days(-1); keep(picker) }
+            (Right, _) | (Char('l'), M::NONE) => { picker.shift_days(1); keep(picker) }
+            (Up, _) | (Char('k'), M::NONE) => { picker.shift_days(-7); keep(picker) }
+            (Down, _) | (Char('j'), M::NONE) => { picker.shift_days(7); keep(picker) }
+            (Char('<'), _) | (Char(','), M::SHIFT) | (Char('['), M::NONE) =>
+                { picker.shift_month(-1); keep(picker) }
+            (Char('>'), _) | (Char('.'), M::SHIFT) | (Char(']'), M::NONE) =>
+                { picker.shift_month(1); keep(picker) }
+            _ => keep(picker),
+        };
     }
 
     /// Keymap for the dashboard picker overlay. The filter is
@@ -1064,23 +790,15 @@ impl App {
     /// removes the last char, and navigation keys scroll the filtered
     /// list.
     fn handle_dashboards_picker_key(&mut self, key: KeyEvent) {
+        use KeyCode::*;
+        use KeyModifiers as M;
         match (key.code, key.modifiers) {
-            (KeyCode::Esc, _) => {
-                self.dashboards.hide();
-            }
-            (KeyCode::Up, _) | (KeyCode::Char('k'), KeyModifiers::CONTROL) => {
-                self.dashboards.move_cursor(-1);
-            }
-            (KeyCode::Down, _) | (KeyCode::Char('j'), KeyModifiers::CONTROL) => {
-                self.dashboards.move_cursor(1);
-            }
-            (KeyCode::PageUp, _) => {
-                self.dashboards.move_cursor(-10);
-            }
-            (KeyCode::PageDown, _) => {
-                self.dashboards.move_cursor(10);
-            }
-            (KeyCode::Enter, _) => {
+            (Esc, _) => self.dashboards.hide(),
+            (Up, _) | (Char('k'), M::CONTROL) => { self.dashboards.move_cursor(-1); }
+            (Down, _) | (Char('j'), M::CONTROL) => { self.dashboards.move_cursor(1); }
+            (PageUp, _) => { self.dashboards.move_cursor(-10); }
+            (PageDown, _) => { self.dashboards.move_cursor(10); }
+            (Enter, _) => {
                 if let Some(sel) = self.dashboards.selected() {
                     let uid = sel.uid.clone();
                     let name = sel.name().to_string();
@@ -1090,11 +808,11 @@ impl App {
                 }
                 self.dashboards.hide();
             }
-            (KeyCode::Backspace, _) => {
+            (Backspace, _) => {
                 self.dashboards.filter.pop();
                 self.dashboards.cursor = 0;
             }
-            (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) => {
+            (Char(c), m) if !m.contains(M::CONTROL) => {
                 self.dashboards.filter.push(c);
                 self.dashboards.cursor = 0;
             }
