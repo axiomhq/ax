@@ -584,7 +584,7 @@ fn draw_grid_tile(
         // classifier decides whether the chart is truly APL (only
         // those should render the APL placeholder) versus "no query
         // at all".
-        match crate::dashboard::classify_chart_query(chart) {
+        match crate::dashboard::extract_query(chart) {
             crate::dashboard::Query::Apl(text) => Body::Apl(text),
             _ => Body::Empty,
         }

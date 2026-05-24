@@ -191,8 +191,7 @@ impl Cache {
     }
 
     /// Cached values for a single tag on a `(dataset, metric)`. Empty when
-    /// nothing is cached. Will feed tag-value completion in 10.x.
-    #[allow(dead_code)]
+    /// nothing is cached. Feeds tag-value completion.
     pub fn tag_values_for(&self, dataset: &str, metric: &str, tag: &str) -> Vec<String> {
         self.data
             .tag_values_by_metric
@@ -236,8 +235,7 @@ impl Cache {
             );
     }
 
-    /// Cached metric names for a dataset; used by tests today and completions later.
-    #[allow(dead_code)]
+    /// Cached metric names for a dataset; feeds completions.
     pub fn metric_names(&self, dataset: &str) -> Vec<String> {
         self.data
             .metrics_by_dataset

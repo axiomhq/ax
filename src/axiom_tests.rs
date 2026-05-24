@@ -241,18 +241,18 @@ fn decodes_metrics_info() {
 #[test]
 fn extract_dataset_from_backticked() {
     assert_eq!(
-        extract_dataset("`home`:`temp` | align to 5m using avg").unwrap(),
+        extract_dataset_metric("`home`:`temp` | align to 5m using avg").unwrap().0,
         "home"
     );
     assert_eq!(
-        extract_dataset("`k8s-metrics-dev`:cpu_usage[1h..]").unwrap(),
+        extract_dataset_metric("`k8s-metrics-dev`:cpu_usage[1h..]").unwrap().0,
         "k8s-metrics-dev"
     );
 }
 
 #[test]
 fn extract_dataset_from_plain() {
-    assert_eq!(extract_dataset("home:temp | align to 1m").unwrap(), "home");
+    assert_eq!(extract_dataset_metric("home:temp | align to 1m").unwrap().0, "home");
 }
 
 #[test]
@@ -271,13 +271,13 @@ fn extract_dataset_skips_leading_line_comment() {
 #[test]
 fn extract_dataset_skips_multiple_comments() {
     let q = "// pragma\n// another\n/* block */ `home`:temp";
-    assert_eq!(extract_dataset(q).unwrap(), "home");
+    assert_eq!(extract_dataset_metric(q).unwrap().0, "home");
 }
 
 #[test]
 fn extract_dataset_errors_on_garbage() {
-    assert!(extract_dataset("").is_err());
-    assert!(extract_dataset("`unterminated").is_err());
+    assert!(extract_dataset_metric("").is_err());
+    assert!(extract_dataset_metric("`unterminated").is_err());
 }
 
 #[test]

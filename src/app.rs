@@ -8,7 +8,7 @@ use tui_textarea::{CursorMove, TextArea};
 
 use crate::axiom::{
     self, Client as AxiomClient, DashboardSummary, DatasetSummary, MetricInfo,
-    MetricsQueryResponse, MetricsSeries, extract_dataset,
+    MetricsQueryResponse, MetricsSeries,
 };
 use crate::cache::{Cache, EdgeRoute};
 use crate::chart::{Series, color_for};
@@ -908,12 +908,6 @@ impl App {
         self.editor.lines().join("\n")
     }
 
-    /// Cached dataset names; used in tests today, completions later.
-    #[allow(dead_code)]
-    pub fn datasets(&self) -> Vec<String> {
-        self.cache.read().unwrap().dataset_names()
-    }
-
     pub fn on_key(&mut self, key: KeyEvent) {
         // Dashboard picker takes precedence over every other key handler
         // when it's visible. Owns its own keymap (arrows + Enter +
@@ -1106,7 +1100,7 @@ impl App {
                 .charts
                 .get(self.selected_chart_idx)
             && let crate::dashboard::Query::Mpl(mpl) =
-                crate::dashboard::classify_chart_query(chart)
+                crate::dashboard::extract_query(chart)
             && let Ok((ds, m)) = crate::axiom::extract_dataset_metric(&mpl)
         {
             // Tile context: ignore the editor's query-hash store
@@ -1186,7 +1180,7 @@ impl App {
             .loaded_dashboard
             .as_ref()
             .and_then(|r| r.dashboard.charts.iter().find(|c| c.base().id == id))
-            .and_then(|c| match crate::dashboard::classify_chart_query(c) {
+            .and_then(|c| match crate::dashboard::extract_query(c) {
                 crate::dashboard::Query::Mpl(s) => Some(s),
                 _ => None,
             });
@@ -1752,7 +1746,7 @@ impl App {
                 .charts
                 .get(self.selected_chart_idx)
             && let crate::dashboard::Query::Mpl(mpl) =
-                crate::dashboard::classify_chart_query(chart)
+                crate::dashboard::extract_query(chart)
             && let Ok((ds, m)) = crate::axiom::extract_dataset_metric(&mpl)
         {
             let mut cache = self.cache.write().unwrap();
@@ -2353,7 +2347,7 @@ impl App {
             return;
         }
         let mpl = self.query_text();
-        let dataset = match extract_dataset(&mpl) {
+        let dataset = match axiom::extract_dataset_metric(&mpl).map(|p| p.0) {
             Ok(d) => d,
             Err(e) => {
                 self.status = format!("MPL error: {e}");
@@ -2956,7 +2950,7 @@ impl App {
         }
         // Dataset is best-effort: the metrics explorer just needs `apl` set,
         // and `metricsDataset` is a hint that selects the right tab.
-        let dataset = axiom::extract_dataset(&mpl).ok();
+        let dataset = axiom::extract_dataset_metric(&mpl).map(|p| p.0).ok();
         let (deployment_url, org_id) = match Config::load() {
             Ok(cfg) => match cfg.active() {
                 Ok((_, dep)) => (dep.url.clone(), dep.org_id.clone()),
@@ -3355,14 +3349,14 @@ impl App {
             return;
         };
         // Snapshot what we need to spawn without holding any borrow.
-        // Uses `classify_chart_query` so MPL-stored-under-`apl` charts
+        // Uses `extract_query` so MPL-stored-under-`apl` charts
         // (the home-overview case) also get fetched.
         let charts: Vec<(String, String)> = resource
             .dashboard
             .charts
             .iter()
             .filter_map(|c| {
-                let mpl = match crate::dashboard::classify_chart_query(c) {
+                let mpl = match crate::dashboard::extract_query(c) {
                     crate::dashboard::Query::Mpl(s) if !s.trim().is_empty() => s,
                     _ => return None,
                 };
@@ -5335,15 +5329,6 @@ pub(crate) const GRID_COLS: u32 = 12;
 pub(crate) mod tile_ops {
     use super::GRID_COLS;
     use crate::axiom::{Chart, ChartBase, LayoutItem};
-
-    /// Find or synthesise the LayoutItem for `chart_id`. Charts
-    /// missing a layout entry get one auto-assigned at the first free
-    /// slot the next time they're touched; until then their position
-    /// is (0, 0, 6, 6).
-    #[allow(dead_code)] // exposed for future external callers + tests
-    pub fn layout_for<'a>(layout: &'a [LayoutItem], chart_id: &str) -> Option<&'a LayoutItem> {
-        layout.iter().find(|l| l.i == chart_id)
-    }
 
     /// `true` if `candidate` overlaps any layout entry whose `i` is
     /// **not** `ignore_id`. Two rectangles overlap when they share at

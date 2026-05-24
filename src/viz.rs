@@ -206,22 +206,6 @@ pub fn draw(
     }
 }
 
-// Retained for forward-compat: if a future `VizKind` lands ahead of
-// its renderer, the match arm in `draw` can route here so the user
-// sees an explicit placeholder rather than a build failure.
-#[allow(dead_code)]
-fn draw_unsupported_placeholder(f: &mut Frame, kind: VizKind, block: Block<'_>, area: Rect) {
-    let msg = format!(
-        "{} not yet implemented — use `:viz line` to switch back.",
-        kind.as_str()
-    );
-    let placeholder = Paragraph::new(msg)
-        .alignment(Alignment::Center)
-        .style(Style::default().fg(Color::DarkGray))
-        .block(block);
-    f.render_widget(placeholder, area);
-}
-
 // ── note / spacer / monitor list ───────────────────────────────────────────────────
 
 /// Render `body` as a hand-rolled markdown subset. The supported subset:
@@ -433,8 +417,10 @@ fn draw_spacer(f: &mut Frame, block: Block<'_>, area: Rect) {
     f.render_widget(block, area);
 }
 
-/// Stub renderer for `monitor_list`. The monitors REST endpoint lands
-/// in step 16b; until then the placeholder shows the next-action hint.
+/// Placeholder renderer for `monitor_list`. Same story as
+/// `draw_log_stream`: the monitors fetcher never landed, so the
+/// variant stays wired to a not-implemented notice rather than
+/// breaking dashboards that contain it.
 fn draw_monitor_list(
     f: &mut Frame,
     _opts: &BTreeMap<String, String>,
@@ -455,7 +441,7 @@ fn draw_monitor_list(
         )),
         Line::raw(""),
         Line::from(Span::styled(
-            "renderer ready; GET /v1/monitors fetch wires in step 16b.",
+            "monitor list rendering not implemented in metrics-tui.",
             Style::default().fg(Color::DarkGray),
         )),
     ];
@@ -1279,124 +1265,31 @@ fn palette_color(palette: &str, t: f64) -> Color {
 
 // ── log stream ───────────────────────────────────────────────────────────────
 
-/// Severity bucket parsed from common log fields. Anything else falls
-/// back to `Info`. Used by the renderer to colour rows consistently.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)] // event-decoder lands in the follow-up.
-pub enum Level {
-    Trace,
-    Debug,
-    Info,
-    Warn,
-    Error,
-    Fatal,
-}
-
-impl Level {
-    #[allow(dead_code)] // consumed by the follow-up event decoder.
-    pub fn parse(s: &str) -> Self {
-        match s.to_ascii_lowercase().as_str() {
-            "trace" => Level::Trace,
-            "debug" => Level::Debug,
-            "warn" | "warning" => Level::Warn,
-            "error" | "err" => Level::Error,
-            "fatal" | "critical" | "crit" => Level::Fatal,
-            _ => Level::Info,
-        }
-    }
-
-    fn color(self) -> Color {
-        match self {
-            Level::Trace => Color::DarkGray,
-            Level::Debug => Color::Gray,
-            Level::Info => Color::Cyan,
-            Level::Warn => Color::Yellow,
-            Level::Error => Color::Red,
-            Level::Fatal => Color::Magenta,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Level::Trace => "TRACE",
-            Level::Debug => "DEBUG",
-            Level::Info => "INFO ",
-            Level::Warn => "WARN ",
-            Level::Error => "ERROR",
-            Level::Fatal => "FATAL",
-        }
-    }
-}
-
-/// One decoded log row. Step 15 ships the type but not the network
-/// fetcher; step 15b wires it to `POST /v1/datasets/_apl` and a polling
-/// tokio task.
-#[derive(Clone, Debug)]
-#[allow(dead_code)] // populated by the events decoder in a follow-up.
-pub struct EventRow {
-    pub time: i64,
-    pub level: Level,
-    pub message: String,
-    pub fields: BTreeMap<String, String>,
-}
-
-/// Renderer for the `log_stream` viz. Reads from `app.log_events` once
-/// the App-side plumbing for the events endpoint lands; until then
-/// shows a placeholder explaining the next step. Importantly the
-/// renderer is already a faithful one-pass log-row layout, so wiring
-/// real data into `events` is a one-line change.
+/// Placeholder renderer for the `log_stream` viz kind. The events
+/// fetcher never landed; until it does, a tile of this kind shows a
+/// static "not implemented" notice. The `VizKind::LogStream` variant
+/// stays so existing dashboards containing log-stream charts still
+/// load — they just render this placeholder instead of crashing.
 fn draw_log_stream(f: &mut Frame, _opts: &BTreeMap<String, String>, block: Block<'_>, area: Rect) {
-    let events: &[EventRow] = &[]; // wired to `App.log_events` in step 15b.
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
-
-    if events.is_empty() {
-        let lines = vec![
-            Line::from(Span::styled(
-                "log stream",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::raw(""),
-            Line::from(Span::styled(
-                "renderer ready; events fetcher (POST /v1/datasets/_apl) wires in step 15b.",
-                Style::default().fg(Color::DarkGray),
-            )),
-            Line::from(Span::styled(
-                "in the meantime: rows render with `_time / LEVEL / message` once data arrives.",
-                Style::default().fg(Color::DarkGray),
-            )),
-        ];
-        f.render_widget(Paragraph::new(lines).alignment(Alignment::Center), inner);
-        return;
-    }
-
-    // Tail-first layout: most recent at the bottom (typical for live tail).
-    // We render up to `inner.height` rows from the tail of `events`.
-    let take = (inner.height as usize).min(events.len());
-    let start = events.len() - take;
-    let lines: Vec<Line<'_>> = events[start..]
-        .iter()
-        .map(|ev| {
-            let ts = format_x_label(ev.time as f64);
-            let lvl_color = ev.level.color();
-            Line::from(vec![
-                Span::styled(ts, Style::default().fg(Color::DarkGray)),
-                Span::raw("  "),
-                Span::styled(
-                    ev.level.label(),
-                    Style::default().fg(lvl_color).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("  "),
-                Span::raw(ev.message.clone()),
-            ])
-        })
-        .collect();
-    f.render_widget(Paragraph::new(lines), inner);
+    let lines = vec![
+        Line::from(Span::styled(
+            "log stream",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "log stream rendering not implemented in metrics-tui.",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    f.render_widget(Paragraph::new(lines).alignment(Alignment::Center), inner);
 }
 
 // ── table ──────────────────────────────────────────────────────────────────

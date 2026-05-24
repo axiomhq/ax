@@ -367,10 +367,6 @@ impl Client {
     ///
     /// On `409 Conflict` the server returns a `DashboardError` whose
     /// `code` distinguishes the failure mode (e.g. uid collision).
-    ///
-    /// Wired to `:dash new from-buffer` in step 17e; declared here so
-    /// the client surface is complete before then.
-    #[allow(dead_code)]
     pub async fn create_dashboard(
         &self,
         doc: &DashboardDocument,
@@ -752,11 +748,6 @@ fn extract_trace_id(headers: &reqwest::header::HeaderMap) -> Option<String> {
         }
     }
     None
-}
-
-/// Parse the dataset name out of an MPL query.
-pub fn extract_dataset(mpl: &str) -> Result<String> {
-    Ok(extract_dataset_metric(mpl)?.0)
 }
 
 /// Skip leading whitespace plus any number of MPL line comments

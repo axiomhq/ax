@@ -229,7 +229,7 @@ fn datasets_event_updates_status() {
     }
     app.handle_event(AppEvent::DatasetsFetched(Ok(datasets)));
     assert!(!app.busy);
-    assert_eq!(app.datasets(), vec!["k8s", "logs"]);
+    assert_eq!(app.cache.read().unwrap().dataset_names(), vec!["k8s", "logs"]);
     assert!(app.status.contains("2 dataset"));
 }
 

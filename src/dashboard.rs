@@ -110,10 +110,10 @@ impl VizKind {
         })
     }
 
-    /// `true` for the kinds whose renderer is implemented today. Used by
-    /// tests and by future placeholder UI for the kinds that still route
-    /// through [`crate::viz::draw_unsupported_placeholder`].
-    #[allow(dead_code)] // kept as the canonical list; consumed by tests.
+    /// `true` for the kinds whose renderer is implemented today.
+    /// Used by tests to assert that the dispatch table in
+    /// [`crate::viz::draw`] covers every variant.
+    #[cfg(test)]
     pub fn is_implemented(self) -> bool {
         matches!(
             self,
@@ -257,14 +257,6 @@ impl Tile {
     }
 }
 
-/// Public form of [`extract_query`] for callers outside this module
-/// (notably `App::run_tile_queries`, which needs to know whether to
-/// fan out a fetch for a given chart). Mirrors the internal mapping
-/// exactly so the fetcher and the tile model agree on what's MPL.
-pub fn classify_chart_query(chart: &Chart) -> Query {
-    extract_query(chart)
-}
-
 /// Extract the executable query string from an Axiom `Chart`.
 ///
 /// **Reality check (verified against the real v2 API)**: the public
@@ -280,7 +272,7 @@ pub fn classify_chart_query(chart: &Chart) -> Query {
 /// truly reliable answer comes from running the actual grammar.
 ///
 /// Charts with no `query` fall back to `Query::Empty`.
-fn extract_query(chart: &Chart) -> Query {
+pub fn extract_query(chart: &Chart) -> Query {
     let _ = chart; // chart variant no longer affects classification
     let q = match chart.base().query.as_ref() {
         Some(v) => v,

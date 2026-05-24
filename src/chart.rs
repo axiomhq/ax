@@ -13,7 +13,6 @@ use crate::dashboard::VizKind;
 #[derive(Clone, Debug)]
 pub struct Series {
     pub name: String,
-    #[allow(dead_code)] // populated when API decoding lands
     pub tags: Vec<(String, String)>,
     pub points: Vec<(f64, f64)>,
     pub color: Color,
@@ -31,7 +30,6 @@ pub const PALETTE: &[Color] = &[
     Color::LightYellow,
 ];
 
-#[allow(dead_code)] // used once query results arrive
 pub fn color_for(index: usize) -> Color {
     PALETTE[index % PALETTE.len()]
 }

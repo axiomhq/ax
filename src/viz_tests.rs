@@ -439,22 +439,6 @@ fn strip_leading_pragma_is_noop_without_pragma() {
     assert_eq!(strip_leading_pragma(body), body);
 }
 
-// ── log stream ────────────────────────────────────────────────────────
-
-#[test]
-fn level_parses_common_aliases() {
-    assert_eq!(Level::parse("trace"), Level::Trace);
-    assert_eq!(Level::parse("DEBUG"), Level::Debug);
-    assert_eq!(Level::parse("warn"), Level::Warn);
-    assert_eq!(Level::parse("warning"), Level::Warn);
-    assert_eq!(Level::parse("err"), Level::Error);
-    assert_eq!(Level::parse("FATAL"), Level::Fatal);
-    assert_eq!(Level::parse("crit"), Level::Fatal);
-    // Unknown → Info.
-    assert_eq!(Level::parse("notice"), Level::Info);
-    assert_eq!(Level::parse(""), Level::Info);
-}
-
 #[test]
 fn table_cell_render_handles_each_variant() {
     assert_eq!(TableCell::Null.render(), "—");
