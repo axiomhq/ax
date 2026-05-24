@@ -125,7 +125,7 @@ Esc	close popup / return to Normal
 :help / :h	show this help
 
 ## Dashboards
-:dashboards / :db	open the searchable dashboard picker
+:dash ls	open the searchable dashboard picker
 :open [uid]	open a dashboard by uid (or retry the last picked)
 :dash save	save the loaded dashboard (last-write-wins)
 :dash rm <uid>	delete a dashboard by uid
@@ -134,7 +134,7 @@ Esc	close popup / return to Normal
 :grid / :solo	switch between grid and single-tile views
 :tile add / rm / mv / size / title	per-tile commands (see :h)
 
-## Dashboard picker (`:dashboards`)
+## Dashboard picker (`:dash ls`)
 type	filter as you type
 j / k / ↑ / ↓	move cursor
 Enter	open selected dashboard

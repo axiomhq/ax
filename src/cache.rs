@@ -53,7 +53,7 @@ pub struct CacheData {
     #[serde(default)]
     pub legend_tags_by_metric: BTreeMap<String, BTreeMap<String, Vec<String>>>,
     /// Last-seen full dashboard listing from `GET /v2/dashboards`. Shown
-    /// instantly when the user opens `:dashboards` while a background
+    /// instantly when the user opens `:dash ls` while a background
     /// refresh fetches the live copy.
     #[serde(default)]
     pub dashboards: Option<CachedDashboardList>,

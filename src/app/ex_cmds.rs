@@ -66,7 +66,6 @@ impl App {
             "help" | "h" => self.open_help(),
             "ax" | "axiom" => self.cmd_axiom_open(),
             "viz" => self.cmd_viz(args.first().copied()),
-            "dashboards" | "db" => self.cmd_dashboards(),
             "open" => self.cmd_open(args.first().copied()),
             "trace" => self.cmd_trace(),
             "time" => self.cmd_time(&args),
@@ -218,7 +217,7 @@ impl App {
                 Some(prev) => prev.to_string(),
                 None => {
                     self.set_error(
-                        ":open requires a dashboard uid (or use :dashboards first)".to_string(),
+                        ":open requires a dashboard uid (or use :dash ls first)".to_string(),
                     );
                     return;
                 }
@@ -331,7 +330,7 @@ impl App {
     /// has been opened yet.
     fn cmd_dashinfo(&mut self) {
         if self.loaded_dashboard.is_none() {
-            self.status = "no dashboard loaded; try :dashboards or :open <uid>".to_string();
+            self.status = "no dashboard loaded; try :dash ls or :open <uid>".to_string();
             return;
         }
         self.dashinfo_visible = !self.dashinfo_visible;
@@ -523,6 +522,7 @@ impl App {
     /// `:dash <sub> [args]` — dashboard CRUD against the server.
     ///
     /// Sub-commands:
+    /// * `ls`           — open the searchable dashboard picker
     /// * `save`         — PUT current dashboard (last-write-wins)
     /// * `rm <uid>`     — DELETE a dashboard by uid
     /// * `new from-buffer [name]` — POST a new dashboard from the buffer
@@ -534,17 +534,18 @@ impl App {
         let sub = match args.first().copied() {
             Some(s) => s,
             None => {
-                self.set_error(":dash needs a sub-command (save, rm, new)".to_string());
+                self.set_error(":dash needs a sub-command (ls, save, rm, new)".to_string());
                 return;
             }
         };
         match sub {
+            "ls" => self.cmd_dashboards(),
             "save" => self.cmd_dash_save(),
             "rm" => self.cmd_dash_rm(args.get(1).copied()),
             "new" => self.cmd_dash_new(&args[1..]),
             other => {
                 self.set_error(format!(
-                    ":dash {other}: unknown sub-command (save, rm, new)"
+                    ":dash {other}: unknown sub-command (ls, save, rm, new)"
                 ));
             }
         }
@@ -631,7 +632,7 @@ impl App {
         });
     }
 
-    /// `:dashboards` / `:db` — open the searchable dashboard picker.
+    /// `:dash ls` — open the searchable dashboard picker.
     ///
     /// Snappy path: if the cache holds a prior listing, the picker
     /// opens instantly against the cached items and a background

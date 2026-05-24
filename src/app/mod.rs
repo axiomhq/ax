@@ -146,9 +146,9 @@ pub struct App {
     /// Path of the `.mpl` file currently being edited, if any. Set by `:e <path>`
     /// or the CLI argument; cleared when `:enew` (TODO) opens a fresh buffer.
     /// Searchable picker over the org's dashboards. Hidden by default;
-    /// `:dashboards` (or `:db`) opens it.
+    /// `:dash ls` opens it.
     pub dashboards: DashboardPicker,
-    /// Last dashboard uid the user picked from `:dashboards`. Captured
+    /// Last dashboard uid the user picked from `:dash ls`. Captured
     /// so `:open` (without args) can re-fetch the same one.
     pub last_picked_dashboard: Option<String>,
     /// The dashboard currently loaded in memory. Set by

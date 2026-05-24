@@ -68,7 +68,7 @@ pub enum AppEvent {
         result: anyhow::Result<MetricsQueryResponse>,
     },
     /// Background refresh of the org's dashboard list. Fires after a
-    /// cached list was shown immediately on `:dashboards`. Errors are
+    /// cached list was shown immediately on `:dash ls`. Errors are
     /// surfaced quietly via `status` so they don't disrupt the picker.
     DashboardsRefreshed(anyhow::Result<Vec<DashboardSummary>>),
     /// Background refresh of a single dashboard by uid. Fires after a
@@ -498,7 +498,7 @@ impl QuickFixPicker {
     }
 }
 
-/// Searchable picker over the org's dashboards. Opened by `:dashboards`,
+/// Searchable picker over the org's dashboards. Opened by `:dash ls`,
 /// closed with `Esc`. Filter input is inline at the top of the modal;
 /// every keystroke that isn't navigation extends or backspaces it.
 ///

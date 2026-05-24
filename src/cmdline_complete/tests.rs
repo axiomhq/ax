@@ -19,8 +19,8 @@ fn ds(uid: &str) -> DashboardSummary {
 fn head_completion_returns_matching_known_commands() {
     let r = completions_for("d", 1, &ctx()).unwrap();
     assert!(r.items.contains(&"dash".to_string()));
-    assert!(r.items.contains(&"dashboards".to_string()));
-    // 'q' doesn't have the `d` prefix.
+    assert!(r.items.contains(&"dashinfo".to_string()));
+    // 'q' doesn't have a `d`.
     assert!(!r.items.contains(&"q".to_string()));
 }
 
@@ -38,6 +38,7 @@ fn dash_subcommands_after_head_and_space() {
     assert_eq!(
         r.items,
         vec![
+            "ls".to_string(),
             "new".to_string(),
             "rm".to_string(),
             "save".to_string(),
@@ -64,22 +65,18 @@ fn dash_subcommands_filter_by_fuzzy_match() {
 
 #[test]
 fn head_completion_is_fuzzy() {
-    // `dr` matches `datasets` + `refresh` style? Actually only commands
-    // containing both d and r in order: `dash`, `dashboards`, `dashinfo`,
-    // `datasets` (no r after d) — only `dr` -> d_r needs r after d:
-    // datasets has no r; dashboards has r; dashinfo no r; trace, dr not
-    // applicable. So expect `dashboards` (and `db`/`di`/`ds` lack r).
-    let r = completions_for("dr", 2, &ctx()).unwrap();
-    assert!(r.items.contains(&"dashboards".to_string()));
-    // Strict-prefix `d` candidates without an `r` should be filtered out.
-    assert!(!r.items.contains(&"dash".to_string()));
-    assert!(!r.items.contains(&"datasets".to_string()));
+    // Fuzzy matches non-prefix subsequences: `hp` matches `help`
+    // (h_p) but not strict-prefix candidates that lack a `p` after
+    // the leading `h`.
+    let r = completions_for("hp", 2, &ctx()).unwrap();
+    assert!(r.items.contains(&"help".to_string()));
+    assert!(!r.items.contains(&"h".to_string()));
 }
 
 #[test]
 fn head_completion_ranks_prefix_above_scattered() {
-    // `da` should rank `dash` / `dashboards` / `datasets` (prefix
-    // matches) ahead of any pure-subsequence match.
+    // `da` should rank `dash` / `dashinfo` / `datasets` (prefix matches)
+    // ahead of any pure-subsequence match.
     let r = completions_for("da", 2, &ctx()).unwrap();
     assert!(!r.items.is_empty());
     assert!(

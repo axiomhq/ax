@@ -186,7 +186,7 @@ fn per_uid_dashboard_round_trips_and_forget_evicts_from_both() {
     cache.forget_dashboard("a");
     assert!(cache.cached_dashboard("a").is_none());
     assert!(cache.cached_dashboard("b").is_some());
-    // Also pruned from the listing so :dashboards doesn't show a
+    // Also pruned from the listing so :dash ls doesn't show a
     // tombstoned uid that the next :open would 404 on.
     let items = cache.cached_dashboards().expect("list");
     assert_eq!(items.len(), 1);

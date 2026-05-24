@@ -1,7 +1,7 @@
 //! Tab completion for the `:` Ex-command line.
 //!
 //! Vim-wildmenu-shaped, but **fuzzy** rather than prefix: typing `:dl`
-//! and hitting Tab matches `:datasets` and `:dashboards` (any
+//! and hitting Tab matches `:datasets` and `:dashinfo` (any
 //! subsequence with the right characters in order), with the closest
 //! match selected first. Sub-command and contextual slots (`:dash sa`,
 //! `:open prod`, `:tile add s`) all use the same scorer.
@@ -44,10 +44,8 @@ pub struct CompletionRequest {
 const HEAD_COMMANDS: &[&str] = &[
     "axiom",
     "dash",
-    "dashboards",
     "dashinfo",
     "datasets",
-    "db",
     "di",
     "ds",
     "e",
@@ -77,7 +75,7 @@ const HEAD_COMMANDS: &[&str] = &[
 ];
 
 /// Sub-commands for `:dash`.
-const DASH_SUBS: &[&str] = &["new", "rm", "save"];
+const DASH_SUBS: &[&str] = &["ls", "new", "rm", "save"];
 
 /// Sub-commands for `:tile`.
 const TILE_SUBS: &[&str] = &["add", "inspect", "json", "mv", "rm", "size", "title"];
