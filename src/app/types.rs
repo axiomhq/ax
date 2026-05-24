@@ -1,0 +1,632 @@
+//! Supporting types for `App`: events, input modes, panes, view mode,
+//! tile-edit submode, cmdline + completion state, dashboard picker,
+//! yank entry, time-picker state, etc.
+//!
+//! These are all separated from `App` itself because they're
+//! independent of its god-struct nature — most have small, focused
+//! method surfaces. Keeping them here lets `mod.rs` shrink to the
+//! parts that *do* depend on `App`'s ~45 fields.
+
+use std::collections::BTreeMap;
+
+use crate::axiom::{
+    DashboardSummary, DatasetSummary, MetricInfo, MetricsQueryResponse,
+};
+use crate::chart::Series;
+use crate::completions;
+use crate::mpl;
+
+pub enum AppEvent {
+    DatasetsFetched(anyhow::Result<Vec<DatasetSummary>>),
+    MetricsFetched {
+        dataset: String,
+        result: anyhow::Result<BTreeMap<String, MetricInfo>>,
+    },
+    TagsFetched {
+        dataset: String,
+        metric: String,
+        result: anyhow::Result<Vec<String>>,
+    },
+    TagValuesFetched {
+        dataset: String,
+        metric: String,
+        tag: String,
+        result: anyhow::Result<Vec<String>>,
+    },
+    QueryFinished {
+        id: u64,
+        result: anyhow::Result<MetricsQueryResponse>,
+    },
+    DashboardsFetched(anyhow::Result<Vec<DashboardSummary>>),
+    /// Single dashboard fetched via `GET /v2/dashboards/uid/{uid}`,
+    /// triggered by selecting an entry in the picker or running
+    /// `:open <uid>`. `uid` is carried alongside the result so the
+    /// handler can surface a contextual error if the fetch fails.
+    DashboardOpened {
+        uid: String,
+        result: anyhow::Result<DashboardSummary>,
+    },
+    /// Result of `:dash save` (PUT). On success the server returns the
+    /// new resource with a bumped version; the handler stamps that
+    /// version onto `loaded_dashboard` so the next save doesn't 412.
+    DashboardSaved {
+        uid: String,
+        result: anyhow::Result<crate::axiom::DashboardWriteResponse>,
+    },
+    /// Result of `:dash rm` (DELETE). On success the handler clears
+    /// `loaded_dashboard` if its uid matches the one we just deleted.
+    DashboardDeleted {
+        uid: String,
+        result: anyhow::Result<()>,
+    },
+    /// Result of a single per-tile MPL query, kicked off in parallel
+    /// when a dashboard is adopted in Grid view. `chart_id` is the
+    /// wire chart id (`ChartBase.id`); the handler stores the result
+    /// in `App.tile_results` under that key.
+    TileQueryFinished {
+        chart_id: String,
+        result: anyhow::Result<MetricsQueryResponse>,
+    },
+    /// Background refresh of the org's dashboard list. Fires after a
+    /// cached list was shown immediately on `:dashboards`. Errors are
+    /// surfaced quietly via `status` so they don't disrupt the picker.
+    DashboardsRefreshed(anyhow::Result<Vec<DashboardSummary>>),
+    /// Background refresh of a single dashboard by uid. Fires after a
+    /// cached resource was adopted instantly. The handler updates the
+    /// cached version metadata and, if the editor buffer is still
+    /// pristine from the original adopt, re-adopts the fresh copy.
+    DashboardRefreshed {
+        uid: String,
+        result: anyhow::Result<DashboardSummary>,
+    },
+}
+
+/// Per-tile query state for the grid renderer. Stored in
+/// `App.tile_results` and consumed by `draw_dashboard_grid` to render
+/// live data in each grid cell instead of just an MPL preview.
+#[derive(Debug, Clone, Default)]
+pub struct TileQueryResult {
+    /// `true` while the async fetch is in-flight; flips to `false` on
+    /// success or error.
+    pub busy: bool,
+    /// Last successful series snapshot. Kept across errors so an
+    /// occasional failed refresh doesn't blank the tile.
+    pub series: Vec<Series>,
+    /// Last error message, if the most recent fetch failed.
+    pub error: Option<String>,
+    /// Server trace id from the most recent successful fetch.
+    /// Surfaced by `:trace` so the user can grab it for support/debug.
+    pub trace_id: Option<String>,
+}
+
+/// Default time range applied to every MPL query (the `_mpl` endpoint accepts
+/// relative expressions).
+pub(super) const DEFAULT_START: &str = "now-1h";
+pub(super) const DEFAULT_END: &str = "now";
+
+/// Quick-select choices for the `:time` picker overlay. Each entry is
+/// `(label_shown_in_picker, duration_passed_to_axiom)`; selecting one
+/// applies `start = format!("now-{}", duration)` and `end = "now"`.
+/// Ordered short-to-long so the cursor lands on a sensible default.
+pub const TIME_PRESETS: &[(&str, &str)] = &[
+    ("3h", "3h"),
+    ("6h", "6h"),
+    ("12h", "12h"),
+    ("24h", "24h"),
+    ("2d", "2d"),
+    ("7d", "7d"),
+    ("30d", "30d"),
+    ("90d", "90d"),
+];
+
+/// Sentinel cursor index for the "Custom…" row in the preset picker;
+/// it sits just below the last preset and transitions into the
+/// calendar overlay when selected.
+pub const TIME_PRESET_CUSTOM_INDEX: usize = TIME_PRESETS.len();
+
+/// State for the `:time` overlay. The Presets variant is the
+/// quick-select list; Custom opens a two-calendar date picker for
+/// arbitrary start/end days.
+#[derive(Debug, Clone)]
+pub enum TimePickerState {
+    Presets { cursor: usize },
+    Custom(CustomRangePicker),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CustomField {
+    Start,
+    End,
+}
+
+/// State for the Custom date-picker overlay. Both endpoints carry a
+/// `time::Date`; on apply the start becomes `YYYY-MM-DDT00:00:00Z` and
+/// the end becomes `YYYY-MM-DDT23:59:59Z` so the chosen days are fully
+/// inclusive.
+#[derive(Debug, Clone)]
+pub struct CustomRangePicker {
+    pub start: time::Date,
+    pub end: time::Date,
+    pub focus: CustomField,
+}
+
+impl CustomRangePicker {
+    /// Seed both endpoints to (yesterday → today) UTC so the user has a
+    /// meaningful starting window even before they touch the cursor.
+    pub fn seed() -> Self {
+        let today = time::OffsetDateTime::now_utc().date();
+        let yesterday = today
+            .checked_sub(time::Duration::days(1))
+            .unwrap_or(today);
+        Self {
+            start: yesterday,
+            end: today,
+            focus: CustomField::Start,
+        }
+    }
+
+    /// Mutable accessor for the currently-focused date so the keymap
+    /// can shift it without re-matching on `focus`.
+    pub(super) fn focused_mut(&mut self) -> &mut time::Date {
+        match self.focus {
+            CustomField::Start => &mut self.start,
+            CustomField::End => &mut self.end,
+        }
+    }
+
+    /// Shift the focused date by `days` days, clamping to the valid
+    /// `time::Date` range so we never panic on Jan-1-Min / Dec-31-Max.
+    pub fn shift_days(&mut self, days: i64) {
+        let d = *self.focused_mut();
+        if let Some(next) = d.checked_add(time::Duration::days(days)) {
+            *self.focused_mut() = next;
+        }
+    }
+
+    /// Move the focused date by one month (positive = forward,
+    /// negative = back). Clamps day-of-month when the destination
+    /// month is shorter (Jan 31 + 1 month → Feb 28/29).
+    pub fn shift_month(&mut self, delta: i32) {
+        let d = *self.focused_mut();
+        let (mut y, mut m) = (d.year(), u8::from(d.month()) as i32);
+        m += delta;
+        while m < 1 {
+            m += 12;
+            y -= 1;
+        }
+        while m > 12 {
+            m -= 12;
+            y += 1;
+        }
+        let month = match time::Month::try_from(m as u8) {
+            Ok(mo) => mo,
+            Err(_) => return,
+        };
+        // Clamp the day to the destination month's length.
+        let max_day = month.length(y);
+        let day = d.day().min(max_day);
+        if let Ok(next) = time::Date::from_calendar_date(y, month, day) {
+            *self.focused_mut() = next;
+        }
+    }
+
+    /// Convert the picker into Axiom-acceptable RFC3339 strings.
+    /// `start` is midnight UTC; `end` is 23:59:59 UTC so the chosen
+    /// end day is fully included.
+    pub fn to_range(&self) -> (String, String) {
+        let (lo, hi) = if self.end < self.start {
+            (self.end, self.start)
+        } else {
+            (self.start, self.end)
+        };
+        (
+            format!("{lo}T00:00:00Z"),
+            format!("{hi}T23:59:59Z"),
+        )
+    }
+}
+
+/// Discovery window for `list_metrics`. The `metrics/info` endpoint only accepts
+/// RFC3339 timestamps, so we materialise these per-request from system time.
+pub(super) const DISCOVERY_WINDOW_HOURS: i64 = 24;
+
+pub(super) fn rfc3339_now_window(hours_back: i64) -> (String, String) {
+    let end = time::OffsetDateTime::now_utc();
+    let start = end - time::Duration::hours(hours_back);
+    let fmt = &time::format_description::well_known::Rfc3339;
+    (
+        start.format(fmt).expect("rfc3339 start"),
+        end.format(fmt).expect("rfc3339 end"),
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    Normal,
+    Insert,
+    /// Vim-style ex-command line. Entered by pressing `:` in Normal mode.
+    /// The status bar becomes an input field; `Enter` runs the command,
+    /// `Esc` cancels back to Normal mode.
+    Command,
+    /// Visual mode — motions extend a live selection from
+    /// [`App::visual_anchor`] to the cursor. Operators (`d`/`c`/`y`/`>`/`<`)
+    /// apply to that range and return to Normal mode.
+    Visual,
+    /// Linewise Visual mode — selection is rounded to whole lines.
+    VisualLine,
+}
+
+impl Mode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Mode::Normal => "NORMAL",
+            Mode::Insert => "INSERT",
+            Mode::Command => "COMMAND",
+            Mode::Visual => "VISUAL",
+            Mode::VisualLine => "V-LINE",
+        }
+    }
+}
+
+/// Memo of the most recent `f`/`F`/`t`/`T` find target so `;` / `,` can
+/// repeat it. Cleared by `Esc` only via the parser's `reset`.
+#[derive(Debug, Clone, Copy)]
+pub struct FindMemo {
+    pub ch: char,
+    pub forward: bool,
+    pub till: bool,
+}
+
+/// Which surface receives keystrokes. The legend is interactive: scroll
+/// through series, toggle visibility, show tag details. The editor handles
+/// everything else — there's only one focusable editor for now (multi-tab
+/// support is on the backlog).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pane {
+    Editor,
+    Legend,
+    /// Right-hand pane below the legend, listing user-declared params
+    /// (from the buffer) plus any CLI/`:p` provided values. Focusable so
+    /// the user can add / edit / clear values without typing colon
+    /// commands directly.
+    Params,
+    /// Dashboard grid pane: shown when `App.view_mode == Grid`,
+    /// replacing the single graph area with a layout of bordered tile
+    /// chrome blocks. Arrow keys cycle selection; `Enter`/`v` zooms
+    /// back into Solo on the selected tile.
+    Dashboard,
+}
+
+/// Where the main visualisation area focuses. `Solo` is the
+/// long-standing single-tile renderer; `Grid` shows all of a loaded
+/// dashboard's charts at once. Solo is the default for fresh sessions
+/// and `.mpl` buffers; loading a multi-chart dashboard auto-switches
+/// to Grid (overridable with `:solo`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ViewMode {
+    #[default]
+    Solo,
+    Grid,
+}
+
+/// Tile editing sub-mode while focus is on `Pane::Dashboard`.
+///
+/// `Idle` is the default — arrow keys navigate selection. Any of
+/// `m` / `s` / `d` / `a` enters a sub-mode where the keymap changes:
+///
+/// * `Move{original}` — arrow keys nudge the selected tile by one
+///   virtual-grid cell. `Enter` commits; `Esc` restores `original`.
+///   Mutations that would overlap another tile are rejected.
+/// * `Resize{original}` — Right/Down grow `w`/`h`; Left/Up shrink
+///   (clamped to a 1-cell minimum and 12-col width).
+/// * `ConfirmDelete` — `y` removes the selected tile; any other key
+///   cancels. No keyboard accelerator can fire by accident here.
+/// * `AddPick{cursor}` — kind-picker overlay; arrow keys move the
+///   cursor across the implemented `VizKind`s and `Enter` inserts a
+///   new tile at the first free grid slot.
+#[derive(Debug, Clone, Default)]
+pub enum TileSubMode {
+    #[default]
+    Idle,
+    Move {
+        original: crate::axiom::LayoutItem,
+    },
+    Resize {
+        original: crate::axiom::LayoutItem,
+    },
+    ConfirmDelete,
+    AddPick {
+        cursor: usize,
+    },
+}
+
+/// The (hash, dataset, metric) triple identifying the query whose results
+/// are currently shown. Used to look up and persist the user's choice of
+/// legend-label tags through the two-step cache fallback.
+#[derive(Debug, Clone)]
+pub struct QueryContext {
+    pub hash: String,
+    pub dataset: String,
+    pub metric: String,
+}
+
+/// Buffer + cursor for the `:` command line.
+#[derive(Default, Debug, Clone)]
+pub struct CmdLine {
+    /// Text after the `:` prompt, without the prompt itself.
+    pub buf: String,
+    /// Cursor position in `buf`, measured in chars (not bytes).
+    pub cursor: usize,
+}
+
+impl CmdLine {
+    pub fn reset(&mut self) {
+        self.buf.clear();
+        self.cursor = 0;
+    }
+
+    pub(super) fn byte_cursor(&self) -> usize {
+        self.buf
+            .char_indices()
+            .nth(self.cursor)
+            .map(|(i, _)| i)
+            .unwrap_or(self.buf.len())
+    }
+
+    pub fn insert_char(&mut self, c: char) {
+        let i = self.byte_cursor();
+        self.buf.insert(i, c);
+        self.cursor += 1;
+    }
+
+    pub fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let end = self.byte_cursor();
+        self.cursor -= 1;
+        let start = self.byte_cursor();
+        self.buf.drain(start..end);
+    }
+
+    pub fn delete_forward(&mut self) {
+        let start = self.byte_cursor();
+        if start >= self.buf.len() {
+            return;
+        }
+        let next = self.buf[start..]
+            .char_indices()
+            .nth(1)
+            .map(|(i, _)| start + i)
+            .unwrap_or(self.buf.len());
+        self.buf.drain(start..next);
+    }
+
+    pub fn move_left(&mut self) {
+        if self.cursor > 0 {
+            self.cursor -= 1;
+        }
+    }
+
+    pub fn move_right(&mut self) {
+        let max = self.buf.chars().count();
+        if self.cursor < max {
+            self.cursor += 1;
+        }
+    }
+
+    pub fn move_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    pub fn move_end(&mut self) {
+        self.cursor = self.buf.chars().count();
+    }
+}
+
+/// Visible state of the autocomplete popup. Refreshed on every keystroke
+/// by [`App::refresh_completions`]; on accept we read `items[selected].apply`
+/// directly — the engine + adapter have already pre-rendered the insert
+/// text with the right backtick / keyword-snippet behaviour.
+#[derive(Default, Debug)]
+pub struct CompletionState {
+    pub visible: bool,
+    pub items: Vec<completions::CompletionItem>,
+    pub selected: usize,
+    /// Byte range in the (multi-line) joined editor text covered by the partial token
+    /// that will be replaced on accept.
+    pub replace_range_bytes: (usize, usize),
+    /// Label for the completion category, displayed in the popup title.
+    pub kind_label: &'static str,
+    /// Engine-classified kind of the current completion. `None` when the
+    /// popup is hidden. Used post-accept to trigger background prefetches
+    /// (e.g. tag fetch after a metric pick).
+    pub kind: Option<completions::CompletionKind>,
+}
+
+impl CompletionState {
+    pub(super) fn hide(&mut self) {
+        self.visible = false;
+        self.items.clear();
+        self.selected = 0;
+        self.kind_label = "";
+        self.kind = None;
+    }
+}
+
+/// State for the `:` cmdline tab-completion popup. Lives on `App` so
+/// the UI can read it without re-running the completer every frame,
+/// and so successive Tabs cycle deterministically through the list.
+#[derive(Debug, Default)]
+pub struct CmdlineCompletionState {
+    pub visible: bool,
+    pub items: Vec<String>,
+    pub selected: usize,
+    /// Byte range in `cmdline.buf` covered by the partial token that
+    /// each item replaces on accept. Matches the engine's
+    /// `CompletionRequest.range` exactly.
+    pub replace_range: (usize, usize),
+}
+
+impl CmdlineCompletionState {
+    pub fn hide(&mut self) {
+        self.visible = false;
+        self.items.clear();
+        self.selected = 0;
+        self.replace_range = (0, 0);
+    }
+}
+
+/// Open quick-fix picker. Items are the engine-supplied actions for the
+/// diagnostic the cursor is sitting on; accept replaces `[byte_offset,
+/// byte_offset + byte_length)` with `insert`, then we recompute diagnostics.
+#[derive(Debug, Default)]
+pub struct QuickFixPicker {
+    pub visible: bool,
+    pub actions: Vec<mpl::DiagnosticAction>,
+    pub selected: usize,
+    /// Header rendered above the action list — the diagnostic message.
+    pub title: String,
+}
+
+impl QuickFixPicker {
+    pub(super) fn hide(&mut self) {
+        self.visible = false;
+        self.actions.clear();
+        self.selected = 0;
+        self.title.clear();
+    }
+}
+
+/// Searchable picker over the org's dashboards. Opened by `:dashboards`,
+/// closed with `Esc`. Filter input is inline at the top of the modal;
+/// every keystroke that isn't navigation extends or backspaces it.
+///
+/// Selection on `Enter` records the dashboard id on `App.last_picked_dashboard`
+/// for step 17's `:open` to consume; today it just surfaces a status
+/// message and closes — actual load lands when the dashboard file
+/// format does.
+#[derive(Debug, Default)]
+pub struct DashboardPicker {
+    pub visible: bool,
+    /// All dashboards fetched from the server, in name order.
+    pub items: Vec<DashboardSummary>,
+    /// Substring filter applied case-insensitively to `name` and
+    /// `description`. Empty filter = show everything.
+    pub filter: String,
+    /// Index into [`filtered_indices`] of the currently-highlighted row.
+    pub cursor: usize,
+}
+
+impl DashboardPicker {
+    pub fn hide(&mut self) {
+        self.visible = false;
+        self.filter.clear();
+        self.cursor = 0;
+    }
+
+    pub fn open(&mut self, items: Vec<DashboardSummary>) {
+        let mut sorted = items;
+        sorted.sort_by_key(|a| a.name().to_lowercase());
+        self.items = sorted;
+        self.filter.clear();
+        self.cursor = 0;
+        self.visible = true;
+    }
+
+    /// Replace `items` while preserving the visible state, the user's
+    /// current `filter`, and — when possible — the highlighted uid.
+    /// Used by the background-refresh path so the picker doesn't lose
+    /// the user's place when fresh data arrives.
+    pub fn refresh_items(&mut self, items: Vec<DashboardSummary>) {
+        let selected_uid = self.selected().map(|d| d.uid.clone());
+        let mut sorted = items;
+        sorted.sort_by_key(|a| a.name().to_lowercase());
+        self.items = sorted;
+        let n = self.filtered_indices().len();
+        if n == 0 {
+            self.cursor = 0;
+            return;
+        }
+        if let Some(uid) = selected_uid {
+            let indices = self.filtered_indices();
+            if let Some(pos) = indices
+                .iter()
+                .position(|i| self.items.get(*i).is_some_and(|d| d.uid == uid))
+            {
+                self.cursor = pos;
+                return;
+            }
+        }
+        if self.cursor >= n {
+            self.cursor = n - 1;
+        }
+    }
+
+    /// Indices into `items` that match the current filter, in original
+    /// (sorted) order. Empty filter returns every index.
+    pub fn filtered_indices(&self) -> Vec<usize> {
+        if self.filter.is_empty() {
+            return (0..self.items.len()).collect();
+        }
+        let needle = self.filter.to_lowercase();
+        self.items
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| {
+                d.name().to_lowercase().contains(&needle)
+                    || d.description()
+                        .map(|s| s.to_lowercase().contains(&needle))
+                        .unwrap_or(false)
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Bump the cursor by `delta`, clamped to the current filtered set.
+    /// Returns the new cursor index for convenience.
+    pub fn move_cursor(&mut self, delta: isize) -> usize {
+        let n = self.filtered_indices().len();
+        if n == 0 {
+            self.cursor = 0;
+            return 0;
+        }
+        let i = self.cursor as isize + delta;
+        let wrapped = ((i % n as isize) + n as isize) % n as isize;
+        self.cursor = wrapped as usize;
+        self.cursor
+    }
+
+    /// The `DashboardSummary` currently under the cursor, if any.
+    pub fn selected(&self) -> Option<&DashboardSummary> {
+        let indices = self.filtered_indices();
+        indices.get(self.cursor).and_then(|i| self.items.get(*i))
+    }
+}
+
+/// Contents of the single yank register populated by `y`/`d`/`c` and
+/// Which kind of artifact the editor + file commands operate on. Two
+/// modes today — a long-standing single-buffer MPL workflow and the
+/// dashboard mode introduced in step 17 — distinguished so `:w`
+/// writes the right thing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum BufferMode {
+    /// Editor buffer is canonical; `:w` writes the buffer text.
+    #[default]
+    Mpl,
+    /// `loaded_dashboard` is canonical; `:w` writes the dashboard
+    /// JSON. The editor still shows the focused tile's MPL/APL but
+    /// changes to the buffer do not currently propagate back to the
+    /// dashboard tile on save (deferred to 17d/17e).
+    Dashboard,
+}
+
+/// Contents of the single yank register populated by `y`/`d`/`c` and
+/// consumed by `p`/`P`. `linewise` decides whether paste opens a new
+/// line (`true`) or splices at the cursor (`false`).
+#[derive(Debug, Clone, Default)]
+pub struct YankEntry {
+    pub text: String,
+    pub linewise: bool,
+}
+

@@ -1,5 +1,9 @@
 use super::*;
+use crate::axiom::{
+    DatasetSummary, MetricInfo, MetricsQueryResponse, MetricsSeries,
+};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use std::collections::BTreeMap;
 
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
