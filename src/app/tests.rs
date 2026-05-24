@@ -2596,20 +2596,17 @@ fn tab_with_partial_token_completes_to_top_score() {
     let mut app = test_app();
     open_cmdline(&mut app, "dash sa");
     app.on_key(key(KeyCode::Tab));
-    // `save` and `save!` both match `sa`; the higher-scored one is
-    // spliced and the popup opens to disambiguate.
-    assert!(
-        app.cmdline.buf == "dash save" || app.cmdline.buf == "dash save!",
-        "unexpected splice: {}",
-        app.cmdline.buf
-    );
-    assert!(app.cmdline_completions.visible);
+    // `sa` only matches `save` now (no more `save!`), so this is a
+    // single-candidate completion that splices + appends a space.
+    assert_eq!(app.cmdline.buf, "dash save ");
+    assert!(!app.cmdline_completions.visible);
 }
 
 #[test]
 fn second_tab_cycles_through_candidates() {
     let mut app = test_app();
-    open_cmdline(&mut app, "dash sa");
+    // `d` matches multiple heads, so Tab opens the popup.
+    open_cmdline(&mut app, "d");
     app.on_key(key(KeyCode::Tab));
     let first = app.cmdline.buf.clone();
     app.on_key(key(KeyCode::Tab));
@@ -2618,14 +2615,13 @@ fn second_tab_cycles_through_candidates() {
         first, second,
         "second Tab should swap in the next candidate"
     );
-    // Cycling forward should advance the selection.
     assert_eq!(app.cmdline_completions.selected, 1);
 }
 
 #[test]
 fn shift_tab_cycles_backward() {
     let mut app = test_app();
-    open_cmdline(&mut app, "dash sa");
+    open_cmdline(&mut app, "d");
     app.on_key(key(KeyCode::Tab));
     // BackTab from selection 0 wraps to the last candidate.
     app.on_key(key(KeyCode::BackTab));
@@ -2636,7 +2632,7 @@ fn shift_tab_cycles_backward() {
 #[test]
 fn typing_a_character_dismisses_completion_popup() {
     let mut app = test_app();
-    open_cmdline(&mut app, "dash sa");
+    open_cmdline(&mut app, "d");
     app.on_key(key(KeyCode::Tab));
     assert!(app.cmdline_completions.visible);
     app.on_key(key(KeyCode::Char('v')));
@@ -2646,15 +2642,16 @@ fn typing_a_character_dismisses_completion_popup() {
 #[test]
 fn enter_accepts_highlighted_completion_without_executing() {
     let mut app = test_app();
-    open_cmdline(&mut app, "dash sa");
+    // `d` matches several heads; Tab opens the popup with the top
+    // candidate spliced. Enter then accepts the selection + appends
+    // a space while staying in Command mode (not executing).
+    open_cmdline(&mut app, "d");
     app.on_key(key(KeyCode::Tab));
+    assert!(app.cmdline_completions.visible);
+    let highlighted = app.cmdline.buf.clone();
     app.on_key(key(KeyCode::Enter));
-    // Popup dismissed, buffer keeps the highlighted candidate +
-    // trailing space, and we stay in Command mode for further
-    // typing (Enter as accept, not execute).
     assert!(!app.cmdline_completions.visible);
-    assert!(app.cmdline.buf.starts_with("dash save"));
-    assert!(app.cmdline.buf.ends_with(' '));
+    assert_eq!(app.cmdline.buf, format!("{highlighted} "));
     assert_eq!(app.mode, Mode::Command);
 }
 

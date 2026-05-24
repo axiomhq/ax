@@ -523,28 +523,28 @@ impl App {
     /// `:dash <sub> [args]` — dashboard CRUD against the server.
     ///
     /// Sub-commands:
-    /// * `save`         — PUT current dashboard, version-checked
-    /// * `save!`        — PUT with `overwrite=true` (skip version check)
+    /// * `save`         — PUT current dashboard (last-write-wins)
     /// * `rm <uid>`     — DELETE a dashboard by uid
+    /// * `new from-buffer [name]` — POST a new dashboard from the buffer
     ///
     /// `:dash save` without a loaded dashboard, or `:dash rm` without
     /// an arg, surfaces an error overlay instead of silently doing
     /// nothing.
-    fn cmd_dash(&mut self, args: &[&str], bang: bool) {
+    fn cmd_dash(&mut self, args: &[&str], _bang: bool) {
         let sub = match args.first().copied() {
             Some(s) => s,
             None => {
-                self.set_error(":dash needs a sub-command (save, save!, rm)".to_string());
+                self.set_error(":dash needs a sub-command (save, rm, new)".to_string());
                 return;
             }
         };
         match sub {
-            "save" => self.cmd_dash_save(bang),
+            "save" => self.cmd_dash_save(),
             "rm" => self.cmd_dash_rm(args.get(1).copied()),
             "new" => self.cmd_dash_new(&args[1..]),
             other => {
                 self.set_error(format!(
-                    ":dash {other}: unknown sub-command (save, save!, rm, new)"
+                    ":dash {other}: unknown sub-command (save, rm, new)"
                 ));
             }
         }
@@ -591,11 +591,10 @@ impl App {
         });
     }
 
-    /// `:dash save` (and `:dash save!`). PUTs the in-memory dashboard
-    /// back to the server. With `!`, the server's version check is
-    /// skipped (`overwrite=true`); otherwise a stale-version response
-    /// surfaces as a precise error.
-    fn cmd_dash_save(&mut self, overwrite: bool) {
+    /// `:dash save` — PUT the in-memory dashboard back to the server.
+    /// Always last-write-wins (`overwrite=true`); the bang dance was
+    /// retired along with the rest of the per-command bang surface.
+    fn cmd_dash_save(&mut self) {
         // Clone up-front so the immutable borrow on `loaded_dashboard`
         // ends before `fetch_prepare` reaches `&mut self`.
         let Some((uid, doc, version)) = self
@@ -605,15 +604,12 @@ impl App {
         else {
             return self.set_error(":dash save: no dashboard loaded".to_string());
         };
-        let status_msg = if overwrite {
-            format!("saving dashboard {uid} (overwrite)…")
-        } else {
-            format!("saving dashboard {uid}…")
-        };
-        let Some((client, tx, _)) = self.fetch_prepare(Some(status_msg)) else { return };
+        let Some((client, tx, _)) =
+            self.fetch_prepare(Some(format!("saving dashboard {uid}…")))
+        else { return };
         let uid_for_event = uid.clone();
         self.runtime.spawn(async move {
-            let result = client.put_dashboard(&uid, &doc, version, overwrite, None).await;
+            let result = client.put_dashboard(&uid, &doc, version, true, None).await;
             let _ = tx.send(AppEvent::DashboardSaved { uid: uid_for_event, result });
         });
     }

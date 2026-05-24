@@ -78,7 +78,7 @@ const HEAD_COMMANDS: &[&str] = &[
 ];
 
 /// Sub-commands for `:dash`.
-const DASH_SUBS: &[&str] = &["new", "rm", "save", "save!"];
+const DASH_SUBS: &[&str] = &["new", "rm", "save"];
 
 /// Sub-commands for `:tile`.
 const TILE_SUBS: &[&str] = &["add", "inspect", "json", "mv", "rm", "size", "title"];

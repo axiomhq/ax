@@ -127,7 +127,7 @@ Esc	close popup / return to Normal
 ## Dashboards
 :dashboards / :db	open the searchable dashboard picker
 :open [uid]	open a dashboard by uid (or retry the last picked)
-:dash save / save!	save the loaded dashboard (overwrite with `!`)
+:dash save	save the loaded dashboard (last-write-wins)
 :dash rm <uid>	delete a dashboard by uid
 :dash new <name>	create a new empty dashboard
 :dashinfo / :di	toggle the dashboard summary overlay

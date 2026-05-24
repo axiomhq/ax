@@ -41,7 +41,6 @@ fn dash_subcommands_after_head_and_space() {
             "new".to_string(),
             "rm".to_string(),
             "save".to_string(),
-            "save!".to_string()
         ]
     );
     // Splice range is empty at the trailing position.
@@ -58,8 +57,8 @@ fn tile_subcommands_include_json_inspector() {
 #[test]
 fn dash_subcommands_filter_by_fuzzy_match() {
     let r = completions_for("dash sa", 7, &ctx()).unwrap();
-    // `sa` only appears in order in `save` / `save!`.
-    assert_eq!(r.items, vec!["save".to_string(), "save!".to_string()]);
+    // `sa` only appears in order in `save`.
+    assert_eq!(r.items, vec!["save".to_string()]);
     assert_eq!(r.range, (5, 7));
 }
 
