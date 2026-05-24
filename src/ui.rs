@@ -89,8 +89,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.view_mode == crate::app::ViewMode::Grid && app.loaded_dashboard.is_some() {
         draw_dashboard_grid(f, app, top[0]);
     } else {
-        let viz_kind = app.dashboard.focused_tile().kind;
-        let viz_opts = app.dashboard.focused_tile().opts.clone();
+        let viz_kind = app.viz_kind;
+        let viz_opts = app.viz_opts.clone();
         // `body` is the tile's underlying text. Note tiles read this
         // as markdown; metrics tiles ignore it (they consume `series`
         // instead).
@@ -953,7 +953,7 @@ fn draw_time_preset_overlay(
     let height = (row_count + 5).min(screen.height.saturating_sub(2));
     let title = format!(
         " time · {} → {} ",
-        app.dashboard.time_range.start, app.dashboard.time_range.end
+        app.time_range.start, app.time_range.end
     );
     let inner = modal_frame(
         f,

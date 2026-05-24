@@ -1,25 +1,16 @@
-//! Canonical internal model for the TUI's visualisation surface.
+//! Viz-kind / query classification helpers shared by the editor, the
+//! grid renderer, and the dashboard adoption path.
 //!
-//! Step 11 introduces this module ahead of the multi-tile work in steps 17
-//! and 18. Today the [`Dashboard`] always carries exactly one [`Tile`],
-//! mirroring the single-buffer-one-element world the rest of the app still
-//! lives in. The shape exists now so later steps can load a real
-//! multi-tile dashboard JSON without reworking core state.
-//!
-//! State migration note: `App.series`, `App.legend_*`, `App.busy`,
-//! `App.last_error`, and `App.last_trace_id` currently live on `App`. They
-//! are conceptually the *focused tile's* state and will move onto a
-//! per-`TileId` map in step 17 (when loading a dashboard actually creates
-//! more than one tile). Mechanically straightforward; deferred to keep
-//! step 11 focused on viz-kind dispatch.
+//! Earlier revisions also held an internal `Dashboard`/`Tile`/`Layout`
+//! model that mirrored the wire shape on `App`. That model was never
+//! the source of truth — the grid renderer walks `axiom::Chart`
+//! directly off `loaded_dashboard`, and only the focused tile's viz
+//! kind / opts / time range ever changed during a session. Step 4 of
+//! the cleanup plan collapsed those structures onto `App` directly
+//! (`App.viz_kind`, `App.viz_opts`, `App.time_range`); what remained
+//! here is the classifier surface every caller actually consumes.
 
-use std::collections::BTreeMap;
-
-use crate::axiom::{Chart, DashboardSummary, LayoutItem};
-
-/// Identifier for a tile within a [`Dashboard`]. Stable for the lifetime
-/// of the dashboard; new tiles get a monotonically increasing id.
-pub type TileId = u32;
+use crate::axiom::{Chart, DashboardSummary};
 
 /// Which Axiom dashboard element a tile renders. Variants outside
 /// `Line/Bar/Area/Scatter` are accepted by the parser so files authored
@@ -134,127 +125,18 @@ impl VizKind {
     }
 }
 
-/// What kind of query a tile runs. `Mpl` is the only variant exercised
-/// today; the others are placeholders for steps 14–16.
+/// What kind of query a tile runs. `Mpl` and `Apl` are the runtime
+/// variants; `Empty` covers charts with no query body (notes,
+/// spacers, monitor-list-without-filter, etc.) — their renderer
+/// doesn't read this field.
 #[derive(Clone, Debug)]
-#[allow(dead_code)] // variants and inner strings populated in later steps
 pub enum Query {
     /// Metrics MPL query, sent to `/v1/query/_mpl`.
     Mpl(String),
-    /// APL query, sent to `/v1/datasets/_apl`. Step 14+.
+    /// APL query, sent to `/v1/datasets/_apl`.
     Apl(String),
-    /// Markdown body for a note tile. Step 16.
-    Note(String),
-    /// No query (spacer, monitor-list-without-filter, etc.). Step 16.
+    /// No query (note bodies, spacers, etc.).
     Empty,
-}
-
-impl Query {
-    /// Borrow the query text when it has one. Used by the editor binding
-    /// (step 18) and by the existing query runner.
-    #[allow(dead_code)]
-    pub fn text(&self) -> Option<&str> {
-        match self {
-            Query::Mpl(s) | Query::Apl(s) | Query::Note(s) => Some(s.as_str()),
-            Query::Empty => None,
-        }
-    }
-}
-
-/// Coordinates in the dashboard grid. Step 11 never reads these (single
-/// tile spans the entire pane); step 18 turns them into ratatui `Rect`s.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct GridPos {
-    pub x: u16,
-    pub y: u16,
-    pub w: u16,
-    pub h: u16,
-}
-
-/// Grid layout parameters. `cols` is the column count, `row_h` the
-/// per-row height in terminal cells. Defaults match a typical Axiom
-/// dashboard (12 cols, 6-cell rows).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Layout {
-    pub cols: u16,
-    pub row_h: u16,
-}
-
-impl Default for Layout {
-    fn default() -> Self {
-        Self { cols: 12, row_h: 6 }
-    }
-}
-
-/// A single visualisation in a [`Dashboard`].
-///
-/// Step 11 only consumes `kind`, `opts`, and `query`. The rest are
-/// modelled now so steps 17 and 18 can populate them without churning
-/// callers — hence the per-field `dead_code` allow.
-#[derive(Clone, Debug)]
-pub struct Tile {
-    #[allow(dead_code)]
-    pub id: TileId,
-    #[allow(dead_code)]
-    pub title: String,
-    pub kind: VizKind,
-    pub opts: BTreeMap<String, String>,
-    pub query: Query,
-    #[allow(dead_code)]
-    pub time_override: Option<TimeRange>,
-    #[allow(dead_code)]
-    pub pos: GridPos,
-}
-
-impl Tile {
-    /// Convenience: a tile that wraps an MPL buffer for single-buffer mode.
-    pub fn from_mpl(
-        id: TileId,
-        mpl: String,
-        kind: VizKind,
-        opts: BTreeMap<String, String>,
-    ) -> Self {
-        Self {
-            id,
-            title: String::new(),
-            kind,
-            opts,
-            query: Query::Mpl(mpl),
-            time_override: None,
-            pos: GridPos::default(),
-        }
-    }
-
-    /// Build a tile from an Axiom wire `Chart`. The chart's `query`
-    /// field is decoded into one of `Query::Mpl | Apl | Empty`; the
-    /// `name` becomes the tile title; layout is supplied separately
-    /// from the matching `LayoutItem` (paired by chart id).
-    pub fn from_chart(id: TileId, chart: &Chart, layout: Option<&LayoutItem>) -> Self {
-        let base = chart.base();
-        let kind = VizKind::from_chart(chart);
-        let title = base.name.clone().unwrap_or_default();
-        let query = extract_query(chart);
-        let pos = layout.map(|l| GridPos {
-            x: l.x as u16,
-            y: l.y.unwrap_or(0) as u16,
-            w: l.w as u16,
-            h: l.h as u16,
-        });
-        Self {
-            id,
-            title,
-            kind,
-            opts: BTreeMap::new(),
-            query,
-            time_override: None,
-            pos: pos.unwrap_or_default(),
-        }
-    }
-
-    /// Set the MPL query text (single-tile, single-buffer mode).
-    pub fn set_mpl(&mut self, mpl: String) {
-        self.query = Query::Mpl(mpl);
-    }
 }
 
 /// Extract the executable query string from an Axiom `Chart`.
@@ -273,7 +155,6 @@ impl Tile {
 ///
 /// Charts with no `query` fall back to `Query::Empty`.
 pub fn extract_query(chart: &Chart) -> Query {
-    let _ = chart; // chart variant no longer affects classification
     let q = match chart.base().query.as_ref() {
         Some(v) => v,
         None => return Query::Empty,
@@ -323,8 +204,8 @@ pub struct TimeRange {
 
 impl Default for TimeRange {
     fn default() -> Self {
-        // Matches the existing `DEFAULT_START` / `DEFAULT_END` constants in
-        // `app.rs` so step 11 is a no-op at runtime.
+        // Matches the legacy `DEFAULT_START` / `DEFAULT_END` constants
+        // so file-mode startup is a no-op at runtime.
         Self {
             start: "now-1h".to_string(),
             end: "now".to_string(),
@@ -332,109 +213,21 @@ impl Default for TimeRange {
     }
 }
 
-/// A complete dashboard. Today's single-buffer mode holds exactly one
-/// tile here; steps 17+ load real multi-tile dashboards into this shape.
-#[derive(Clone, Debug, Default)]
-pub struct Dashboard {
-    #[allow(dead_code)]
-    pub id: Option<String>,
-    #[allow(dead_code)]
-    pub name: String,
-    #[allow(dead_code)]
-    pub time_range: TimeRange,
-    #[allow(dead_code)]
-    pub variables: BTreeMap<String, String>,
-    pub tiles: Vec<Tile>,
-    #[allow(dead_code)]
-    pub layout: Layout,
-    next_tile_id: TileId,
-}
-
-impl Dashboard {
-    /// Build a single-tile dashboard wrapping the given MPL buffer with
-    /// the given viz kind + options. This is the constructor the `App`
-    /// uses on file load.
-    pub fn single_tile_from_mpl(
-        mpl: String,
-        kind: VizKind,
-        opts: BTreeMap<String, String>,
-    ) -> Self {
-        let mut d = Self {
-            name: "untitled".to_string(),
-            ..Default::default()
-        };
-        let id = d.next_id();
-        d.tiles.push(Tile::from_mpl(id, mpl, kind, opts));
-        d
-    }
-
-    /// Adopt an Axiom `DashboardResource` (wire type) into the
-    /// internal model. Each `Chart` becomes a `Tile`; matching
-    /// `LayoutItem`s populate `Tile.pos`. Charts with no extractable
-    /// MPL/APL still produce a tile so the dashboard's structure is
-    /// preserved — the renderer just shows a placeholder body.
-    ///
-    /// If the resource has no charts (rare: empty new dashboard), a
-    /// single empty tile is created so `focused_tile()` doesn't panic.
+impl TimeRange {
+    /// Build a `TimeRange` from a loaded dashboard resource, falling
+    /// back to `now-1h` / `now` when the document omits either field.
     pub fn from_resource(resource: &DashboardSummary) -> Self {
         let doc = &resource.dashboard;
-        let mut d = Self {
-            id: Some(resource.uid.clone()),
-            name: resource.name().to_string(),
-            time_range: TimeRange {
-                start: doc
-                    .time_window_start
-                    .clone()
-                    .unwrap_or_else(|| "now-1h".to_string()),
-                end: doc
-                    .time_window_end
-                    .clone()
-                    .unwrap_or_else(|| "now".to_string()),
-            },
-            ..Default::default()
-        };
-        for chart in &doc.charts {
-            let id = d.next_id();
-            let layout = doc.layout.iter().find(|l| l.i == chart.base().id);
-            d.tiles.push(Tile::from_chart(id, chart, layout));
+        Self {
+            start: doc
+                .time_window_start
+                .clone()
+                .unwrap_or_else(|| "now-1h".to_string()),
+            end: doc
+                .time_window_end
+                .clone()
+                .unwrap_or_else(|| "now".to_string()),
         }
-        if d.tiles.is_empty() {
-            // Keep the focused-tile invariant: a brand-new empty
-            // dashboard still gets one placeholder tile.
-            let id = d.next_id();
-            d.tiles.push(Tile {
-                id,
-                title: "(empty)".to_string(),
-                kind: VizKind::Note,
-                opts: BTreeMap::new(),
-                query: Query::Note("_This dashboard has no charts yet._".to_string()),
-                time_override: None,
-                pos: GridPos::default(),
-            });
-        }
-        d
-    }
-
-    fn next_id(&mut self) -> TileId {
-        let id = self.next_tile_id;
-        self.next_tile_id = self.next_tile_id.wrapping_add(1);
-        id
-    }
-
-    /// The first (and, in step 11, only) tile. Panics if empty — a
-    /// `Dashboard` is never constructed without at least one tile, but
-    /// we don't enforce that statically.
-    pub fn focused_tile(&self) -> &Tile {
-        self.tiles
-            .first()
-            .expect("Dashboard always has at least one tile in step 11")
-    }
-
-    /// Mutable variant of [`focused_tile`].
-    pub fn focused_tile_mut(&mut self) -> &mut Tile {
-        self.tiles
-            .first_mut()
-            .expect("Dashboard always has at least one tile in step 11")
     }
 }
 

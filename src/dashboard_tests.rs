@@ -77,29 +77,8 @@ fn implemented_set_matches_current_scope() {
     );
 }
 
-#[test]
-fn single_tile_dashboard_carries_kind_and_opts() {
-    let mut opts = BTreeMap::new();
-    opts.insert("n".to_string(), "10".to_string());
-    let d = Dashboard::single_tile_from_mpl("foo:bar".to_string(), VizKind::Bar, opts);
-    assert_eq!(d.tiles.len(), 1);
-    let t = d.focused_tile();
-    assert_eq!(t.kind, VizKind::Bar);
-    assert_eq!(t.opts.get("n").map(String::as_str), Some("10"));
-    assert!(matches!(&t.query, Query::Mpl(s) if s == "foo:bar"));
-}
-
-use crate::axiom::{ChartBase, DashboardDocument, DashboardSummary, LayoutItem};
+use crate::axiom::{ChartBase, DashboardDocument, DashboardSummary};
 use serde_json::json;
-
-fn chart_with_mpl(id: &str, name: &str, mpl: &str) -> Chart {
-    Chart::TimeSeries(ChartBase {
-        id: id.to_string(),
-        name: Some(name.to_string()),
-        query: Some(json!({ "mpl": mpl })),
-        extras: Default::default(),
-    })
-}
 
 // Fixtures lifted verbatim from `GET /v2/dashboards/uid/…` against
 // a real account. Two MPL examples (home overview) and one APL
@@ -195,101 +174,25 @@ fn explicit_mpl_key_still_wins_when_present() {
 }
 
 #[test]
-fn from_resource_maps_chart_types_to_viz_kinds() {
-    let resource = DashboardSummary {
-        uid: "u1".into(),
-        id: None,
-        updated_at: None,
-        updated_by: None,
-        version: None,
-        dashboard: DashboardDocument {
-            name: Some("d".into()),
-            charts: vec![
-                chart_with_mpl("c1", "latency", "http_latency:p99"),
-                Chart::Pie(ChartBase {
-                    id: "c2".into(),
-                    name: Some("by-region".into()),
-                    query: Some(json!({ "apl": "['logs'] | summarize count() by region" })),
-                    extras: Default::default(),
-                }),
-                Chart::TopK(ChartBase {
-                    id: "c3".into(),
-                    name: Some("errors".into()),
-                    query: None,
-                    extras: Default::default(),
-                }),
-            ],
-            ..Default::default()
-        },
-    };
-    let d = Dashboard::from_resource(&resource);
-    assert_eq!(d.id.as_deref(), Some("u1"));
-    assert_eq!(d.tiles.len(), 3);
-    assert_eq!(d.tiles[0].kind, VizKind::Line);
-    assert_eq!(d.tiles[1].kind, VizKind::Pie);
-    assert_eq!(d.tiles[2].kind, VizKind::TopList);
-    assert!(matches!(
-        &d.tiles[0].query,
-        Query::Mpl(s) if s == "http_latency:p99"
-    ));
-    assert!(matches!(
-        &d.tiles[1].query,
-        Query::Apl(s) if s.starts_with("['logs']")
-    ));
-    assert!(matches!(d.tiles[2].query, Query::Empty));
+fn extract_query_chart_without_query_yields_empty() {
+    let chart = Chart::TopK(ChartBase {
+        id: "c3".into(),
+        name: Some("errors".into()),
+        query: None,
+        extras: Default::default(),
+    });
+    assert!(matches!(extract_query(&chart), Query::Empty));
 }
 
 #[test]
-fn from_resource_pairs_layout_by_chart_id() {
-    let resource = DashboardSummary {
-        uid: "u".into(),
-        id: None,
-        updated_at: None,
-        updated_by: None,
-        version: None,
-        dashboard: DashboardDocument {
-            name: Some("d".into()),
-            charts: vec![chart_with_mpl("c1", "x", "a:b")],
-            layout: vec![LayoutItem {
-                i: "c1".into(),
-                x: 3,
-                y: Some(2),
-                w: 6,
-                h: 4,
-                extras: Default::default(),
-            }],
-            ..Default::default()
-        },
-    };
-    let d = Dashboard::from_resource(&resource);
-    let pos = d.tiles[0].pos;
-    assert_eq!(pos.x, 3);
-    assert_eq!(pos.y, 2);
-    assert_eq!(pos.w, 6);
-    assert_eq!(pos.h, 4);
+fn default_time_range_matches_legacy_constants() {
+    let r = TimeRange::default();
+    assert_eq!(r.start, "now-1h");
+    assert_eq!(r.end, "now");
 }
 
 #[test]
-fn from_resource_creates_placeholder_tile_when_no_charts() {
-    let resource = DashboardSummary {
-        uid: "u".into(),
-        id: None,
-        updated_at: None,
-        updated_by: None,
-        version: None,
-        dashboard: DashboardDocument {
-            name: Some("empty".into()),
-            ..Default::default()
-        },
-    };
-    let d = Dashboard::from_resource(&resource);
-    // Invariant: focused_tile never panics.
-    assert_eq!(d.tiles.len(), 1);
-    assert_eq!(d.focused_tile().kind, VizKind::Note);
-}
-
-#[test]
-fn from_resource_carries_time_window() {
+fn time_range_from_resource_carries_window() {
     let resource = DashboardSummary {
         uid: "u".into(),
         id: None,
@@ -303,14 +206,25 @@ fn from_resource_carries_time_window() {
             ..Default::default()
         },
     };
-    let d = Dashboard::from_resource(&resource);
-    assert_eq!(d.time_range.start, "qr-now-7d");
-    assert_eq!(d.time_range.end, "qr-now");
+    let r = TimeRange::from_resource(&resource);
+    assert_eq!(r.start, "qr-now-7d");
+    assert_eq!(r.end, "qr-now");
 }
 
 #[test]
-fn default_time_range_matches_legacy_constants() {
-    let r = TimeRange::default();
+fn time_range_from_resource_falls_back_to_legacy_defaults() {
+    let resource = DashboardSummary {
+        uid: "u".into(),
+        id: None,
+        updated_at: None,
+        updated_by: None,
+        version: None,
+        dashboard: DashboardDocument {
+            name: Some("d".into()),
+            ..Default::default()
+        },
+    };
+    let r = TimeRange::from_resource(&resource);
     assert_eq!(r.start, "now-1h");
     assert_eq!(r.end, "now");
 }

@@ -2046,23 +2046,23 @@ fn visual_esc_exits_without_modification() {
 #[test]
 fn default_buffer_is_line_kind() {
     let app = test_app();
-    assert_eq!(app.dashboard.focused_tile().kind, VizKind::Line);
+    assert_eq!(app.viz_kind, VizKind::Line);
 }
 
 #[test]
 fn pragma_in_buffer_switches_kind() {
     let mut app = test_app();
     set_buffer(&mut app, "// @viz scatter\nhome:temp | align to 1m");
-    assert_eq!(app.dashboard.focused_tile().kind, VizKind::Scatter);
+    assert_eq!(app.viz_kind, VizKind::Scatter);
 }
 
 #[test]
 fn removing_pragma_falls_back_to_line() {
     let mut app = test_app();
     set_buffer(&mut app, "// @viz bar\nhome:temp");
-    assert_eq!(app.dashboard.focused_tile().kind, VizKind::Bar);
+    assert_eq!(app.viz_kind, VizKind::Bar);
     set_buffer(&mut app, "home:temp");
-    assert_eq!(app.dashboard.focused_tile().kind, VizKind::Line);
+    assert_eq!(app.viz_kind, VizKind::Line);
 }
 
 #[test]
@@ -2083,7 +2083,7 @@ fn cmd_viz_inserts_pragma_and_updates_tile() {
     let mut app = test_app();
     set_buffer(&mut app, "home:temp");
     app.cmd_viz(Some("bar"));
-    assert_eq!(app.dashboard.focused_tile().kind, VizKind::Bar);
+    assert_eq!(app.viz_kind, VizKind::Bar);
     assert!(
         buffer(&app).starts_with("// @viz bar"),
         "expected pragma prepended, got: {:?}",
@@ -2287,12 +2287,8 @@ fn dashboard_open_adopts_internal_dashboard_and_seeds_mpl_buffer() {
         uid: "u1".into(),
         result: Ok(resource),
     });
-    // Internal dashboard swapped.
-    assert_eq!(app.dashboard.tiles.len(), 1);
-    assert_eq!(
-        app.dashboard.focused_tile().kind,
-        crate::dashboard::VizKind::Line
-    );
+    // Focused viz kind reflects the first chart.
+    assert_eq!(app.viz_kind, crate::dashboard::VizKind::Line);
     // Buffer seeded with pragma + mpl.
     let buf = app.query_text();
     assert!(buf.contains("// @viz line"), "buffer: {buf:?}");
@@ -2792,11 +2788,8 @@ fn active_time_range_strips_qr_prefix_for_mpl_endpoint() {
     let mut app = test_app();
     app.execute_command("time qr-now-7d qr-now");
     // What we store is verbatim (so `:dash save` round-trips)…
-    assert_eq!(
-        app.dashboard.time_range.start.as_str(),
-        "qr-now-7d"
-    );
-    assert_eq!(app.dashboard.time_range.end.as_str(), "qr-now");
+    assert_eq!(app.time_range.start.as_str(), "qr-now-7d");
+    assert_eq!(app.time_range.end.as_str(), "qr-now");
     // …but what the query layer reads is normalised.
     assert_eq!(
         app.active_time_range(),
@@ -2810,7 +2803,7 @@ fn time_picker_no_args_matches_qr_prefixed_preset() {
     // picker should still highlight the `6h` row instead of
     // falling back to cursor 0.
     let mut app = test_app();
-    app.dashboard.time_range = crate::dashboard::TimeRange {
+    app.time_range = crate::dashboard::TimeRange {
         start: "qr-now-6h".into(),
         end: "qr-now".into(),
     };

@@ -15,7 +15,7 @@ use crate::chart::{Series, color_for};
 use crate::command::{self, Command, InsertAt, Motion, Operator, Step, Target};
 use crate::completions;
 use crate::config::Config;
-use crate::dashboard::{Dashboard, VizKind};
+use crate::dashboard::{TimeRange, VizKind};
 use crate::editor;
 use crate::hover;
 use crate::motion::{self, Range};
@@ -802,13 +802,23 @@ pub struct App {
     /// Snapshot of the buffer the last time it was loaded or written to disk;
     /// used to compute the dirty flag without relying on `tui-textarea` internals.
     pub saved_buffer: String,
-    /// Canonical visualisation model. Step 11 keeps this as a single-tile
-    /// `Dashboard` mirroring whatever the editor buffer holds; step 17 starts
-    /// loading real multi-tile dashboards into the same field.
-    /// Kept in sync with the buffer's `// @viz` pragma by
-    /// [`App::sync_dashboard_from_buffer`], which runs on every buffer-mutating
-    /// or buffer-loading path via [`App::recompute_diagnostics`].
-    pub dashboard: Dashboard,
+    /// Focused tile's viz kind. In Solo / file mode this is the
+    /// kind the editor's `// @viz` pragma selects; in Grid mode it
+    /// tracks whichever chart the user last zoomed in on (since the
+    /// editor + status bar live in solo terms). Kept in sync with
+    /// the buffer's pragma by [`App::sync_dashboard_from_buffer`],
+    /// which runs after every buffer-mutating or buffer-loading path
+    /// via [`App::recompute_diagnostics`].
+    pub viz_kind: VizKind,
+    /// Focused tile's `// @viz:opts` map (e.g. `n=10` for top-list).
+    /// Same lifecycle as [`Self::viz_kind`].
+    pub viz_opts: std::collections::BTreeMap<String, String>,
+    /// Active query time range, shared by every tile in the loaded
+    /// dashboard and by the editor's `:r` runs. Seeded from the
+    /// dashboard's `timeWindowStart` / `End` (or the legacy
+    /// `now-1h` / `now` defaults on file-mode startup) and mutated
+    /// in place by `:time` and the picker.
+    pub time_range: TimeRange,
     /// Counter incremented on each query start; only matching responses are accepted.
     last_query_id: u64,
     runtime: Handle,
@@ -840,6 +850,16 @@ impl App {
         let initial_text = saved_query
             .clone()
             .unwrap_or_else(|| editor.lines().join("\n"));
+        // Seed `viz_kind` / `viz_opts` from the buffer's `// @viz`
+        // pragma so the first frame renders the right chart kind
+        // before any edit runs `sync_dashboard_from_buffer`.
+        // Pragma errors fall through silently — they'll resurface
+        // as soon as `sync_dashboard_from_buffer` runs on the
+        // first edit.
+        let (initial_viz_kind, initial_viz_opts) = match viz::parse_pragma(&initial_text) {
+            Ok(Some(spec)) => (spec.kind, spec.opts),
+            _ => (VizKind::default(), std::collections::BTreeMap::new()),
+        };
         Self {
             mode: Mode::Normal,
             editor,
@@ -849,7 +869,9 @@ impl App {
             cli_params: std::collections::BTreeMap::new(),
             current_file: None,
             saved_buffer: initial_text.clone(),
-            dashboard: build_initial_dashboard(&initial_text),
+            viz_kind: initial_viz_kind,
+            viz_opts: initial_viz_opts,
+            time_range: TimeRange::default(),
             dashboards: DashboardPicker::default(),
             last_picked_dashboard: None,
             loaded_dashboard: None,
@@ -2992,21 +3014,17 @@ impl App {
     ///                          persists in the file.
     fn cmd_viz(&mut self, kind_arg: Option<&str>) {
         let Some(kind_str) = kind_arg else {
-            let cur = self.dashboard.focused_tile().kind;
-            self.status = format!("viz: {}", cur.as_str());
+            self.status = format!("viz: {}", self.viz_kind.as_str());
             return;
         };
         let Some(kind) = VizKind::parse(kind_str) else {
             self.set_error(format!("unknown viz kind: `{kind_str}`"));
             return;
         };
-        // Update the tile, then re-emit the pragma into the buffer so
-        // saving the file persists the choice.
-        {
-            let t = self.dashboard.focused_tile_mut();
-            t.kind = kind;
-        }
-        let opts = self.dashboard.focused_tile().opts.clone();
+        // Update the focused-tile kind, then re-emit the pragma into
+        // the buffer so saving the file persists the choice.
+        self.viz_kind = kind;
+        let opts = self.viz_opts.clone();
         let spec = viz::VizSpec { kind, opts };
         let new_text = viz::upsert_pragma(&self.query_text(), &spec);
         self.editor = editor::editor_with_text(&new_text);
@@ -3039,12 +3057,12 @@ impl App {
     }
 
     /// Active query time range, in the order the Axiom API wants it
-    /// (`start`, `end`). Sourced from `self.dashboard.time_range`, which
-    /// is seeded from the loaded dashboard's `timeWindowStart`/`End`
-    /// (or the legacy `now-1h`/`now` defaults) and mutated in place by
-    /// `:time`. Both editor (`run_query`) and per-tile fetches
-    /// (`run_tile_queries`, `run_focused_tile_query`) read this so the
-    /// whole dashboard shares one consistent window.
+    /// (`start`, `end`). Sourced from `self.time_range`, which is
+    /// seeded from the loaded dashboard's `timeWindowStart`/`End`
+    /// (or the legacy `now-1h`/`now` defaults) and mutated in place
+    /// by `:time`. Both editor (`run_query`) and per-tile fetches
+    /// (`run_tile_queries`, `run_focused_tile_query`) read this so
+    /// the whole dashboard shares one consistent window.
     ///
     /// The returned strings go through [`normalize_time_expr`] so the
     /// `qr-` prefix Axiom's web UI stores in dashboards (e.g.
@@ -3053,8 +3071,8 @@ impl App {
     /// (`now-7d`) and 400s otherwise.
     pub fn active_time_range(&self) -> (String, String) {
         (
-            normalize_time_expr(&self.dashboard.time_range.start),
-            normalize_time_expr(&self.dashboard.time_range.end),
+            normalize_time_expr(&self.time_range.start),
+            normalize_time_expr(&self.time_range.end),
         )
     }
 
@@ -3116,7 +3134,7 @@ impl App {
     /// the dashboard dirty, status-line the change, and kick a refetch
     /// so the user sees the new window immediately.
     fn set_time_range(&mut self, start: String, end: String) {
-        self.dashboard.time_range = crate::dashboard::TimeRange {
+        self.time_range = TimeRange {
             start: start.clone(),
             end: end.clone(),
         };
@@ -3171,10 +3189,10 @@ impl App {
                     // whatever the dashboard's current window parses
                     // as (defaulting to yesterday→today).
                     let mut picker = CustomRangePicker::seed();
-                    if let Some(d) = parse_iso_date(&self.dashboard.time_range.start) {
+                    if let Some(d) = parse_iso_date(&self.time_range.start) {
                         picker.start = d;
                     }
-                    if let Some(d) = parse_iso_date(&self.dashboard.time_range.end) {
+                    if let Some(d) = parse_iso_date(&self.time_range.end) {
                         picker.end = d;
                     }
                     self.time_picker = Some(TimePickerState::Custom(picker));
@@ -3745,20 +3763,15 @@ impl App {
         else {
             return;
         };
-        let kind = crate::dashboard::VizKind::from_chart(&chart);
-        let layout = resource
-            .dashboard
-            .layout
-            .iter()
-            .find(|l| l.i == chart.base().id)
-            .cloned();
-        let tile_id = self.dashboard.focused_tile().id;
-        let new_tile = crate::dashboard::Tile::from_chart(tile_id, &chart, layout.as_ref());
-        if let Some(t) = self.dashboard.tiles.first_mut() {
-            *t = new_tile.clone();
-        }
+        let kind = VizKind::from_chart(&chart);
+        let query = crate::dashboard::extract_query(&chart);
+        // The focused tile is whichever chart the user just zoomed
+        // in on; reset opts (the wire chart has none) so the buffer
+        // pragma is the only source of viz options.
+        self.viz_kind = kind;
+        self.viz_opts.clear();
         let pragma_line = format!("// @viz {}\n", kind.as_str());
-        match &new_tile.query {
+        match &query {
             Query::Mpl(mpl) => {
                 let text = format!("{pragma_line}{mpl}");
                 self.editor = editor::editor_with_text(&text);
@@ -3786,7 +3799,7 @@ impl App {
                 self.editor = editor::editor_with_text(&text);
                 self.recompute_diagnostics();
             }
-            Query::Note(_) | Query::Empty => {}
+            Query::Empty => {}
         }
         // Adopt the tile's last-known series into the Solo-view
         // `app.series` so the chart pane shows the real data
@@ -3819,11 +3832,12 @@ impl App {
         // view mode is Solo, pick up that metric's saved tag
         // selection (or clear if there's nothing cached).
         self.reload_legend_label_tags();
-        let title = if new_tile.title.is_empty() {
-            kind.as_str().to_string()
-        } else {
-            new_tile.title.clone()
-        };
+        let title = chart
+            .base()
+            .name
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| kind.as_str().to_string());
         self.status = format!("zoomed `{title}`");
     }
 
@@ -3831,15 +3845,23 @@ impl App {
         use crate::dashboard::Query;
         let name = resource.name().to_string();
         let chart_count = resource.dashboard.charts.len();
-        let new_dash = crate::dashboard::Dashboard::from_resource(&resource);
-        let focused = new_dash.focused_tile().clone();
-        self.dashboard = new_dash;
+        self.time_range = TimeRange::from_resource(&resource);
+        // Focus snaps to the first chart — matches the grid's
+        // initial selection and the prior `Dashboard::tiles[0]`
+        // semantics. Empty dashboards fall through to defaults.
+        let first_chart = resource.dashboard.charts.first().cloned();
+        let (focused_kind, focused_query) = match first_chart.as_ref() {
+            Some(c) => (VizKind::from_chart(c), crate::dashboard::extract_query(c)),
+            None => (VizKind::default(), Query::Empty),
+        };
+        self.viz_kind = focused_kind;
+        self.viz_opts.clear();
         self.last_picked_dashboard = Some(uid);
         self.loaded_dashboard = Some(resource);
 
-        let pragma_line = format!("// @viz {}\n", focused.kind.as_str());
+        let pragma_line = format!("// @viz {}\n", focused_kind.as_str());
         let mut seeded: Option<String> = None;
-        match &focused.query {
+        match &focused_query {
             Query::Mpl(mpl) => {
                 let text = format!("{pragma_line}{mpl}");
                 self.editor = editor::editor_with_text(&text);
@@ -3855,7 +3877,7 @@ impl App {
                 self.recompute_diagnostics();
                 seeded = Some(text);
             }
-            Query::Note(_) | Query::Empty => {
+            Query::Empty => {
                 // Leave the editor alone; tile renderer surfaces the
                 // note body / placeholder directly.
             }
@@ -4008,7 +4030,7 @@ impl App {
             name
         };
         let mpl = self.query_text();
-        let kind = self.dashboard.focused_tile().kind;
+        let kind = self.viz_kind;
         let doc = build_dashboard_doc_from_buffer(&name, kind, &mpl);
 
         let Some((client, tx, _cache)) =
@@ -4800,20 +4822,14 @@ impl App {
     fn sync_dashboard_from_buffer(&mut self, text: &str) {
         match viz::parse_pragma(text) {
             Ok(Some(spec)) => {
-                let t = self.dashboard.focused_tile_mut();
-                t.kind = spec.kind;
-                t.opts = spec.opts;
-                t.set_mpl(text.to_string());
+                self.viz_kind = spec.kind;
+                self.viz_opts = spec.opts;
             }
             Ok(None) => {
-                let t = self.dashboard.focused_tile_mut();
-                t.kind = VizKind::default();
-                t.opts.clear();
-                t.set_mpl(text.to_string());
+                self.viz_kind = VizKind::default();
+                self.viz_opts.clear();
             }
             Err((line_idx, err)) => {
-                let t = self.dashboard.focused_tile_mut();
-                t.set_mpl(text.to_string());
                 self.diagnostics
                     .push(pragma_diagnostic(text, line_idx, &err));
             }
@@ -5577,16 +5593,6 @@ pub fn build_dashboard_doc_from_buffer(
 
 /// Build the single-tile dashboard that wraps the initial buffer text.
 /// On a fresh app this is the demo query; on file-load it's the file's
-/// contents. Pragma errors fall through silently — they'll resurface as
-/// soon as [`App::sync_dashboard_from_buffer`] runs on the first edit.
-fn build_initial_dashboard(initial_text: &str) -> Dashboard {
-    let (kind, opts) = match viz::parse_pragma(initial_text) {
-        Ok(Some(spec)) => (spec.kind, spec.opts),
-        _ => (VizKind::default(), std::collections::BTreeMap::new()),
-    };
-    Dashboard::single_tile_from_mpl(initial_text.to_string(), kind, opts)
-}
-
 fn default_cache() -> Cache {
     // We don't yet have a base URL — `Cache::load` only needs a fallback for
     // datasets that lack `edgeDeployment`. Use a placeholder; it gets replaced

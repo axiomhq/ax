@@ -176,9 +176,8 @@ pub struct DashboardDocument {
 ///
 /// Note: this list intentionally diverges from our internal
 /// `dashboard::VizKind`. The TUI has extras (`Bar`, `Area`, `Spacer`,
-/// `MonitorList`) that don't exist server-side; conversely the server
-/// has `Scatter` which the TUI hasn't implemented. Mapping between
-/// the two lives in `dashboard::Tile::from_chart` (step 17b).
+/// `MonitorList`) that don't exist server-side. Mapping between the
+/// two lives in `dashboard::VizKind::from_chart`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type")]
 pub enum Chart {
