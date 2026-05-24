@@ -1,8 +1,6 @@
-use super::{MIN_GRID_ROW_HEIGHT, NOTE_ROW_HEIGHT, compute_row_heights};
+use super::grid::{InlineLegendPlan, MIN_GRID_ROW_HEIGHT, NOTE_ROW_HEIGHT, compute_row_heights, fit_inline_legend};
+use super::help::{KEYS_HELP_SOURCE, render_keys_help};
 use crate::axiom::{Chart, ChartBase, LayoutItem};
-
-use super::{InlineLegendPlan, fit_inline_legend};
-use super::{KEYS_HELP_SOURCE, render_keys_help};
 
 fn note(id: &str) -> Chart {
     Chart::Note(ChartBase {
