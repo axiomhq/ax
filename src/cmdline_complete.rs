@@ -1,11 +1,10 @@
 //! Tab completion for the `:` Ex-command line.
 //!
-//! Mirrors vim's wildmenu behaviour at a basic level: Tab on the head
-//! completes against the known command vocabulary; once a head is
-//! selected, subsequent tokens are completed contextually (e.g.
-//! `:dash <Tab>` proposes `save / save! / rm / new`, `:tile add <Tab>`
-//! proposes the implemented viz kinds, `:open <Tab>` proposes the
-//! cached dashboard uids from `:dashboards`).
+//! Vim-wildmenu-shaped, but **fuzzy** rather than prefix: typing `:dl`
+//! and hitting Tab matches `:datasets` and `:dashboards` (any
+//! subsequence with the right characters in order), with the closest
+//! match selected first. Sub-command and contextual slots (`:dash sa`,
+//! `:open prod`, `:tile add s`) all use the same scorer.
 //!
 //! The entry point is [`completions_for`], which is a pure function
 //! over the cmdline buffer and a small `Context` carrying the data the
@@ -20,6 +19,7 @@
 
 use crate::axiom::DashboardSummary;
 use crate::dashboard::VizKind;
+use nucleo_matcher::{Config, Matcher, Utf32Str};
 
 /// Per-call context handed to the completer. Borrowed slices so the
 /// caller doesn't have to clone.
@@ -38,31 +38,9 @@ pub struct CompletionRequest {
     pub range: (usize, usize),
 }
 
-impl CompletionRequest {
-    /// Longest common prefix shared by every candidate. Used by the
-    /// first-Tab "fill in what's unambiguous" behaviour.
-    pub fn common_prefix(&self) -> String {
-        if self.items.is_empty() {
-            return String::new();
-        }
-        let mut prefix = self.items[0].as_str();
-        for s in &self.items[1..] {
-            let mut i = 0;
-            for (a, b) in prefix.bytes().zip(s.bytes()) {
-                if a == b {
-                    i += 1;
-                } else {
-                    break;
-                }
-            }
-            prefix = &prefix[..i];
-        }
-        prefix.to_string()
-    }
-}
-
-/// Full Ex-command vocabulary. Keep alphabetised; the head completer
-/// preserves this order so first-tab results are deterministic.
+/// Full Ex-command vocabulary. Keep alphabetised; empty-token
+/// completion preserves this order for deterministic first-Tab
+/// results.
 const HEAD_COMMANDS: &[&str] = &[
     "axiom",
     "dash",
@@ -109,9 +87,12 @@ const TILE_SUBS: &[&str] = &["add", "inspect", "json", "mv", "rm", "size", "titl
 /// (mirrors `CmdLine.cursor` which counts chars, not bytes). Returns
 /// `None` when no completion source applies for this position.
 ///
-/// Matching policy: case-sensitive prefix. An empty token matches
-/// every candidate in its category — which is what users expect right
-/// after pressing a space and then Tab.
+/// Matching policy: **smart-case fuzzy** (nucleo-matcher). An empty
+/// token returns every candidate in its category, sorted
+/// alphabetically; a non-empty token keeps only candidates that
+/// contain the typed characters as an in-order subsequence and orders
+/// them by descending match score (prefix / word-start matches
+/// outrank scattered ones).
 pub fn completions_for(
     buf: &str,
     char_cursor: usize,
@@ -192,20 +173,36 @@ fn viz_kind_names() -> Vec<&'static str> {
     .collect()
 }
 
-/// Filter `candidates` by `token` (prefix match) and wrap with the
-/// splice range. Deduplicates + sorts for stable display order.
+/// Filter `candidates` by `token` using nucleo's fuzzy scorer. Empty
+/// `token` short-circuits to alphabetical order; otherwise items are
+/// ordered by descending score with ties broken alphabetically.
 fn filter_candidates<I>(candidates: I, token: &str, range: (usize, usize)) -> CompletionRequest
 where
     I: Iterator,
     I::Item: Into<String>,
 {
-    let mut items: Vec<String> = candidates
-        .map(Into::into)
-        .filter(|s| s.starts_with(token))
-        .collect();
+    let mut items: Vec<String> = candidates.map(Into::into).collect();
     items.sort();
     items.dedup();
-    CompletionRequest { items, range }
+    if token.is_empty() {
+        return CompletionRequest { items, range };
+    }
+    let mut matcher = Matcher::new(Config::DEFAULT);
+    let mut needle_buf = Vec::new();
+    let needle = Utf32Str::new(token, &mut needle_buf);
+    let mut scored: Vec<(String, u16)> = items
+        .into_iter()
+        .filter_map(|s| {
+            let mut h_buf = Vec::new();
+            let h = Utf32Str::new(&s, &mut h_buf);
+            matcher.fuzzy_match(h, needle).map(|score| (s, score))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    CompletionRequest {
+        items: scored.into_iter().map(|(s, _)| s).collect(),
+        range,
+    }
 }
 
 /// Locate the token under (or just-before) `byte_cursor`. Returns the

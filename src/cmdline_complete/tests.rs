@@ -34,6 +34,7 @@ fn head_completion_with_empty_buffer_offers_all_heads() {
 #[test]
 fn dash_subcommands_after_head_and_space() {
     let r = completions_for("dash ", 5, &ctx()).unwrap();
+    // Empty token: alphabetical order, full set.
     assert_eq!(
         r.items,
         vec![
@@ -55,10 +56,38 @@ fn tile_subcommands_include_json_inspector() {
 }
 
 #[test]
-fn dash_subcommands_filter_by_prefix() {
+fn dash_subcommands_filter_by_fuzzy_match() {
     let r = completions_for("dash sa", 7, &ctx()).unwrap();
+    // `sa` only appears in order in `save` / `save!`.
     assert_eq!(r.items, vec!["save".to_string(), "save!".to_string()]);
     assert_eq!(r.range, (5, 7));
+}
+
+#[test]
+fn head_completion_is_fuzzy() {
+    // `dr` matches `datasets` + `refresh` style? Actually only commands
+    // containing both d and r in order: `dash`, `dashboards`, `dashinfo`,
+    // `datasets` (no r after d) — only `dr` -> d_r needs r after d:
+    // datasets has no r; dashboards has r; dashinfo no r; trace, dr not
+    // applicable. So expect `dashboards` (and `db`/`di`/`ds` lack r).
+    let r = completions_for("dr", 2, &ctx()).unwrap();
+    assert!(r.items.contains(&"dashboards".to_string()));
+    // Strict-prefix `d` candidates without an `r` should be filtered out.
+    assert!(!r.items.contains(&"dash".to_string()));
+    assert!(!r.items.contains(&"datasets".to_string()));
+}
+
+#[test]
+fn head_completion_ranks_prefix_above_scattered() {
+    // `da` should rank `dash` / `dashboards` / `datasets` (prefix
+    // matches) ahead of any pure-subsequence match.
+    let r = completions_for("da", 2, &ctx()).unwrap();
+    assert!(!r.items.is_empty());
+    assert!(
+        r.items[0].starts_with("da"),
+        "prefix match should win first slot, got {:?}",
+        r.items
+    );
 }
 
 #[test]
@@ -81,24 +110,6 @@ fn tile_add_third_token_filters() {
 fn viz_command_completes_kinds() {
     let r = completions_for("viz ", 4, &ctx()).unwrap();
     assert!(r.items.contains(&"heatmap".to_string()));
-}
-
-#[test]
-fn common_prefix_finds_longest_shared_start() {
-    let r = CompletionRequest {
-        items: vec!["save".to_string(), "save!".to_string()],
-        range: (0, 0),
-    };
-    assert_eq!(r.common_prefix(), "save");
-}
-
-#[test]
-fn common_prefix_returns_empty_when_no_overlap() {
-    let r = CompletionRequest {
-        items: vec!["alpha".into(), "beta".into()],
-        range: (0, 0),
-    };
-    assert_eq!(r.common_prefix(), "");
 }
 
 #[test]

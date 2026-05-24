@@ -2577,27 +2577,30 @@ fn tab_with_single_candidate_splices_and_appends_space() {
 }
 
 #[test]
-fn tab_with_common_prefix_splices_prefix_and_shows_popup() {
+fn tab_with_multiple_candidates_splices_top_score_and_shows_popup() {
     let mut app = test_app();
     open_cmdline(&mut app, "d");
     app.on_key(key(KeyCode::Tab));
-    // `dash`, `dashboards`, `dashinfo`, `datasets`, `db`, `di`, `ds`
-    // share the prefix `d`. Common prefix beyond `d` is empty
-    // (because of `datasets`/`db`/etc.), so the buffer is
-    // unchanged but the popup shows up.
-    assert_eq!(app.cmdline.buf, "d");
+    // Fuzzy matching against `d` returns multiple heads; the top-scored
+    // one is spliced into the buffer and the popup opens so the user
+    // can Tab through alternatives.
     assert!(app.cmdline_completions.visible);
     assert!(app.cmdline_completions.items.len() > 1);
+    assert_eq!(app.cmdline.buf, app.cmdline_completions.items[0]);
 }
 
 #[test]
-fn tab_with_partial_prefix_completes_to_longest_common() {
+fn tab_with_partial_token_completes_to_top_score() {
     let mut app = test_app();
     open_cmdline(&mut app, "dash sa");
     app.on_key(key(KeyCode::Tab));
-    // `save` and `save!` share `save` — spliced in immediately,
-    // popup stays up to disambiguate.
-    assert_eq!(app.cmdline.buf, "dash save");
+    // `save` and `save!` both match `sa`; the higher-scored one is
+    // spliced and the popup opens to disambiguate.
+    assert!(
+        app.cmdline.buf == "dash save" || app.cmdline.buf == "dash save!",
+        "unexpected splice: {}",
+        app.cmdline.buf
+    );
     assert!(app.cmdline_completions.visible);
 }
 

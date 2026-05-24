@@ -7,52 +7,43 @@ use super::*;
 impl App {
 
     /// Drive the cmdline completion popup on Tab / Shift-Tab. First
-    /// Tab from a hidden state: compute candidates, splice in the
-    /// longest common prefix, and — if there's still more than one
-    /// candidate — show the popup with the first item selected.
+    /// Tab from a hidden state: compute fuzzy candidates. A single
+    /// match auto-completes + appends a space; multiple matches show
+    /// the popup with the top-scored item spliced into the buffer.
     /// Subsequent Tabs cycle (Shift-Tab cycles backward) and splice
     /// the highlighted candidate over the current token in real time.
     pub fn handle_cmdline_tab(&mut self, backward: bool) {
-        if !self.cmdline_completions.visible {
-            // Fresh Tab: recompute the candidate set against the
-            // current buffer + cursor.
-            let ctx = crate::cmdline_complete::Context {
-                dashboards: &self.dashboards.items,
-            };
-            let req = match crate::cmdline_complete::completions_for(
-                &self.cmdline.buf,
-                self.cmdline.cursor,
-                &ctx,
-            ) {
-                Some(r) if !r.items.is_empty() => r,
-                _ => return,
-            };
-            // Splice the longest common prefix immediately so single-
-            // candidate paths are zero-friction.
-            let prefix = req.common_prefix();
-            self.splice_cmdline_token(req.range, &prefix);
-            if req.items.len() == 1 {
-                // Exact match: also append a trailing space so the
-                // user can type the next arg without an extra
-                // keystroke.
-                self.cmdline.buf.push(' ');
-                self.cmdline.cursor = self.cmdline.buf.chars().count();
-                return;
-            }
-            // Multiple candidates: show the popup. Recompute the
-            // splice range against the just-updated buffer so future
-            // accepts overwrite the token we just typed in.
-            let new_token_start = req.range.0;
-            let new_token_end = new_token_start + prefix.len();
-            self.cmdline_completions.items = req.items;
-            self.cmdline_completions.selected = 0;
-            self.cmdline_completions.replace_range = (new_token_start, new_token_end);
-            self.cmdline_completions.visible = true;
+        if self.cmdline_completions.visible {
+            // Popup already visible: cycle.
+            return self.move_cmdline_completion(if backward { -1 } else { 1 });
+        }
+        let ctx = crate::cmdline_complete::Context {
+            dashboards: &self.dashboards.items,
+        };
+        let req = match crate::cmdline_complete::completions_for(
+            &self.cmdline.buf,
+            self.cmdline.cursor,
+            &ctx,
+        ) {
+            Some(r) if !r.items.is_empty() => r,
+            _ => return,
+        };
+        // With fuzzy matching there's no meaningful shared prefix, so
+        // splice the top-scored candidate directly. Single match: also
+        // append a trailing space so the user can type the next arg.
+        let top = req.items[0].clone();
+        self.splice_cmdline_token(req.range, &top);
+        if req.items.len() == 1 {
+            self.cmdline.buf.push(' ');
+            self.cmdline.cursor = self.cmdline.buf.chars().count();
             return;
         }
-        // Popup already visible: cycle.
-        let delta = if backward { -1 } else { 1 };
-        self.move_cmdline_completion(delta);
+        // Multi: show popup; re-anchor splice range to the spliced text.
+        let new_token_end = req.range.0 + top.len();
+        self.cmdline_completions.items = req.items;
+        self.cmdline_completions.selected = 0;
+        self.cmdline_completions.replace_range = (req.range.0, new_token_end);
+        self.cmdline_completions.visible = true;
     }
 
     pub(super) fn move_cmdline_completion(&mut self, delta: isize) {

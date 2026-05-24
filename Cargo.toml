@@ -18,6 +18,7 @@ pest = "2.8.6"
 mpl-language-server = { version = "0.5.3", path = "../mpl/extra/mpl-language-server" }
 miette = "7.6.0"
 time = { version = "0.3", features = ["formatting", "macros", "parsing"] }
+nucleo-matcher = "0.3"
 
 [dev-dependencies]
 tempfile = "3.27.0"
