@@ -1,5 +1,14 @@
 use super::*;
 
+use super::agg::{Agg, format_value};
+use super::pragma::format_pragma;
+use super::heatmap::{heatmap_bin, normalize, viridis_rgb};
+use super::note::{render_markdown, strip_leading_pragma};
+use super::pie::pie_rows;
+use super::table::{TableCell, series_to_table};
+use super::top_list::top_list_rows;
+use ratatui::style::{Color, Style};
+
 fn spec(kind: VizKind) -> VizSpec {
     VizSpec {
         kind,
@@ -156,7 +165,7 @@ fn mkseries(name: &str, ys: &[f64]) -> Series {
         name: name.to_string(),
         tags: vec![],
         points: pts(ys),
-        color: ratatui::style::Color::Cyan,
+        color: Color::Cyan,
     }
 }
 
@@ -265,7 +274,7 @@ fn tagged(name: &str, tag: &str, ys: &[f64]) -> Series {
         name: name.to_string(),
         tags: vec![("room".to_string(), tag.to_string())],
         points: pts(ys),
-        color: ratatui::style::Color::Cyan,
+        color: Color::Cyan,
     }
 }
 
@@ -327,13 +336,13 @@ fn series_to_table_collects_tag_columns_alphabetically_then_value() {
                 ("host".into(), "db-1".into()),
             ],
             points: pts(&[1.0, 2.0, 3.0]),
-            color: ratatui::style::Color::Cyan,
+            color: Color::Cyan,
         },
         Series {
             name: "b".into(),
             tags: vec![("host".into(), "db-2".into())],
             points: pts(&[10.0, 20.0]),
-            color: ratatui::style::Color::Yellow,
+            color: Color::Yellow,
         },
     ];
     let t = series_to_table(&s, &[false; 2], Agg::Last);
@@ -356,18 +365,36 @@ fn series_to_table_skips_hidden_series() {
             name: "a".into(),
             tags: vec![("h".into(), "x".into())],
             points: pts(&[1.0]),
-            color: ratatui::style::Color::Cyan,
+            color: Color::Cyan,
         },
         Series {
             name: "b".into(),
             tags: vec![("h".into(), "y".into())],
             points: pts(&[2.0]),
-            color: ratatui::style::Color::Yellow,
+            color: Color::Yellow,
         },
     ];
     let t = series_to_table(&s, &[false, true], Agg::Last);
     assert_eq!(t.rows.len(), 1);
     assert_eq!(t.rows[0][0], TableCell::Str("x".into()));
+}
+
+#[test]
+fn table_cell_render_handles_each_variant() {
+    assert_eq!(TableCell::Null.render(), "—");
+    assert_eq!(TableCell::Int(42).render(), "42");
+    assert_eq!(TableCell::Float(2.5).render(), "2.50");
+    assert_eq!(TableCell::Str("hi".into()).render(), "hi");
+    assert_eq!(TableCell::Bool(true).render(), "true");
+}
+
+#[test]
+fn normalize_handles_constant_range() {
+    assert_eq!(normalize(5.0, 5.0, 5.0), 0.5);
+    assert_eq!(normalize(0.0, 0.0, 10.0), 0.0);
+    assert_eq!(normalize(10.0, 0.0, 10.0), 1.0);
+    assert_eq!(normalize(-1.0, 0.0, 10.0), 0.0);
+    assert_eq!(normalize(100.0, 0.0, 10.0), 1.0);
 }
 
 // ── note (mini-markdown) ─────────────────────────────────────────────────
@@ -437,22 +464,4 @@ fn strip_leading_pragma_removes_just_the_pragma_line() {
 fn strip_leading_pragma_is_noop_without_pragma() {
     let body = "# Title\n";
     assert_eq!(strip_leading_pragma(body), body);
-}
-
-#[test]
-fn table_cell_render_handles_each_variant() {
-    assert_eq!(TableCell::Null.render(), "—");
-    assert_eq!(TableCell::Int(42).render(), "42");
-    assert_eq!(TableCell::Float(2.5).render(), "2.50");
-    assert_eq!(TableCell::Str("hi".into()).render(), "hi");
-    assert_eq!(TableCell::Bool(true).render(), "true");
-}
-
-#[test]
-fn normalize_handles_constant_range() {
-    assert_eq!(normalize(5.0, 5.0, 5.0), 0.5);
-    assert_eq!(normalize(0.0, 0.0, 10.0), 0.0);
-    assert_eq!(normalize(10.0, 0.0, 10.0), 1.0);
-    assert_eq!(normalize(-1.0, 0.0, 10.0), 0.0);
-    assert_eq!(normalize(100.0, 0.0, 10.0), 1.0);
 }
