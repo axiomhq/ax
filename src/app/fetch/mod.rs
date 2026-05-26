@@ -123,8 +123,27 @@ impl App {
                                 .map(|v| v.to_string())
                                 .unwrap_or_else(|| "?".to_string())
                         );
+                        // `:wq` / `:x` armed a deferred quit; honour
+                        // it now that the save round-tripped. Guard
+                        // against the race where the user edited
+                        // again between dispatch and response — we
+                        // honour the save that landed but cancel the
+                        // quit so the new edits aren't lost.
+                        if self.quit_after_save {
+                            self.quit_after_save = false;
+                            if self.dashboard_dirty {
+                                self.status = "saved — quit aborted (buffer modified)".to_string();
+                            } else {
+                                self.persist_query();
+                                self.should_quit = true;
+                            }
+                        }
                     }
                     Err(e) => {
+                        // Failed save must not leave a stale
+                        // `quit_after_save` armed — otherwise a later
+                        // successful save would ghost-quit the app.
+                        self.quit_after_save = false;
                         self.set_error(format!("save {uid}: {e}"));
                     }
                 }

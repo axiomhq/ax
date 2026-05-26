@@ -469,3 +469,477 @@ fn dashboard_undo_toggles_redo_on_second_press() {
         .len();
     assert_eq!(after, before - 1);
 }
+
+// ── editor ↔ focused-tile sync (plan/19 follow-up) ────────────────────
+//
+// In dashboard mode the editor buffer is a live view onto the focused
+// tile's MPL. Navigating between tiles re-seeds the buffer; edits flow
+// back into the focused tile so `:w` saves a coherent state.
+
+/// Helper: pull the MPL string out of `loaded_dashboard.charts[idx]`.
+/// Panics if the chart is missing or the query isn't MPL.
+fn tile_mpl(app: &App, idx: usize) -> String {
+    let chart = &app
+        .loaded_dashboard
+        .as_ref()
+        .expect("loaded dashboard")
+        .dashboard
+        .charts[idx];
+    let q = chart.known_base().query.as_ref().expect("chart has query");
+    q.get("mpl")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .expect("query has `mpl` key")
+}
+
+#[test]
+fn dashboard_nav_reseeds_editor_to_focused_tile() {
+    // Spatial nav must re-seed the editor from whichever tile is now
+    // focused — otherwise the diagnostic shown in the status bar
+    // refers to a buffer that doesn't belong to anything on screen.
+    let mut app = test_app();
+    app.handle_event(AppEvent::DashboardOpened {
+        uid: "u".into(),
+        result: Ok(multi_chart_resource()),
+    });
+    assert!(app.query_text().contains("top-left:rate"));
+    app.on_key(key(KeyCode::Right));
+    assert!(
+        app.query_text().contains("top-right:rate"),
+        "after Right nav, buffer: {:?}",
+        app.query_text()
+    );
+    app.on_key(key(KeyCode::Down));
+    assert!(app.query_text().contains("bottom-right:rate"));
+    app.on_key(key(KeyCode::Left));
+    assert!(app.query_text().contains("bottom-left:rate"));
+}
+
+#[test]
+fn dashboard_nav_reseeds_clears_stale_mpl_diagnostic() {
+    // The reported user bug: status bar shows a "1:1: MPL syntax error"
+    // from a buffer that has nothing to do with the loaded dashboard.
+    // After re-seeding from the focused tile, the editor contains the
+    // tile's MPL and the diagnostics reflect that tile — not whatever
+    // was in the buffer before.
+    use crate::axiom::{Chart, ChartBase, KnownChart, LayoutItem};
+    let mk = |id: &str, mpl: &str| {
+        Chart::Known(KnownChart::TimeSeries(ChartBase {
+            id: id.into(),
+            name: Some(id.into()),
+            query: Some(serde_json::json!({ "mpl": mpl })),
+            extras: Default::default(),
+        }))
+    };
+    let resource = DashboardSummary {
+        uid: "u".into(),
+        id: None,
+        updated_at: None,
+        updated_by: None,
+        version: None,
+        dashboard: crate::axiom::DashboardDocument {
+            name: Some("clean".into()),
+            charts: vec![mk("a", "home:temp"), mk("b", "home:humidity")],
+            layout: vec![
+                LayoutItem {
+                    i: "a".into(),
+                    x: 0,
+                    y: Some(0),
+                    w: 6,
+                    h: 6,
+                    extras: Default::default(),
+                },
+                LayoutItem {
+                    i: "b".into(),
+                    x: 6,
+                    y: Some(0),
+                    w: 6,
+                    h: 6,
+                    extras: Default::default(),
+                },
+            ],
+            ..Default::default()
+        },
+    };
+    let mut app = test_app();
+    // Pre-populate the editor with garbage MPL so we know the
+    // re-seed actually replaced it.
+    set_buffer(&mut app, "definitely not valid <<< mpl");
+    assert!(app.diagnostics.iter().any(|d| d.severity.is_error()));
+    app.handle_event(AppEvent::DashboardOpened {
+        uid: "u".into(),
+        result: Ok(resource),
+    });
+    // Adoption seeds from the first chart; diagnostics should now be clean.
+    assert!(
+        app.diagnostics.iter().all(|d| !d.severity.is_error()),
+        "diagnostics after adopt: {:?}",
+        app.diagnostics
+            .iter()
+            .map(|d| &d.message)
+            .collect::<Vec<_>>()
+    );
+    // And navigating to another tile keeps them clean.
+    app.on_key(key(KeyCode::Right));
+    assert!(app.diagnostics.iter().all(|d| !d.severity.is_error()));
+}
+
+/// Test helper: zoom into the currently focused dashboard tile and
+/// drop into Insert mode at end-of-buffer (last line, end of line).
+/// Mirrors what a user does to start editing a tile.
+fn zoom_and_enter_insert(app: &mut App) {
+    app.on_key(key(KeyCode::Enter)); // zoom → Solo + focus Editor
+    assert_eq!(app.focus, Pane::Editor, "zoom failed to focus editor");
+    app.on_key(key(KeyCode::Char('i'))); // → Insert mode
+    assert_eq!(app.mode, Mode::Insert, "failed to enter Insert mode");
+    app.editor.move_cursor(tui_textarea::CursorMove::Bottom);
+    app.editor.move_cursor(tui_textarea::CursorMove::End);
+}
+
+#[test]
+fn dashboard_buffer_edit_writes_back_to_focused_tile() {
+    // Typing in the editor while a dashboard tile is focused must
+    // mutate that tile's MPL. The dirty flag flips so `:w` is required
+    // before quit, and the new MPL appears in the serialised dashboard.
+    let mut app = test_app();
+    app.handle_event(AppEvent::DashboardOpened {
+        uid: "u".into(),
+        result: Ok(multi_chart_resource()),
+    });
+    assert!(!app.dashboard_dirty);
+    assert_eq!(tile_mpl(&app, 0), "top-left:rate");
+    zoom_and_enter_insert(&mut app);
+    type_text(&mut app, " | rate(1m)");
+    app.on_key(key(KeyCode::Esc));
+    let mpl = tile_mpl(&app, 0);
+    assert!(mpl.ends_with(" | rate(1m)"), "tile MPL after edit: {mpl:?}");
+    assert!(app.dashboard_dirty);
+}
+
+#[test]
+fn dashboard_buffer_edit_leaves_unfocused_tiles_untouched() {
+    let mut app = test_app();
+    app.handle_event(AppEvent::DashboardOpened {
+        uid: "u".into(),
+        result: Ok(multi_chart_resource()),
+    });
+    let untouched_before = tile_mpl(&app, 1);
+    zoom_and_enter_insert(&mut app);
+    type_text(&mut app, "X");
+    app.on_key(key(KeyCode::Esc));
+    assert_ne!(tile_mpl(&app, 0), "top-left:rate"); // focused tile changed
+    assert_eq!(tile_mpl(&app, 1), untouched_before); // sibling untouched
+}
+
+#[test]
+fn dashboard_nav_then_back_preserves_edits_per_tile() {
+    // Edit tile 0, navigate to tile 1, navigate back to tile 0. Tile
+    // 0's edit must still be there — i.e. nav fully round-trips edits
+    // through the wire chart.
+    let mut app = test_app();
+    app.handle_event(AppEvent::DashboardOpened {
+        uid: "u".into(),
+        result: Ok(multi_chart_resource()),
+    });
+    zoom_and_enter_insert(&mut app);
+    type_text(&mut app, " | A");
+    app.on_key(key(KeyCode::Esc));
+    let edited = tile_mpl(&app, 0);
+    assert!(edited.ends_with(" | A"), "tile 0 MPL: {edited:?}");
+    // Back to Grid to navigate between tiles, then re-check.
+    app.execute_command("grid");
+    app.on_key(key(KeyCode::Right)); // → tile 1
+    assert!(app.query_text().contains("top-right:rate"));
+    app.on_key(key(KeyCode::Left)); // ← back to tile 0
+    assert!(
+        app.query_text().contains(" | A"),
+        "buffer after round-trip: {:?}",
+        app.query_text()
+    );
+    // The wire chart still has the edit too.
+    assert_eq!(tile_mpl(&app, 0), edited);
+}
+
+#[test]
+fn dashboard_apl_tile_edits_do_not_overwrite_apl() {
+    // APL tiles are seeded with a commented "APL query — execution
+    // lands in step 14b" banner. Editing that banner must NOT push
+    // garbage into the chart's `apl` field.
+    use crate::axiom::{Chart, ChartBase, KnownChart};
+    let mut app = test_app();
+    let resource = DashboardSummary {
+        uid: "u".into(),
+        id: None,
+        updated_at: None,
+        updated_by: None,
+        version: None,
+        dashboard: crate::axiom::DashboardDocument {
+            name: Some("d".into()),
+            charts: vec![Chart::Known(KnownChart::Pie(ChartBase {
+                id: "c1".into(),
+                name: Some("by-region".into()),
+                query: Some(serde_json::json!({
+                    "apl": "['logs'] | summarize count() by region"
+                })),
+                extras: Default::default(),
+            }))],
+            ..Default::default()
+        },
+    };
+    app.handle_event(AppEvent::DashboardOpened {
+        uid: "u".into(),
+        result: Ok(resource),
+    });
+    let original_apl = app.loaded_dashboard.as_ref().unwrap().dashboard.charts[0]
+        .known_base()
+        .query
+        .as_ref()
+        .unwrap()
+        .get("apl")
+        .and_then(|v| v.as_str())
+        .unwrap()
+        .to_string();
+    // Single-chart dashboard auto-switches to Solo + focus Editor;
+    // no need to zoom.
+    assert_eq!(app.focus, Pane::Editor);
+    app.on_key(key(KeyCode::Char('i')));
+    app.editor.move_cursor(tui_textarea::CursorMove::End);
+    type_text(&mut app, " GARBAGE");
+    app.on_key(key(KeyCode::Esc));
+    let after_apl = app.loaded_dashboard.as_ref().unwrap().dashboard.charts[0]
+        .known_base()
+        .query
+        .as_ref()
+        .unwrap()
+        .get("apl")
+        .and_then(|v| v.as_str())
+        .unwrap()
+        .to_string();
+    assert_eq!(after_apl, original_apl, "APL must not be overwritten");
+}
+
+#[test]
+fn dashboard_quit_after_adopt_is_clean() {
+    // `:q` on a freshly adopted dashboard must succeed: the editor
+    // buffer was overwritten by the seed, but no actual dashboard
+    // edit has happened. Without this guard, every dashboard would
+    // refuse to close until forced with `:q!`.
+    let mut app = test_app();
+    app.handle_event(AppEvent::DashboardOpened {
+        uid: "u".into(),
+        result: Ok(multi_chart_resource()),
+    });
+    assert!(!app.is_dirty(), "clean adopt should not be dirty");
+    app.execute_command("q");
+    assert!(app.should_quit, "`:q` after clean adopt must quit");
+    assert!(app.last_error.is_none(), "`:q` raised: {:?}", app.status);
+}
+
+#[test]
+fn dashboard_quit_after_nav_is_clean() {
+    // Navigating between tiles re-seeds the editor (changing
+    // `query_text()`) but does not dirty the dashboard. `:q` must
+    // still succeed.
+    let mut app = test_app();
+    app.handle_event(AppEvent::DashboardOpened {
+        uid: "u".into(),
+        result: Ok(multi_chart_resource()),
+    });
+    app.on_key(key(KeyCode::Right));
+    app.on_key(key(KeyCode::Down));
+    assert!(!app.is_dirty(), "nav alone should not be dirty");
+    app.execute_command("q");
+    assert!(app.should_quit);
+}
+
+#[test]
+fn dashboard_quit_after_edit_blocks_without_bang() {
+    // After a real edit, `:q` must block (E37) and `:q!` must force.
+    let mut app = test_app();
+    app.handle_event(AppEvent::DashboardOpened {
+        uid: "u".into(),
+        result: Ok(multi_chart_resource()),
+    });
+    zoom_and_enter_insert(&mut app);
+    type_text(&mut app, " | rate(1m)");
+    app.on_key(key(KeyCode::Esc));
+    assert!(app.dashboard_dirty);
+    assert!(app.is_dirty(), "edit must mark dashboard dirty");
+    app.execute_command("q");
+    assert!(!app.should_quit, "`:q` must block when dirty");
+    assert!(
+        app.last_error
+            .as_ref()
+            .map(|e| e.contains("E37"))
+            .unwrap_or(false),
+        "expected E37 error, got: {:?}",
+        app.last_error
+    );
+    app.dismiss_error();
+    app.execute_command("q!");
+    assert!(app.should_quit, "`:q!` must force-quit");
+}
+
+#[test]
+fn dashboard_wq_server_loaded_waits_for_save_event_before_quit() {
+    // Server-loaded dashboard `:wq` must NOT quit synchronously — the
+    // PUT is async and the runtime drops on main-loop exit, so an
+    // immediate quit can abort the in-flight HTTP request and the
+    // user's edits are lost. Instead we arm `quit_after_save` and let
+    // the `DashboardSaved` event handler trigger the quit on success.
+    use crate::axiom::{DashboardWriteResponse, DashboardWriteStatus};
+    let mut app = test_app();
+    app.handle_event(AppEvent::DashboardOpened {
+        uid: "u".into(),
+        result: Ok(multi_chart_resource()),
+    });
+    assert!(app.current_file.is_none());
+    zoom_and_enter_insert(&mut app);
+    type_text(&mut app, " | rate(1m)");
+    app.on_key(key(KeyCode::Esc));
+    assert!(app.dashboard_dirty);
+
+    // Fake a successful dispatch by arming the flag directly. (The
+    // real path goes through `put_loaded_dashboard`, which requires
+    // an HTTP client we don't have in tests.) This isolates the
+    // "quit-on-save" contract from the dispatch plumbing.
+    app.quit_after_save = true;
+    assert!(!app.should_quit, "flag alone must not quit");
+
+    let resp = DashboardWriteResponse {
+        status: DashboardWriteStatus::Updated,
+        overwritten: Some(false),
+        dashboard: app.loaded_dashboard.clone().unwrap(),
+    };
+    app.handle_event(AppEvent::DashboardSaved {
+        uid: "u".into(),
+        result: Ok(resp),
+    });
+    assert!(
+        app.should_quit,
+        "successful DashboardSaved with armed flag must quit"
+    );
+    assert!(!app.quit_after_save, "flag must be consumed");
+}
+
+#[test]
+fn dashboard_wq_save_error_clears_flag_and_keeps_running() {
+    // If the server save fails (412 conflict, network error, etc.),
+    // `:wq` must surface the error AND keep the app running so the
+    // user can retry. The flag must be cleared so a later successful
+    // save doesn't ghost-quit.
+    let mut app = test_app();
+    app.handle_event(AppEvent::DashboardOpened {
+        uid: "u".into(),
+        result: Ok(multi_chart_resource()),
+    });
+    app.quit_after_save = true;
+    app.handle_event(AppEvent::DashboardSaved {
+        uid: "u".into(),
+        result: Err(anyhow::anyhow!("412 version conflict")),
+    });
+    assert!(!app.should_quit, "failed save must NOT quit");
+    assert!(!app.quit_after_save, "failed save must clear the flag");
+    assert!(
+        app.last_error.is_some(),
+        "failed save must surface an error"
+    );
+}
+
+#[test]
+fn dashboard_wq_no_dispatch_does_not_arm_quit() {
+    // When the PUT can't be dispatched (busy gate, no client, no
+    // dashboard, etc.), `:wq` MUST NOT arm `quit_after_save` — no
+    // `DashboardSaved` event will ever arrive and the app would hang
+    // forever waiting for one. We force the busy gate here since the
+    // dev machine has a working axiom.toml and the no-client path
+    // can't be reproduced reliably.
+    let mut app = test_app();
+    app.handle_event(AppEvent::DashboardOpened {
+        uid: "u".into(),
+        result: Ok(multi_chart_resource()),
+    });
+    app.busy = true; // make `fetch_prepare` short-circuit
+    app.execute_command("wq");
+    assert!(!app.should_quit, "failed-dispatch `:wq` must not quit");
+    assert!(
+        !app.quit_after_save,
+        "failed-dispatch `:wq` must not arm quit_after_save (would hang)"
+    );
+}
+
+#[test]
+fn dashboard_wq_writes_file_and_quits() {
+    // `:wq` on a file-backed dashboard must write the JSON to disk
+    // AND set `should_quit`. This is the synchronous path (no
+    // network); failures here would mean the command surface isn't
+    // honouring the standard vim contract for `:wq`.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dash.axiom.json");
+
+    let mut app = test_app();
+    app.handle_event(AppEvent::DashboardOpened {
+        uid: "u".into(),
+        result: Ok(multi_chart_resource()),
+    });
+    // Stash the dashboard at `path` so subsequent :wq writes there.
+    app.write_file(Some(path.clone())).unwrap();
+    assert_eq!(app.current_file.as_deref(), Some(path.as_path()));
+
+    // Edit a tile so the dashboard is dirty.
+    zoom_and_enter_insert(&mut app);
+    type_text(&mut app, " | rate(1m)");
+    app.on_key(key(KeyCode::Esc));
+    assert!(app.dashboard_dirty);
+
+    // Now :wq must write the edits to `path` and quit.
+    app.execute_command("wq");
+    assert!(
+        app.should_quit,
+        "`:wq` failed to quit (status: {:?})",
+        app.status
+    );
+    assert!(!app.dashboard_dirty, "`:wq` must clear dirty flag");
+    assert!(
+        !app.quit_after_save,
+        "file-based sync `:wq` must not touch quit_after_save"
+    );
+
+    // Re-load `path` in a fresh app to verify the edits actually
+    // landed on disk.
+    let mut app2 = test_app();
+    app2.open_file(path).unwrap();
+    assert!(
+        tile_mpl(&app2, 0).ends_with(" | rate(1m)"),
+        "persisted MPL after :wq: {:?}",
+        tile_mpl(&app2, 0)
+    );
+}
+
+#[test]
+fn dashboard_save_after_edit_captures_edited_mpl() {
+    // End-to-end: edit a tile, write the dashboard to disk, re-load,
+    // verify the on-disk JSON has the edited MPL. This is the user's
+    // headline scenario: "writing the dashboard" should persist what
+    // they see on screen.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dash.axiom.json");
+
+    let mut app = test_app();
+    app.handle_event(AppEvent::DashboardOpened {
+        uid: "u".into(),
+        result: Ok(multi_chart_resource()),
+    });
+    zoom_and_enter_insert(&mut app);
+    type_text(&mut app, " | rate(1m)");
+    app.on_key(key(KeyCode::Esc));
+    app.write_file(Some(path.clone())).unwrap();
+
+    let mut app2 = test_app();
+    app2.open_file(path).unwrap();
+    assert!(
+        tile_mpl(&app2, 0).ends_with(" | rate(1m)"),
+        "persisted tile MPL: {:?}",
+        tile_mpl(&app2, 0)
+    );
+}

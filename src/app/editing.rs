@@ -19,7 +19,8 @@ impl App {
     pub(super) fn run_command(&mut self, cmd: Command) {
         // Record buffer-mutating commands so `.` can replay them. Done
         // *before* dispatch so a recursive `.` doesn't overwrite itself.
-        if Self::is_mutating(&cmd) {
+        let mutating = Self::is_mutating(&cmd);
+        if mutating {
             self.last_change = Some(cmd.clone());
         }
         match cmd {
@@ -66,6 +67,16 @@ impl App {
             Command::RepeatFind { reverse, count } => self.repeat_find(reverse, count),
             Command::RepeatLastChange => self.repeat_last_change(),
             Command::EnterVisual { linewise } => self.enter_visual(linewise),
+        }
+        // Normal-mode mutating commands (`dd`, `p`, `cw…Esc`, `rx`…)
+        // historically didn't refresh diagnostics until the next Insert
+        // keystroke. Without this hook the editor↔focused-tile sync
+        // would also miss those edits, leaving the dashboard stale.
+        // EnterInsert intentionally triggers a recompute too: the next
+        // Insert keystroke will rerun, but keeping the pair tight here
+        // avoids a one-keystroke window where the dirty flag lags.
+        if mutating {
+            self.recompute_diagnostics();
         }
     }
 
@@ -203,6 +214,7 @@ impl App {
             return;
         };
         let buf = self.query_text();
+        let mutates_buffer = !matches!(op, Operator::Yank);
         match op {
             Operator::Delete => self.delete_range(&buf, range),
             Operator::Yank => self.yank_range(&buf, range),
@@ -210,12 +222,16 @@ impl App {
                 self.delete_range(&buf, range);
                 self.mode = Mode::Insert;
                 self.visual_anchor = None;
+                self.recompute_diagnostics();
                 return;
             }
             Operator::IndentRight => self.indent_range(&buf, range, true),
             Operator::IndentLeft => self.indent_range(&buf, range, false),
         }
         self.exit_visual();
+        if mutates_buffer {
+            self.recompute_diagnostics();
+        }
     }
 
     /// Translate a [`Motion`] into a `tui-textarea` cursor move and apply

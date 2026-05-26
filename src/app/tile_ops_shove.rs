@@ -96,8 +96,9 @@ pub fn shove_move(
 }
 
 /// Auto-shove resize. Shrink-only resizes (both deltas ≤ 0) use the
-/// strict path because shrinking can't introduce overlap. Anything
-/// that grows in either axis runs through the cascade.
+/// strict path because shrinking can't introduce overlap, then run
+/// [`compact_vertical`] so tiles below collapse into the freed band.
+/// Anything that grows in either axis runs through the cascade.
 pub fn shove_resize(
     layout: &mut Vec<LayoutItem>,
     id: &str,
@@ -109,9 +110,30 @@ pub fn shove_resize(
     }
     if dw <= 0 && dh <= 0 {
         let before = layout_max_y(layout);
+        let before_ys: Vec<(String, u32)> = layout.iter().map(|l| (l.i.clone(), y_of(l))).collect();
         tile_ops::resize(layout, id, dw, dh)?;
+        // Shrink may leave an empty horizontal band beneath the
+        // resized tile (or under any tile column band). Gravity-pack
+        // so lower tiles ride up into the freed space.
+        compact_vertical(layout);
+        // Report every tile whose `y` actually changed — callers use
+        // this for status messaging.
+        let mut moved = vec![id.to_string()];
+        for (other_id, before_y) in before_ys {
+            if other_id == id {
+                continue;
+            }
+            let after_y = layout
+                .iter()
+                .find(|l| l.i == other_id)
+                .map(y_of)
+                .unwrap_or(before_y);
+            if after_y != before_y {
+                moved.push(other_id);
+            }
+        }
         return Ok(ShoveOutcome {
-            moved: vec![id.to_string()],
+            moved,
             new_rows: layout_max_y(layout).saturating_sub(before),
         });
     }
@@ -175,6 +197,51 @@ pub fn shove_insert(
     let mut moved = vec![id];
     moved.extend(cascaded);
     Ok(ShoveOutcome { moved, new_rows })
+}
+
+/// Gravity-pack tiles upward: each tile slides as far up as it can
+/// without colliding with any other tile or with the top edge
+/// (`y = 0`). Stable: we process tiles in current `(y, x, id)`
+/// order so an already-compacted row above is always settled before
+/// a row below is considered, and ties break deterministically.
+///
+/// Why row-major iteration is safe: when we land on a tile T, every
+/// tile that started above T has already moved to its final
+/// position (or stayed put). Every tile that started below T is
+/// still at its original `y ≥ T.y`. So colliding against the full
+/// layout (minus T itself) correctly bounds how far T can rise.
+pub fn compact_vertical(layout: &mut [LayoutItem]) {
+    let mut order: Vec<usize> = (0..layout.len()).collect();
+    order.sort_by(|&a, &b| {
+        let la = &layout[a];
+        let lb = &layout[b];
+        (y_of(la), la.x, la.i.as_str()).cmp(&(y_of(lb), lb.x, lb.i.as_str()))
+    });
+    for idx in order {
+        let item = layout[idx].clone();
+        let original_y = y_of(&item);
+        if original_y == 0 {
+            continue;
+        }
+        // Linear scan from y=0 upward for the lowest non-colliding
+        // slot. O(n·max_y) total — fine for our 12-col grids with a
+        // few dozen tiles. Switch to a sweep-line if profiling ever
+        // flags this.
+        for y in 0..original_y {
+            let test = LayoutItem {
+                y: Some(y),
+                ..item.clone()
+            };
+            let collides = layout
+                .iter()
+                .enumerate()
+                .any(|(j, other)| j != idx && rects_overlap(&test, other));
+            if !collides {
+                layout[idx].y = Some(y);
+                break;
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -534,6 +601,89 @@ mod tests {
         assert_eq!(pos(&layout, "t4"), (9, 0, 2, 2));
         assert_eq!(pos(&layout, "t5"), (10, 2, 2, 2));
         assert!(out.new_rows >= 2);
+    }
+
+    #[test]
+    fn resize_shrink_height_pulls_tiles_below_up() {
+        // Headline user bug: a (0..6 cols, 0..4 rows), b sitting
+        // beneath at (0..6 cols, 4..6 rows). Shrink a's height by 2
+        // → a is now 0..2 rows, leaving rows 2..4 empty across
+        // a's column band. b must pull up to y=2 instead of
+        // hovering at y=4 over an empty band.
+        let mut layout = vec![li("a", 0, 0, 6, 4), li("b", 0, 4, 6, 2)];
+        let out = shove_resize(&mut layout, "a", 0, -2).unwrap();
+        assert_eq!(pos(&layout, "a"), (0, 0, 6, 2));
+        assert_eq!(
+            pos(&layout, "b"),
+            (0, 2, 6, 2),
+            "tile below should pull up after the row above shrinks"
+        );
+        assert!(out.moved.contains(&"b".to_string()));
+    }
+
+    #[test]
+    fn resize_shrink_width_does_not_pull_neighbours_horizontally() {
+        // Compaction is vertical-only. Shrinking a's width leaves a
+        // horizontal gap; b stays put. (If you wanted horizontal
+        // packing too you'd write a separate `compact_horizontal`.)
+        let mut layout = vec![li("a", 0, 0, 6, 4), li("b", 6, 0, 4, 2)];
+        let out = shove_resize(&mut layout, "a", -2, 0).unwrap();
+        assert_eq!(pos(&layout, "a"), (0, 0, 4, 4));
+        assert_eq!(pos(&layout, "b"), (6, 0, 4, 2));
+        assert!(!out.moved.contains(&"b".to_string()));
+    }
+
+    #[test]
+    fn resize_shrink_compacts_only_within_column_band() {
+        // a (0..6, 0..4) shrinks to (0..6, 0..2). An unrelated
+        // tile c at the right (8..12, 4..6) must NOT move — its
+        // columns aren't under a, so there's no "empty row in
+        // its column" to fill. Tile b directly under a does pull up.
+        let mut layout = vec![
+            li("a", 0, 0, 6, 4),
+            li("b", 0, 4, 6, 2),
+            li("c", 8, 4, 4, 2),
+        ];
+        shove_resize(&mut layout, "a", 0, -2).unwrap();
+        assert_eq!(pos(&layout, "a"), (0, 0, 6, 2));
+        assert_eq!(pos(&layout, "b"), (0, 2, 6, 2));
+        // c is unrelated to a's column band, but it sits over an
+        // empty band in its own columns (rows 0..4 in cols 8..12 are
+        // empty after shrink) — gravity pulls c up to y=0.
+        assert_eq!(pos(&layout, "c"), (8, 0, 4, 2));
+    }
+
+    #[test]
+    fn compact_is_idempotent() {
+        // Running compact twice produces the same layout as once —
+        // i.e. there are no "oscillating" placements. `LayoutItem`
+        // doesn't implement `PartialEq` so we compare via `pos`.
+        let mut once = vec![li("a", 0, 0, 6, 2), li("b", 0, 4, 6, 2)];
+        compact_vertical(&mut once);
+        let mut twice = once.clone();
+        compact_vertical(&mut twice);
+        let ids = ["a", "b"];
+        for id in ids {
+            assert_eq!(pos(&once, id), pos(&twice, id));
+        }
+    }
+
+    #[test]
+    fn compact_pulls_tile_up_through_gap_when_above_is_clear() {
+        // No tile above b's columns — it falls all the way to y=0.
+        let mut layout = vec![li("b", 6, 4, 4, 2)];
+        compact_vertical(&mut layout);
+        assert_eq!(pos(&layout, "b"), (6, 0, 4, 2));
+    }
+
+    #[test]
+    fn compact_respects_horizontal_neighbours() {
+        // a sits at top-left; b is at (6, 4). a doesn't block b's
+        // columns, so b falls to y=0 (next to a, not under it).
+        let mut layout = vec![li("a", 0, 0, 6, 4), li("b", 6, 4, 4, 2)];
+        compact_vertical(&mut layout);
+        assert_eq!(pos(&layout, "a"), (0, 0, 6, 4));
+        assert_eq!(pos(&layout, "b"), (6, 0, 4, 2));
     }
 
     #[test]

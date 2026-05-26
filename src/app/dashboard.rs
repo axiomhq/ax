@@ -106,9 +106,8 @@ impl App {
             return;
         }
         let i = self.selected_chart_idx as isize + delta;
-        let wrapped = ((i % n as isize) + n as isize) % n as isize;
-        self.selected_chart_idx = wrapped as usize;
-        self.reload_legend_label_tags();
+        let wrapped = (((i % n as isize) + n as isize) % n as isize) as usize;
+        self.set_focused_chart(wrapped);
     }
 
     /// Spatial navigation in the dashboard grid: pick the chart whose
@@ -133,8 +132,7 @@ impl App {
             self.selected_chart_idx,
             dir,
         ) {
-            self.selected_chart_idx = next;
-            self.reload_legend_label_tags();
+            self.set_focused_chart(next);
             return;
         }
         // No spatial match — fall back to row-major cycle.
@@ -151,6 +149,9 @@ impl App {
     /// MPL/APL. Drops view mode back to Solo + focuses the editor.
     pub fn zoom_selected_chart(&mut self) {
         use crate::dashboard::Query;
+        // Pull the chart up-front for the post-seed bookkeeping
+        // (tile-results adoption, title, legend tags). The seed
+        // helper does its own clone so this one is independent.
         let Some(resource) = self.loaded_dashboard.as_ref() else {
             return;
         };
@@ -163,17 +164,12 @@ impl App {
             return;
         };
         let kind = VizKind::from_chart(&chart);
-        let query = crate::dashboard::extract_query(&chart);
-        // The focused tile is whichever chart the user just zoomed
-        // in on; reset opts (the wire chart has none) so the buffer
-        // pragma is the only source of viz options.
-        self.viz_kind = kind;
-        self.viz_opts.clear();
-        let pragma_line = format!("// @viz {}\n", kind.as_str());
-        if let Some(text) = Self::build_query_seed(&pragma_line, &query) {
-            self.editor = editor::editor_with_text(&text);
-            self.recompute_diagnostics();
-        }
+        // Re-seed the editor + viz state from the focused tile.
+        // `seed_editor_from_focused_tile` returns the extracted
+        // `Query` so we don't extract twice.
+        let Some(query) = self.seed_editor_from_focused_tile() else {
+            return;
+        };
         // For MPL tiles, pin the editor-side query context to the
         // tile's (dataset, metric) so the upcoming legend-tag reload
         // finds the right per-metric cache slot. We don't know the
@@ -241,13 +237,7 @@ impl App {
         // Focus snaps to the first chart — matches the grid's
         // initial selection and the prior `Dashboard::tiles[0]`
         // semantics. Empty dashboards fall through to defaults.
-        let first_chart = resource.dashboard.charts.first().cloned();
-        let (focused_kind, focused_query) = match first_chart.as_ref() {
-            Some(c) => (VizKind::from_chart(c), crate::dashboard::extract_query(c)),
-            None => (VizKind::default(), Query::Empty),
-        };
-        self.viz_kind = focused_kind;
-        self.viz_opts.clear();
+        self.selected_chart_idx = 0;
         self.last_picked_dashboard = Some(uid);
         self.loaded_dashboard = Some(resource);
         // The dashboard is now the canonical artifact. `:w` and
@@ -261,16 +251,20 @@ impl App {
         // routes to the server PUT path, not a leftover .mpl path.
         self.current_file = None;
 
-        let pragma_line = format!("// @viz {}\n", focused_kind.as_str());
-        // Query::Empty leaves the editor alone — the tile renderer
-        // surfaces the note body / placeholder directly.
-        if let Some(text) = Self::build_query_seed(&pragma_line, &focused_query) {
-            self.editor = editor::editor_with_text(&text);
-            self.recompute_diagnostics();
-        }
-        // Capture the seed *after* `recompute_diagnostics` so it matches
-        // what `query_text()` returns for an untouched buffer (line
-        // endings normalised by the editor).
+        // Seed the editor from the focused (first) tile. Empty
+        // dashboards leave the editor untouched (no charts to seed
+        // from), preserving any MPL the user was already writing.
+        let focused_query = if chart_count > 0 {
+            self.seed_editor_from_focused_tile().unwrap_or(Query::Empty)
+        } else {
+            Query::Empty
+        };
+        // `last_adopted_seed` powers the background-refresh re-adopt
+        // guard: a fresh adopt that matches the buffer means "pristine,
+        // safe to re-adopt". With per-tile re-seeding (each navigation
+        // rewrites the buffer) this stays a per-adopt snapshot —
+        // refreshes re-adopt only when the user hasn't dirtied the
+        // dashboard.
         self.last_adopted_seed = match &focused_query {
             Query::Empty => None,
             _ => Some(self.query_text()),
@@ -332,5 +326,131 @@ impl App {
                     .push(pragma_diagnostic(text, line_idx, &err));
             }
         }
+    }
+
+    /// Move dashboard focus to `idx`, persisting the currently focused
+    /// tile's editor edits first (so we don't lose work when navigating
+    /// away) and then re-seeding the editor from the new focus. No-op
+    /// when `idx` is already the focused chart — navigation that
+    /// resolves to the same tile must not clobber pending edits.
+    pub(super) fn set_focused_chart(&mut self, idx: usize) {
+        if idx == self.selected_chart_idx {
+            // Still reload tags in case caller relied on the side effect.
+            self.reload_legend_label_tags();
+            return;
+        }
+        // Save current edits to the outgoing tile before the
+        // selection moves; otherwise the next seed would clobber them.
+        self.sync_buffer_to_focused_tile();
+        self.selected_chart_idx = idx;
+        self.seed_editor_from_focused_tile();
+        self.reload_legend_label_tags();
+    }
+
+    /// Re-seed the editor buffer + viz state from the currently focused
+    /// tile in `loaded_dashboard`. The pragma line (`// @viz <kind>`)
+    /// is always present; the body is the tile's MPL, an APL banner,
+    /// or a `(no query)` placeholder for Note/Spacer tiles.
+    ///
+    /// Only MPL tiles get live diagnostics. APL banners and Empty seeds
+    /// are comment-only buffers that the MPL parser would reject —
+    /// surfacing that as a status-bar error is noise, so we suppress it.
+    /// Returns the extracted [`Query`] so callers (zoom) can use it for
+    /// follow-up state updates without re-extracting.
+    pub(super) fn seed_editor_from_focused_tile(&mut self) -> Option<crate::dashboard::Query> {
+        use crate::dashboard::Query;
+        let resource = self.loaded_dashboard.as_ref()?;
+        let chart = resource
+            .dashboard
+            .charts
+            .get(self.selected_chart_idx)?
+            .clone();
+        let kind = VizKind::from_chart(&chart);
+        let query = crate::dashboard::extract_query(&chart);
+        self.viz_kind = kind;
+        self.viz_opts.clear();
+        let pragma_line = format!("// @viz {}\n", kind.as_str());
+        let text = Self::build_query_seed(&pragma_line, &query)
+            .unwrap_or_else(|| format!("{pragma_line}// (no query for this tile)\n"));
+        self.editor = editor::editor_with_text(&text);
+        if matches!(query, Query::Mpl(_)) {
+            self.recompute_diagnostics();
+        } else {
+            // Refresh pragma-derived viz state without invoking the MPL
+            // analyzer (whose error on a comment-only buffer is the
+            // exact noise we're suppressing).
+            self.diagnostics.clear();
+            self.sync_dashboard_from_buffer(&text);
+            self.recompute_sig_help();
+        }
+        Some(query)
+    }
+
+    /// Push the editor buffer back into the focused tile's MPL query.
+    /// No-op outside Dashboard mode, when the focused tile isn't MPL,
+    /// or when the stripped MPL already matches the chart's stored MPL
+    /// (the equality guard keeps `dashboard_dirty` from flipping on
+    /// cursor moves, undo/redo round-trips, or seed operations that
+    /// just loaded the same text we're about to write).
+    ///
+    /// The buffer's leading `// @viz <kind>` pragma is stripped — the
+    /// chart's wire kind comes from `Chart::Known(…)`, not the pragma.
+    /// Changing the pragma in the buffer adjusts the TUI render kind
+    /// for the current session but doesn't rewrite the server-side
+    /// chart variant (that would be a separate "convert chart type"
+    /// command).
+    pub(super) fn sync_buffer_to_focused_tile(&mut self) {
+        use crate::dashboard::Query;
+        if self.buffer_mode != BufferMode::Dashboard {
+            return;
+        }
+        let Some(resource) = self.loaded_dashboard.as_mut() else {
+            return;
+        };
+        let Some(chart) = resource.dashboard.charts.get_mut(self.selected_chart_idx) else {
+            return;
+        };
+        // Only MPL tiles accept buffer-driven edits. APL banners and
+        // empty placeholders are read-only views in the editor.
+        let existing = crate::dashboard::extract_query(chart);
+        let Query::Mpl(existing_mpl) = existing else {
+            return;
+        };
+        let buf = self.editor.lines().join("\n");
+        let new_mpl = strip_viz_pragma(&buf);
+        if new_mpl == existing_mpl {
+            return;
+        }
+        let base = chart.known_base_mut();
+        // Preserve any sibling keys (e.g. extras) on the existing
+        // query object; only the `mpl` key is rewritten.
+        let new_query = match base.query.take() {
+            Some(mut v) if v.is_object() => {
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert(
+                        "mpl".to_string(),
+                        serde_json::Value::String(new_mpl.to_string()),
+                    );
+                }
+                v
+            }
+            _ => serde_json::json!({ "mpl": new_mpl }),
+        };
+        base.query = Some(new_query);
+        self.dashboard_dirty = true;
+    }
+}
+
+/// Strip a leading `// @viz <kind>` pragma line off the editor buffer
+/// so what's left is the raw MPL we can store on the wire chart. If
+/// the buffer has no pragma we return it untouched.
+fn strip_viz_pragma(buf: &str) -> &str {
+    let rest = match buf.strip_prefix("// @viz ") {
+        Some(r) => r,
+        None => return buf,
+    };
+    match rest.find('\n') {
+        Some(i) => &rest[i + 1..],
+        None => "",
     }
 }

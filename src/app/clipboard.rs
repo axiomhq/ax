@@ -79,6 +79,9 @@ impl App {
         };
         self.dashboard_dirty = snap.dirty;
         self.dashboard_undo = Some(redo);
+        // Restored focus may point at a different chart — re-seed
+        // the editor so the buffer matches what's now selected.
+        self.seed_editor_from_focused_tile();
         self.status = "undo".to_string();
     }
 
@@ -132,6 +135,10 @@ impl App {
                 self.selected_chart_idx = new_len.saturating_sub(1);
             }
         }
+        // Cut may have removed the focused tile; re-seed the editor
+        // so it tracks the new focus (or shows the placeholder if
+        // the dashboard is now empty).
+        self.seed_editor_from_focused_tile();
         self.tile_yank = Some(snapshots);
         self.dashboard_dirty = true;
         self.status = if count == 1 {
@@ -302,6 +309,9 @@ impl App {
                 .position(|c| c.known_base().id == id)
         {
             self.selected_chart_idx = pos;
+            // Paste focus moved to the freshly inserted tile; re-seed
+            // the editor from it so the buffer matches the new focus.
+            self.seed_editor_from_focused_tile();
         }
         self.status = match total_new_rows {
             0 => format!("pasted {inserted} tile(s)"),
@@ -372,6 +382,10 @@ impl App {
                 resource.dashboard.charts.push(kind.to_chart(base));
                 self.selected_chart_idx = resource.dashboard.charts.len() - 1;
                 self.dashboard_dirty = true;
+                // Freshly opened tile becomes the focus; re-seed the
+                // editor so the user types into the new tile's body
+                // instead of the previous tile's stale buffer.
+                self.seed_editor_from_focused_tile();
                 true
             }
             Err(reason) => {

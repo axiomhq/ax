@@ -408,8 +408,11 @@ impl App {
                     n_before = resource.dashboard.charts.len();
                     r
                 };
-                if r.is_ok() && app.selected_chart_idx >= n_before {
-                    app.selected_chart_idx = n_before.saturating_sub(1);
+                if r.is_ok() {
+                    if app.selected_chart_idx >= n_before {
+                        app.selected_chart_idx = n_before.saturating_sub(1);
+                    }
+                    app.seed_editor_from_focused_tile();
                 }
                 r.map(|()| format!("deleted tile {id}"))
             }),
@@ -578,6 +581,9 @@ impl App {
         );
         self.dashboard_dirty = true;
         self.selected_chart_idx = resource.dashboard.charts.len() - 1;
+        // Newly added tile becomes the focus — re-seed so the
+        // editor reflects its (empty) body, not the old tile's MPL.
+        self.seed_editor_from_focused_tile();
         self.status = format!("added {} tile {id}", kind.as_str());
     }
 
@@ -588,6 +594,10 @@ impl App {
             self.status = ":grid: no dashboard loaded".to_string();
             return;
         }
+        // Switching away from Solo: write the editor buffer back to
+        // the focused tile so we don't lose unsaved edits made while
+        // zoomed in.
+        self.sync_buffer_to_focused_tile();
         self.view_mode = ViewMode::Grid;
         self.focus = Pane::Dashboard;
         let n = self
@@ -597,6 +607,9 @@ impl App {
             .unwrap_or(0);
         if self.selected_chart_idx >= n {
             self.selected_chart_idx = 0;
+            // Clamped to a different tile; refresh the editor to
+            // match the new focus.
+            self.seed_editor_from_focused_tile();
         }
         self.reload_legend_label_tags();
     }
@@ -697,19 +710,26 @@ impl App {
     /// `overwrite=false` (plain `:w`) means the server's optimistic
     /// version check fires — a 412 surfaces as an error so the user
     /// can rebase and retry. `:w!` skips the check.
-    pub(super) fn put_loaded_dashboard(&mut self, overwrite: bool) {
+    ///
+    /// Returns `true` iff the PUT task was actually spawned. The
+    /// caller (`write_then_quit`) uses this to decide whether arming
+    /// `quit_after_save` is safe — a silent `false` (busy gate, no
+    /// client) means no `DashboardSaved` event will ever arrive, and
+    /// arming the flag would hang the app waiting for it.
+    pub(super) fn put_loaded_dashboard(&mut self, overwrite: bool) -> bool {
         let Some((uid, doc, version)) = self
             .loaded_dashboard
             .as_ref()
             .map(|r| (r.uid.clone(), r.dashboard.clone(), r.version))
         else {
-            return self.set_error(":w: no dashboard loaded".to_string());
+            self.set_error(":w: no dashboard loaded".to_string());
+            return false;
         };
         let verb = if overwrite { ":w!" } else { ":w" };
         let Some((client, tx, _)) =
             self.fetch_prepare(Some(format!("{verb}: saving dashboard {uid}…")))
         else {
-            return;
+            return false;
         };
         let uid_for_event = uid.clone();
         self.runtime.spawn(async move {
@@ -721,6 +741,7 @@ impl App {
                 result,
             });
         });
+        true
     }
 
     /// `:dash rm <uid>` — delete a dashboard. Requires an explicit uid
@@ -834,7 +855,11 @@ impl App {
             && path.is_none()
             && self.current_file.is_none()
         {
-            return self.put_loaded_dashboard(bang);
+            // Bare `:w` ignores the dispatch result — success/failure
+            // surfaces via the status line or error overlay. The
+            // return value only matters for `:wq` / `:x` (write_then_quit).
+            let _ = self.put_loaded_dashboard(bang);
+            return;
         }
         match self.write_file(path.map(std::path::PathBuf::from)) {
             Ok(p) => self.status = format!("wrote {}", display_path(&p)),
@@ -849,8 +874,9 @@ impl App {
     /// `:x` — write only when modified, then quit. Equivalent to `:wq`
     /// when dirty, or `:q` when clean.
     fn cmd_update_quit(&mut self, path: Option<&str>, bang: bool) {
-        let dirty = self.is_dirty() || self.dashboard_dirty;
-        self.write_then_quit(path, bang, dirty || path.is_some());
+        // `is_dirty()` already folds `dashboard_dirty` into Dashboard
+        // mode, so a separate disjunction is redundant.
+        self.write_then_quit(path, bang, self.is_dirty() || path.is_some());
     }
 
     /// Shared body for `:wq` / `:x`: optionally write, then quit
@@ -863,18 +889,32 @@ impl App {
     /// printed after the alt-screen tears down. Synchronous failure
     /// modes (no client, no dashboard) still abort the quit cleanly.
     fn write_then_quit(&mut self, path: Option<&str>, bang: bool, write: bool) {
-        if write {
-            if self.buffer_mode == BufferMode::Dashboard
-                && path.is_none()
-                && self.current_file.is_none()
-            {
-                self.put_loaded_dashboard(bang);
-                if self.last_error.is_some() {
-                    return;
-                }
-            } else if let Err(e) = self.write_file(path.map(std::path::PathBuf::from)) {
-                return self.set_error(format!("write failed: {e}"));
+        if !write {
+            self.persist_query();
+            self.should_quit = true;
+            return;
+        }
+        // Server-loaded dashboard save is async: spawn the PUT and
+        // defer the quit to the `DashboardSaved` handler. Quitting
+        // here would let the main loop drop the tokio runtime before
+        // the in-flight HTTP request lands, silently dropping the
+        // user's edits.
+        if self.buffer_mode == BufferMode::Dashboard
+            && path.is_none()
+            && self.current_file.is_none()
+        {
+            if self.put_loaded_dashboard(bang) {
+                // Dispatch succeeded — wait for the save event.
+                self.quit_after_save = true;
             }
+            // Dispatch failed (no client / busy / no dashboard): the
+            // status or error overlay already explains why; stay
+            // running so the user can retry.
+            return;
+        }
+        // Synchronous paths: write now, quit now.
+        if let Err(e) = self.write_file(path.map(std::path::PathBuf::from)) {
+            return self.set_error(format!("write failed: {e}"));
         }
         self.persist_query();
         self.should_quit = true;

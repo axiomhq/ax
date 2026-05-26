@@ -178,6 +178,13 @@ pub struct App {
     /// Cleared on `DashboardSaved` and on `write_file` in dashboard
     /// mode. Surfaced as `[+]` in the status line.
     pub dashboard_dirty: bool,
+    /// Armed by `:wq` / `:x` on a server-loaded dashboard: the PUT is
+    /// async, so we can't quit synchronously without aborting the
+    /// in-flight HTTP request when the tokio runtime drops. Instead
+    /// the cmd dispatches the save, sets this flag, and the
+    /// `DashboardSaved` event handler completes the quit on success
+    /// (or clears the flag on error so the user can retry).
+    pub quit_after_save: bool,
     /// Per-tile query results, keyed by chart id (wire `ChartBase.id`).
     /// Populated by `run_tile_queries` after `adopt_dashboard`; read
     /// by the grid renderer to draw live data in each tile.
@@ -280,6 +287,7 @@ impl App {
             tile_yank: None,
             dashboard_undo: None,
             dashboard_dirty: false,
+            quit_after_save: false,
             tile_results: std::collections::BTreeMap::new(),
             tile_query_epoch: 0,
             last_adopted_seed: None,
@@ -551,10 +559,20 @@ impl App {
         self.help.scroll = 0;
     }
 
-    /// `true` when the editor buffer has unsaved changes compared to the last
-    /// load or write.
+    /// `true` when there are unsaved changes.
+    ///
+    /// * MPL mode: the editor buffer diverges from the last load/write.
+    /// * Dashboard mode: the dashboard model itself is dirty
+    ///   (`dashboard_dirty`). The editor buffer is a live view onto
+    ///   the focused tile and gets rewritten on every navigation, so
+    ///   comparing it against `saved_buffer` would flag every nav as
+    ///   "unsaved" — the writeback already mirrors real edits into
+    ///   `loaded_dashboard` and flips `dashboard_dirty` there.
     pub fn is_dirty(&self) -> bool {
-        self.query_text() != self.saved_buffer
+        match self.buffer_mode {
+            BufferMode::Mpl => self.query_text() != self.saved_buffer,
+            BufferMode::Dashboard => self.dashboard_dirty,
+        }
     }
 
     /// Set both the status line summary and the dismissable error overlay.
@@ -626,11 +644,17 @@ impl App {
     /// `self.diagnostics`. Cheap enough (~ms range on our queries) to run on
     /// every buffer-mutating keystroke; debounce if it ever shows up in a
     /// profile.
+    ///
+    /// Also pushes the buffer back into the focused dashboard tile when
+    /// in `BufferMode::Dashboard` — the writeback is guarded by an
+    /// equality check so seed operations (which re-run diagnostics) and
+    /// pure cursor moves are no-ops on `dashboard_dirty`.
     pub fn recompute_diagnostics(&mut self) {
         let text = self.query_text();
         self.diagnostics = mpl::analyze(&text, &self.params.system);
         self.sync_dashboard_from_buffer(&text);
         self.recompute_sig_help();
+        self.sync_buffer_to_focused_tile();
     }
 
     /// Refresh the status-line signature help from the current cursor.

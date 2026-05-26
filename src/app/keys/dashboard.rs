@@ -253,6 +253,9 @@ impl App {
                 self.selected_chart_idx = n.saturating_sub(1);
             }
             self.status = format!("deleted tile {id}");
+            // Focused tile may have changed (or the dashboard is now
+            // empty); refresh the editor accordingly.
+            self.seed_editor_from_focused_tile();
         }
         self.tile_submode = TileSubMode::Idle;
     }
@@ -312,6 +315,8 @@ impl App {
                             self.dashboard_dirty = true;
                             self.selected_chart_idx = resource.dashboard.charts.len() - 1;
                             self.status = format!("added {} tile {id}", kind.as_str());
+                            // Refocus the new tile in the editor.
+                            self.seed_editor_from_focused_tile();
                         }
                     }
                     PickVizAction::Open { above, remaining } => {
