@@ -191,7 +191,16 @@ impl App {
         // background fetch — we just promote it. A subsequent `:r`
         // (or the editor's run-on-Enter) will refresh it if the
         // user wants a fresh point-in-time.
-        let chart_id = chart.known_base().id.clone();
+        // Unknown chart variants have no `ChartBase` (id/name/extras),
+        // so they can't be zoomed into: there's nothing for the editor
+        // to seed from and nothing for `tile_results` to key on. The
+        // `seed_editor_from_focused_tile` guard above already returns
+        // `None` for Unknowns, so by here `chart` is `Chart::Known` in
+        // practice. We still go through `base()` so an SDK upgrade
+        // can't turn this into a panic.
+        let Some(chart_id) = chart.base().map(|b| b.id.clone()) else {
+            return;
+        };
         if let Some(tile) = self.tile_results.get(&chart_id) {
             self.series = tile.series.clone();
             self.legend.hidden = vec![false; self.series.len()];
@@ -216,9 +225,8 @@ impl App {
         // selection (or clear if there's nothing cached).
         self.reload_legend_label_tags();
         let title = chart
-            .known_base()
-            .name
-            .clone()
+            .base()
+            .and_then(|b| b.name.clone())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| kind.as_str().to_string());
         self.status = format!("zoomed `{title}`");
@@ -421,7 +429,15 @@ impl App {
         if new_mpl == existing_mpl {
             return;
         }
-        let base = chart.known_base_mut();
+        // Apply the editor's new MPL back onto the focused tile.
+        // `Chart::Unknown` carries raw JSON with no `ChartBase`, so
+        // there's nothing to mutate; we skip silently — the editor
+        // shouldn't have been routed to an Unknown tile in the first
+        // place (Unknowns have no MPL to extract), but bail safely
+        // either way.
+        let Some(base) = chart.base_mut() else {
+            return;
+        };
         // Preserve any sibling keys (e.g. extras) on the existing
         // query object; only the `mpl` key is rewritten.
         let new_query = match base.query.take() {

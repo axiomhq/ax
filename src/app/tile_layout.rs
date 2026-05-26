@@ -6,7 +6,6 @@
 //! Everything here is pure (no `App` borrow) so each piece can be
 //! unit-tested in isolation.
 
-use crate::axiom::ChartKnownExt;
 use crate::dashboard::VizKind;
 
 /// Backwards-compatible alias for [`VizKind::ALL`]. Kept so add-pick /
@@ -51,14 +50,20 @@ pub(crate) fn pick_next_chart_in_direction(
             None => (0.0, 0.0),
         }
     }
-    let src_id = charts.get(selected)?.known_base().id.clone();
+    // `Chart::Unknown` has no `ChartBase.id`, so we can't locate it in
+    // the layout grid. Treat such a focused tile as "no spatial
+    // navigation source" and skip Unknown candidates in the scan
+    // — they remain visible in the grid (their raw JSON round-trips)
+    // but aren't reachable by hjkl until the SDK knows about them.
+    let src_id = charts.get(selected)?.base()?.id.clone();
     let (sx, sy) = centroid(layout, &src_id);
     let mut best: Option<(usize, f32)> = None;
     for (i, c) in charts.iter().enumerate() {
         if i == selected {
             continue;
         }
-        let (cx, cy) = centroid(layout, &c.known_base().id);
+        let Some(base) = c.base() else { continue };
+        let (cx, cy) = centroid(layout, &base.id);
         // Must actually lie in the requested direction.
         let in_dir = match dir {
             SpatialDir::Right => cx > sx,
@@ -94,7 +99,7 @@ pub(crate) const GRID_COLS: u32 = 12;
 /// keyboard sub-modes + the `:tile` Ex-commands.
 pub(crate) mod tile_ops {
     use super::GRID_COLS;
-    use crate::axiom::{Chart, ChartBase, ChartKnownExt, LayoutItem};
+    use crate::axiom::{Chart, ChartBase, LayoutItem};
 
     /// `true` if `candidate` overlaps any layout entry whose `i` is
     /// **not** `ignore_id`. Two rectangles overlap when they share at
@@ -185,7 +190,7 @@ pub(crate) mod tile_ops {
     ) -> Result<(), &'static str> {
         let cidx = charts
             .iter()
-            .position(|c| c.known_base().id == chart_id)
+            .position(|c| c.base().is_some_and(|b| b.id == chart_id))
             .ok_or("unknown chart id")?;
         charts.remove(cidx);
         layout.retain(|l| l.i != chart_id);
@@ -230,8 +235,13 @@ pub(crate) mod tile_ops {
         name: &str,
     ) -> String {
         // Generate a chart id that doesn't collide.
-        let used: std::collections::HashSet<&str> =
-            charts.iter().map(|c| c.known_base().id.as_str()).collect();
+        // `Chart::Unknown` tiles contribute no id to the reserved set;
+        // the `"cN"` namespace they live outside of can't collide with
+        // them anyway.
+        let used: std::collections::HashSet<&str> = charts
+            .iter()
+            .filter_map(|c| c.base().map(|b| b.id.as_str()))
+            .collect();
         let mut n = charts.len();
         let id = loop {
             let candidate = format!("c{n}");
@@ -268,9 +278,12 @@ pub(crate) mod tile_ops {
     ) -> Result<(), &'static str> {
         let chart = charts
             .iter_mut()
-            .find(|c| c.known_base().id == chart_id)
+            .find(|c| c.base().is_some_and(|b| b.id == chart_id))
             .ok_or("unknown chart id")?;
-        chart.known_base_mut().name = Some(title.to_string());
+        // `find` above guarantees this is `Chart::Known`; bail safely
+        // if a future refactor breaks that invariant.
+        let base = chart.base_mut().ok_or("chart has no base")?;
+        base.name = Some(title.to_string());
         Ok(())
     }
 }

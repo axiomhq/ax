@@ -76,13 +76,6 @@ impl DashboardParser {
         self.count
     }
 
-    /// Reset to a clean state. Used when the host needs to cancel
-    /// pending input (e.g. on focus change).
-    #[allow(dead_code)]
-    pub fn reset(&mut self) {
-        self.count = 0;
-    }
-
     pub fn feed(&mut self, key: KeyEvent) -> DashStep {
         use KeyCode::*;
         use KeyModifiers as M;
@@ -246,16 +239,6 @@ mod tests {
             }
             other => panic!("expected Passthrough, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn reset_clears_count() {
-        let mut p = DashboardParser::new();
-        assert_eq!(p.feed(k('5')), DashStep::Pending);
-        p.reset();
-        assert_eq!(p.count(), 0);
-        // Next verb runs with default count 1.
-        assert_eq!(p.feed(k('y')), DashStep::Emit(DashCommand::Yank { n: 1 }));
     }
 
     #[test]

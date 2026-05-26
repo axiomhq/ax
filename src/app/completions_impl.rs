@@ -118,12 +118,7 @@ impl App {
     fn compute_completion_payload(&self) -> Option<completions::CompletionPayload> {
         let query = self.query_text();
         let cursor_byte = editor_cursor_byte_offset(&self.editor);
-        completions::compute(
-            &query,
-            cursor_byte,
-            &self.params.system,
-            &self.cache.read().unwrap(),
-        )
+        completions::compute(&query, cursor_byte, &self.params.system, &self.cache.read())
     }
 
     /// When a cache-backed context has nothing to offer, transparently kick off the
@@ -134,15 +129,12 @@ impl App {
             return;
         }
         match kind {
-            completions::CompletionKind::Dataset
-                if self.cache.read().unwrap().dataset_count() == 0 =>
-            {
+            completions::CompletionKind::Dataset if self.cache.read().dataset_count() == 0 => {
                 self.status = "no datasets cached — fetching…".to_string();
                 self.fetch_datasets();
             }
             completions::CompletionKind::Metric { dataset }
-                if !dataset.is_empty()
-                    && self.cache.read().unwrap().metric_names(dataset).is_empty() =>
+                if !dataset.is_empty() && self.cache.read().metric_names(dataset).is_empty() =>
             {
                 self.status = format!("no metrics cached for `{dataset}` — fetching…");
                 self.fetch_metrics_for_current_query();

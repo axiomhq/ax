@@ -23,7 +23,7 @@ impl App {
         };
         // Snappy path: serve cache + refresh in background (Refreshed event).
         // Cold path: foreground fetch (Opened event, sets busy).
-        let cached = self.cache.read().unwrap().cached_dashboard(&uid);
+        let cached = self.cache.read().cached_dashboard(&uid);
         let event_ctor: fn(_, _) -> AppEvent = match cached {
             Some(resource) => {
                 use crate::axiom::DashboardSummaryExt;
@@ -94,7 +94,12 @@ impl App {
                     crate::dashboard::Query::Mpl(s) if !s.trim().is_empty() => s,
                     _ => return None,
                 };
-                Some((c.known_base().id.clone(), mpl))
+                // `extract_query` falls back to `Query::Empty` for
+                // `Chart::Unknown` (no `query` field surfaced), so the
+                // arm above already filters them. The `base()` here
+                // is a forward-compat belt against an SDK upgrade
+                // that ever lets Unknown carry an MPL string.
+                Some((c.base()?.id.clone(), mpl))
             })
             .collect();
         if charts.is_empty() {
@@ -107,6 +112,13 @@ impl App {
         let cache = self.cache.clone();
         let params = self.params.cli.clone();
         let (start, end) = self.active_time_range();
+        // Shared with every spawned tile task: the per-App
+        // `Semaphore` enforces the concurrency cap (see
+        // `TILE_FETCH_CONCURRENCY`). Each task acquires a permit
+        // before issuing the HTTP request and drops it on completion;
+        // the cap survives across waves of `run_tile_queries` calls
+        // so back-to-back refreshes don't double-spawn.
+        let sem = self.tile_fetch_semaphore.clone();
         for (chart_id, mpl) in charts {
             // Initial busy state — grid renderer reads this to show a “loading…” hint.
             self.tile_results.insert(
@@ -136,7 +148,15 @@ impl App {
             let start = start.clone();
             let end = end.clone();
             let epoch = self.tile_query_epoch;
+            let sem = sem.clone();
             self.runtime.spawn(async move {
+                // Acquire a permit and hold it through the HTTP call;
+                // dropping the guard at end-of-block releases it.
+                // `acquire_owned` only errors if the semaphore is
+                // closed, which we never do — fall through on error
+                // so the request still goes (better to over-spawn
+                // once than to silently lose the tile).
+                let _permit = sem.acquire_owned().await.ok();
                 let result =
                     run_query_task(&cache, &client, &dataset, &mpl, &start, &end, &params).await;
                 let _ = tx.send(AppEvent::TileQueryFinished {

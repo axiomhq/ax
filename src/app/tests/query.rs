@@ -37,15 +37,12 @@ fn datasets_event_updates_status() {
     app.busy = true;
     // Simulate the spawned task having already updated the cache.
     {
-        let mut c = app.cache.write().unwrap();
+        let mut c = app.cache.write();
         c.replace_datasets(datasets.clone());
     }
     app.handle_event(AppEvent::DatasetsFetched(Ok(datasets)));
     assert!(!app.busy);
-    assert_eq!(
-        app.cache.read().unwrap().dataset_names(),
-        vec!["k8s", "logs"]
-    );
+    assert_eq!(app.cache.read().dataset_names(), vec!["k8s", "logs"]);
     assert!(app.status.contains("2 dataset"));
 }
 #[test]
@@ -62,7 +59,7 @@ fn metrics_event_updates_status_and_cache_view() {
     );
     app.busy = true;
     {
-        let mut c = app.cache.write().unwrap();
+        let mut c = app.cache.write();
         c.replace_metrics("home", metrics.clone());
     }
     app.handle_event(AppEvent::MetricsFetched {
@@ -70,7 +67,7 @@ fn metrics_event_updates_status_and_cache_view() {
         result: Ok(metrics),
     });
     assert!(!app.busy);
-    let names = app.cache.read().unwrap().metric_names("home");
+    let names = app.cache.read().metric_names("home");
     assert_eq!(names, vec!["temp"]);
     assert!(app.status.contains("1 metric"));
 }
@@ -185,7 +182,6 @@ fn fetch_tag_values_skipped_when_already_cached() {
     let mut app = test_app();
     app.cache
         .write()
-        .unwrap()
         .replace_tag_values("home", "temp", "host", vec!["a".to_string()]);
     let before = app.status.clone();
     app.fetch_tag_values("home".to_string(), "temp".to_string(), "host".to_string());
@@ -213,7 +209,6 @@ fn fetch_tags_skipped_when_already_cached() {
     let mut app = test_app();
     app.cache
         .write()
-        .unwrap()
         .replace_tags("home", "temp", vec!["host".to_string()]);
     // The fetch attempt should short-circuit without flipping `busy` or
     // emitting any status change.
@@ -345,7 +340,8 @@ fn trace_command_in_grid_uses_focused_tile_trace_id() {
         result: Ok(multi_chart_resource()),
     });
     let chart_id = app.loaded_dashboard.as_ref().unwrap().dashboard.charts[0]
-        .known_base()
+        .base()
+        .expect("test fixture is Chart::Known")
         .id
         .clone();
     // Per-tile fetch lands with a trace id.

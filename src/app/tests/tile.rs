@@ -215,7 +215,8 @@ fn tile_title_renames_selected_tile() {
     });
     app.execute_command("tile title renamed bigly");
     let title = app.loaded_dashboard.as_ref().unwrap().dashboard.charts[0]
-        .known_base()
+        .base()
+        .expect("test fixture is Chart::Known")
         .name
         .clone();
     assert_eq!(title.as_deref(), Some("renamed bigly"));
@@ -385,7 +386,7 @@ fn yank_focused_then_paste_creates_copy_with_fresh_id() {
         .dashboard
         .charts
         .iter()
-        .map(|c| c.known_base().id.as_str())
+        .map(|c| c.base().expect("test fixture is Chart::Known").id.as_str())
         .collect();
     assert!(ids.contains(&"tl"));
     // No id collision.
@@ -469,7 +470,13 @@ fn tile_open_bang_opens_above_focused() {
     let charts = &app.loaded_dashboard.as_ref().unwrap().dashboard.charts;
     assert_eq!(charts.len(), 5);
     // Last chart should be the newly inserted one.
-    let new_id = charts.last().unwrap().known_base().id.as_str();
+    let new_id = charts
+        .last()
+        .unwrap()
+        .base()
+        .expect("test fixture is Chart::Known")
+        .id
+        .as_str();
     let li = &app.loaded_dashboard.as_ref().unwrap().dashboard.layout;
     let new_li = li.iter().find(|l| l.i == new_id).unwrap();
     // "above" bl (y=6) means y=0 (6 - 6).

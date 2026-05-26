@@ -10,7 +10,7 @@ use ratatui::{
 
 use super::pane_block;
 use crate::app::App;
-use crate::axiom::{Chart, ChartKnownExt, DashboardSummaryExt, KnownChart, LayoutItem};
+use crate::axiom::{Chart, DashboardSummaryExt, KnownChart, LayoutItem};
 use crate::viz;
 
 /// Minimum number of terminal rows per virtual grid row **for rows
@@ -283,7 +283,15 @@ pub(super) fn compute_row_heights(
 /// 2-per-row auto-stack at default 6×6 dimensions when no
 /// `LayoutItem` exists. Returns `(x, y, w, h)`.
 fn resolve_slot(layout: &[LayoutItem], chart: &Chart, idx: usize) -> (u32, u32, u32, u32) {
-    if let Some(l) = layout.iter().find(|l| l.i == chart.known_base().id) {
+    // `Chart::Unknown` has no `ChartBase.id`, so it can never match a
+    // layout entry by id — fall through to the auto-stack slot, which
+    // gives the tile a visible footprint even when the SDK doesn't
+    // model the variant. `:w` still round-trips the raw JSON; we
+    // just can't honour any custom layout linkage for it.
+    let id = chart.base().map(|b| b.id.as_str()).unwrap_or("");
+    if !id.is_empty()
+        && let Some(l) = layout.iter().find(|l| l.i == id)
+    {
         (l.x, l.y.unwrap_or(0), l.w, l.h)
     } else {
         let row = (idx / 2) as u32;
@@ -304,7 +312,6 @@ fn resolve_slot(layout: &[LayoutItem], chart: &Chart, idx: usize) -> (u32, u32, 
 ///   * the per-tile fetch is still in flight (shows "loading..."),
 ///   * the per-tile fetch errored (shows the error message).
 fn draw_grid_tile(f: &mut Frame, app: &App, chart: &Chart, area: Rect, highlighted: bool) {
-    let base = chart.known_base();
     let kind_glyph = match chart {
         Chart::Known(KnownChart::TimeSeries(_)) => "⌈⌉",
         Chart::Known(KnownChart::Heatmap(_)) => "▦",
@@ -317,10 +324,24 @@ fn draw_grid_tile(f: &mut Frame, app: &App, chart: &Chart, area: Rect, highlight
         Chart::Known(KnownChart::Note(_)) => "✎",
         Chart::Unknown(_) => "?",
     };
-    // Per-tile status pip in the title bar.
+    // `Chart::Unknown` has no `ChartBase`: synthesise a placeholder
+    // `base` view (empty id/name, no extras) so the rest of this
+    // function can render a stub tile instead of panicking. The tile
+    // is still visible in the grid (so the user knows it exists and
+    // `:w` will round-trip it), it just can't be filled with live
+    // data or correlated with `tile_results`.
+    let placeholder_extras = serde_json::Map::new();
+    let (base_id, base_name, base_extras): (&str, Option<&str>, &serde_json::Map<_, _>) =
+        match chart.base() {
+            Some(b) => (b.id.as_str(), b.name.as_deref(), &b.extras),
+            None => ("", None, &placeholder_extras),
+        };
+    // Per-tile status pip in the title bar. Unknown tiles have an
+    // empty `base_id` and so never match `tile_results`; that's the
+    // intended outcome — we never spawned a fetch for them.
     let pip = app
         .tile_results
-        .get(&base.id)
+        .get(base_id)
         .map(
             |t| match (t.busy, t.error.is_some(), !t.series.is_empty()) {
                 (true, _, _) => "· ⚫",
@@ -330,13 +351,14 @@ fn draw_grid_tile(f: &mut Frame, app: &App, chart: &Chart, area: Rect, highlight
             },
         )
         .unwrap_or("");
+    // For Unknown we fall back to the literal string "unknown" so the
+    // title bar isn't blank.
+    let type_label = chart.type_str().unwrap_or("unknown");
     let title = format!(
         " {} {} · {} {} ",
         kind_glyph,
-        chart
-            .type_str()
-            .expect("mcu expects Chart::Known; got Chart::Unknown"),
-        base.name.as_deref().unwrap_or("(unnamed)"),
+        type_label,
+        base_name.unwrap_or("(unnamed)"),
         pip,
     );
     let border_style = if highlighted {
@@ -365,14 +387,15 @@ fn draw_grid_tile(f: &mut Frame, app: &App, chart: &Chart, area: Rect, highlight
     // conventional ones and fall back to an empty body (which the
     // renderer collapses to a single divider line).
     let body = if matches!(chart, Chart::Known(KnownChart::Note(_))) {
-        let extras = &chart.known_base().extras;
+        // `Note` is a Known variant, so `base_extras` is the real map.
+        let extras = base_extras;
         let text = ["markdown", "text", "body", "content"]
             .into_iter()
             .find_map(|k| extras.get(k).and_then(|v| v.as_str()))
             .unwrap_or("")
             .to_string();
         Body::Note(text)
-    } else if let Some(t) = app.tile_results.get(&base.id) {
+    } else if let Some(t) = app.tile_results.get(base_id) {
         if let Some(err) = t.error.as_deref() {
             Body::Error(err.to_string())
         } else if !t.series.is_empty() {

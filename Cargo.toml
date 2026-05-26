@@ -25,3 +25,4 @@ miette = "7.6.0"
 time = { version = "0.3", features = ["formatting", "macros", "parsing"] }
 nucleo-matcher = "0.3"
 tempfile = "3.27"
+parking_lot = "0.12"

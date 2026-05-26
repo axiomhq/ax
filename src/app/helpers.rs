@@ -4,7 +4,8 @@
 //! plumbing helper around the async query path (`resolve_route`,
 //! `run_query_task`).
 
-use std::sync::{Arc, RwLock};
+use parking_lot::RwLock;
+use std::sync::Arc;
 
 use tui_textarea::TextArea;
 
@@ -184,7 +185,7 @@ pub(super) async fn resolve_route(
     client: &AxiomClient,
     dataset: &str,
 ) -> anyhow::Result<EdgeRoute> {
-    if let Some(r) = cache.read().unwrap().edge_route_for(dataset) {
+    if let Some(r) = cache.read().edge_route_for(dataset) {
         return Ok(r);
     }
     refresh_dataset_route(cache, client, dataset).await
@@ -205,7 +206,6 @@ pub(super) async fn refresh_dataset_route(
     cache_save_with(cache, |c| c.replace_datasets(datasets));
     cache
         .read()
-        .unwrap()
         .edge_route_for(dataset)
         .ok_or_else(|| anyhow::anyhow!("dataset `{dataset}` not found in this deployment"))
 }
@@ -252,6 +252,14 @@ pub(super) fn parse_iso_date(s: &str) -> Option<time::Date> {
     time::Date::parse(s, &ymd).ok()
 }
 
+/// Wall-clock cap on a single user-or-tile MPL query. Without this an
+/// upstream HTTP hang (proxy stall, half-open connection, edge
+/// outage — the SDK builds its own `reqwest::Client` whose timeout we
+/// don't control) would leave `App.busy = true` forever with no user
+/// cancel path. 30s matches the bare `reqwest::Client` timeout we
+/// configure for the `_v1_datasets` endpoint in `axiom.rs`.
+const QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub(super) async fn run_query_task(
     cache: &Arc<RwLock<Cache>>,
     client: &AxiomClient,
@@ -261,26 +269,35 @@ pub(super) async fn run_query_task(
     end: &str,
     params: &std::collections::BTreeMap<String, String>,
 ) -> anyhow::Result<MetricsQueryResponse> {
-    let mut route = resolve_route(cache, client, dataset).await?;
-    let mut refreshed = false;
-    loop {
-        let result = client
-            .query_mpl(
-                &route.url,
-                route.deployment.as_deref(),
-                mpl,
-                start,
-                end,
-                params,
-            )
-            .await;
-        match result {
-            Err(e) if !refreshed && is_axiom_404(&e) => {
-                refreshed = true;
-                route = refresh_dataset_route(cache, client, dataset).await?;
+    let attempt = async {
+        let mut route = resolve_route(cache, client, dataset).await?;
+        let mut refreshed = false;
+        loop {
+            let result = client
+                .query_mpl(
+                    &route.url,
+                    route.deployment.as_deref(),
+                    mpl,
+                    start,
+                    end,
+                    params,
+                )
+                .await;
+            match result {
+                Err(e) if !refreshed && is_axiom_404(&e) => {
+                    refreshed = true;
+                    route = refresh_dataset_route(cache, client, dataset).await?;
+                }
+                other => return other,
             }
-            other => return other,
         }
+    };
+    match tokio::time::timeout(QUERY_TIMEOUT, attempt).await {
+        Ok(r) => r,
+        Err(_) => Err(anyhow::anyhow!(
+            "query timed out after {}s",
+            QUERY_TIMEOUT.as_secs()
+        )),
     }
 }
 
@@ -321,7 +338,7 @@ pub(super) fn pragma_diagnostic(
 /// pattern this replaced) so it never fights the UI for the status
 /// line.
 pub(super) fn cache_save_with<F: FnOnce(&mut Cache)>(cache: &Arc<RwLock<Cache>>, f: F) {
-    let mut c = cache.write().unwrap();
+    let mut c = cache.write();
     f(&mut c);
     if let Err(e) = c.save() {
         eprintln!("mcu: cache save failed: {e}");

@@ -33,7 +33,7 @@ pub(super) fn type_text(app: &mut App, s: &str) {
 /// Seed the cache with two datasets and one metric, so context-aware
 /// completion tests have real data to draw on.
 pub(super) fn seed_cache(app: &App) {
-    let mut c = app.cache.write().unwrap();
+    let mut c = app.cache.write();
     c.replace_datasets(vec![
         DatasetSummary {
             name: "home".to_string(),

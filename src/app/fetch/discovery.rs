@@ -70,7 +70,7 @@ impl App {
     /// avoid clobbering the user's view. Skipped when the cache already has
     /// tags for this pair, or when client configuration can't be resolved.
     pub fn fetch_tags(&mut self, dataset: String, metric: String) {
-        if self.cache.read().unwrap().has_tags(&dataset, &metric) {
+        if self.cache.read().has_tags(&dataset, &metric) {
             return;
         }
         let Some((client, tx, cache)) = self.fetch_prepare(None) else {
@@ -120,12 +120,7 @@ impl App {
     /// `(dataset, metric)`. Skipped when values are already cached or when
     /// another fetch is already busy. Silent on errors — status line only.
     pub fn fetch_tag_values(&mut self, dataset: String, metric: String, tag: String) {
-        if self
-            .cache
-            .read()
-            .unwrap()
-            .has_tag_values(&dataset, &metric, &tag)
-        {
+        if self.cache.read().has_tag_values(&dataset, &metric, &tag) {
             return;
         }
         let Some((client, tx, cache)) = self.fetch_prepare(None) else {

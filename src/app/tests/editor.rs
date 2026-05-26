@@ -445,7 +445,7 @@ fn toggle_persists_to_cache_via_query_context() {
     app.on_key(key(KeyCode::Char('e')));
     app.on_key(key(KeyCode::Char(' ')));
     // Cache now has the choice keyed both ways.
-    let cache = app.cache.read().unwrap();
+    let cache = app.cache.read();
     assert_eq!(
         cache.resolve_legend_tags("h1", "home", "temp"),
         vec!["host"]

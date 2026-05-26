@@ -428,7 +428,7 @@ fn dashboard_undo_restores_after_cut() {
         .dashboard
         .charts
         .iter()
-        .map(|c| c.known_base().id.clone())
+        .map(|c| c.base().expect("test fixture is Chart::Known").id.clone())
         .collect();
     app.on_key(key(KeyCode::Char('x')));
     app.on_key(key(KeyCode::Char('u')));
@@ -439,7 +439,7 @@ fn dashboard_undo_restores_after_cut() {
         .dashboard
         .charts
         .iter()
-        .map(|c| c.known_base().id.clone())
+        .map(|c| c.base().expect("test fixture is Chart::Known").id.clone())
         .collect();
     assert_eq!(after_charts, before_charts);
 }
@@ -485,7 +485,12 @@ fn tile_mpl(app: &App, idx: usize) -> String {
         .expect("loaded dashboard")
         .dashboard
         .charts[idx];
-    let q = chart.known_base().query.as_ref().expect("chart has query");
+    let q = chart
+        .base()
+        .expect("test fixture is Chart::Known")
+        .query
+        .as_ref()
+        .expect("chart has query");
     q.get("mpl")
         .and_then(|v| v.as_str())
         .map(str::to_string)
@@ -691,7 +696,8 @@ fn dashboard_apl_tile_edits_do_not_overwrite_apl() {
         result: Ok(resource),
     });
     let original_apl = app.loaded_dashboard.as_ref().unwrap().dashboard.charts[0]
-        .known_base()
+        .base()
+        .expect("test fixture is Chart::Known")
         .query
         .as_ref()
         .unwrap()
@@ -707,7 +713,8 @@ fn dashboard_apl_tile_edits_do_not_overwrite_apl() {
     type_text(&mut app, " GARBAGE");
     app.on_key(key(KeyCode::Esc));
     let after_apl = app.loaded_dashboard.as_ref().unwrap().dashboard.charts[0]
-        .known_base()
+        .base()
+        .expect("test fixture is Chart::Known")
         .query
         .as_ref()
         .unwrap()
@@ -942,4 +949,161 @@ fn dashboard_save_after_edit_captures_edited_mpl() {
         "persisted tile MPL: {:?}",
         tile_mpl(&app2, 0)
     );
+}
+
+// ---------- Forward-compat / concurrency regression tests --------------
+
+/// Regression for the `DashboardRefreshed` clobber bug: when a
+/// background refresh lands and the user has unsaved edits, the
+/// editor body AND the optimistic-concurrency `version` must stay
+/// pinned to the user's adopted snapshot. Bumping the local version
+/// to match the server would silently defeat the next `:w`'s
+/// 412 check and overwrite the other writer's changes.
+#[test]
+fn dashboard_refresh_with_dirty_edits_keeps_version_and_body() {
+    let mut app = test_app();
+    let mut original = multi_chart_resource();
+    original.version = Some(7);
+    app.handle_event(AppEvent::DashboardOpened {
+        uid: "u".into(),
+        result: Ok(original.clone()),
+    });
+    // Dirty the dashboard: rename the focused tile, which sets
+    // `dashboard_dirty = true` and mutates `charts[0].name`.
+    app.execute_command("tile title renamed");
+    assert!(app.dashboard_dirty);
+    let dirty_names: Vec<Option<String>> = app
+        .loaded_dashboard
+        .as_ref()
+        .unwrap()
+        .dashboard
+        .charts
+        .iter()
+        .map(|c| c.base().and_then(|b| b.name.clone()))
+        .collect();
+
+    // Server-side: someone else updated the dashboard, bumping
+    // version to 9 and changing chart names. A background refresh
+    // delivers this fresh snapshot.
+    let mut fresh = multi_chart_resource();
+    fresh.version = Some(9);
+    for (i, c) in fresh.dashboard.charts.iter_mut().enumerate() {
+        if let Some(b) = c.base_mut() {
+            b.name = Some(format!("server-renamed-{i}"));
+        }
+    }
+    app.handle_event(AppEvent::DashboardRefreshed {
+        uid: "u".into(),
+        result: Ok(fresh),
+    });
+
+    let after = app.loaded_dashboard.as_ref().unwrap();
+    // Version MUST remain at the user's adopted snapshot (7), not
+    // the server's latest (9) — otherwise the next `:w` would
+    // silently clobber the server's changes.
+    assert_eq!(
+        after.version,
+        Some(7),
+        "refresh on dirty must not bump local version"
+    );
+    // Body MUST be the user's edited copy, not the server's fresh
+    // one. `axiom_rs::dashboards::Chart` doesn't implement
+    // `PartialEq`, so compare names instead — the rename is the
+    // observable edit, and the server's payload uses
+    // `"server-renamed-*"`, so any swap would be visible here.
+    let after_names: Vec<Option<String>> = after
+        .dashboard
+        .charts
+        .iter()
+        .map(|c| c.base().and_then(|b| b.name.clone()))
+        .collect();
+    assert_eq!(
+        after_names, dirty_names,
+        "refresh on dirty must not replace edited charts"
+    );
+    assert!(app.dashboard_dirty, "dirty flag must persist");
+}
+
+/// Regression for the `Chart::Unknown` panic: a future Axiom chart
+/// variant arrives as `Chart::Unknown(raw_json)`. Adopting such a
+/// dashboard, navigating onto an Unknown tile, and re-serialising
+/// must NOT panic — the raw JSON must round-trip via `serde`.
+#[test]
+fn dashboard_with_chart_unknown_survives_adopt_and_save() {
+    use crate::axiom::{Chart, ChartBase, KnownChart, LayoutItem};
+    // Build a dashboard with one Known tile and one Unknown tile.
+    let known = Chart::Known(KnownChart::TimeSeries(ChartBase {
+        id: "c-known".into(),
+        name: Some("rps".into()),
+        query: Some(serde_json::json!({ "mpl": "http_rps:rate" })),
+        extras: Default::default(),
+    }));
+    // `Chart::Unknown` is `untagged`, so any JSON shape that doesn't
+    // decode as a `KnownChart` lands here. A made-up future type
+    // (e.g. `"sankey"`) is the canonical example.
+    let unknown = Chart::Unknown(serde_json::json!({
+        "id": "c-unk",
+        "type": "sankey",
+        "name": "future-viz",
+        "weirdField": [1, 2, 3]
+    }));
+    let resource = crate::axiom::DashboardSummary {
+        uid: "u".into(),
+        id: None,
+        updated_at: None,
+        updated_by: None,
+        version: Some(1),
+        dashboard: crate::axiom::DashboardDocument {
+            name: Some("mixed".into()),
+            charts: vec![known, unknown],
+            layout: vec![
+                LayoutItem {
+                    i: "c-known".into(),
+                    x: 0,
+                    y: Some(0),
+                    w: 6,
+                    h: 6,
+                    extras: Default::default(),
+                },
+                LayoutItem {
+                    i: "c-unk".into(),
+                    x: 6,
+                    y: Some(0),
+                    w: 6,
+                    h: 6,
+                    extras: Default::default(),
+                },
+            ],
+            ..Default::default()
+        },
+    };
+
+    let mut app = test_app();
+    // Adopt: every code path that touched `.known_base()` used to
+    // panic here.
+    app.handle_event(AppEvent::DashboardOpened {
+        uid: "u".into(),
+        result: Ok(resource),
+    });
+
+    // Both tiles must be present after adoption (Unknown is NOT
+    // silently dropped — that would be data loss on the next `:w`).
+    let charts = &app.loaded_dashboard.as_ref().unwrap().dashboard.charts;
+    assert_eq!(charts.len(), 2);
+    assert!(matches!(charts[0], Chart::Known(_)));
+    assert!(matches!(charts[1], Chart::Unknown(_)));
+
+    // Focus the Unknown tile and let the renderer + helpers touch
+    // it. None of these may panic.
+    app.selected_chart_idx = 1;
+    let _ = app.active_legend_series();
+    app.execute_command("trace");
+
+    // Re-serialise: the raw JSON of the Unknown tile must survive
+    // verbatim (forward-compat round-trip is the whole point of
+    // `Chart::Unknown`).
+    let json = serde_json::to_value(&app.loaded_dashboard.as_ref().unwrap().dashboard).unwrap();
+    let unk_chart = &json["charts"][1];
+    assert_eq!(unk_chart["type"], "sankey");
+    assert_eq!(unk_chart["weirdField"], serde_json::json!([1, 2, 3]));
 }

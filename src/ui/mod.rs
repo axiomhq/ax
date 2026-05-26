@@ -25,7 +25,7 @@ use ratatui::{
 };
 
 use crate::app::App;
-use crate::axiom::ChartKnownExt;
+
 use crate::chart;
 use crate::viz;
 
@@ -209,15 +209,15 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     ) = if app.view_mode == crate::app::ViewMode::Grid
         && let Some(resource) = app.loaded_dashboard.as_ref()
         && let Some(chart) = resource.dashboard.charts.get(app.selected_chart_idx)
+        // `Chart::Unknown` has no `ChartBase` (no id, no name) so it
+        // can't drive the legend; fall through to the editor's
+        // last series in that case (handled by the `else` below).
+        && let Some(base) = chart.base()
     {
-        let label = chart
-            .known_base()
-            .name
-            .clone()
-            .unwrap_or_else(|| chart.known_base().id.clone());
+        let label = base.name.clone().unwrap_or_else(|| base.id.clone());
         let series_slice: &[crate::chart::Series] = app
             .tile_results
-            .get(&chart.known_base().id)
+            .get(&base.id)
             .map(|t| t.series.as_slice())
             .unwrap_or(&[]);
         let n = series_slice.len();

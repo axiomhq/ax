@@ -15,7 +15,7 @@ use ratatui::{
 
 use super::{centered_area, modal_frame, wrap_message};
 use crate::app::App;
-use crate::axiom::{ChartKnownExt, DashboardSummaryExt};
+use crate::axiom::DashboardSummaryExt;
 
 /// Modal overlay for `d` (delete) confirmation. Renders over the
 /// dashboard pane; `y` confirms, any other key cancels (handled in
@@ -25,11 +25,9 @@ pub(super) fn draw_confirm_delete_overlay(f: &mut Frame, app: &App, screen: Rect
         .loaded_dashboard
         .as_ref()
         .and_then(|r| r.dashboard.charts.get(app.selected_chart_idx))
-        .map(|c| {
-            c.known_base()
-                .name
-                .clone()
-                .unwrap_or_else(|| c.known_base().id.clone())
+        .map(|c| match c.base() {
+            Some(b) => b.name.clone().unwrap_or_else(|| b.id.clone()),
+            None => "(unknown chart type)".to_string(),
         })
         .unwrap_or_default();
     let lines = vec![
@@ -218,26 +216,33 @@ pub(super) fn draw_dashinfo_overlay(
         ]);
         let rows: Vec<Line<'_>> = std::iter::once(header_row)
             .chain(doc.charts.iter().map(|c| {
-                let b = c.known_base();
-                let id_short = if b.id.len() > 12 {
-                    format!("{}...", &b.id[..11])
-                } else {
-                    b.id.clone()
+                // `Chart::Unknown` has no `ChartBase`, so id/name come
+                // out as "-" and the type label falls back to the raw
+                // JSON's `type` field (or "unknown"). The tile still
+                // shows up in `:dashinfo` so the user knows it
+                // exists; we just can't decorate it like a Known one.
+                let (id_str, name_str) = match c.base() {
+                    Some(b) => {
+                        let id_short = if b.id.len() > 12 {
+                            format!("{}...", &b.id[..11])
+                        } else {
+                            b.id.clone()
+                        };
+                        (id_short, b.name.clone().unwrap_or_else(|| "-".to_string()))
+                    }
+                    None => ("-".to_string(), "-".to_string()),
                 };
+                let type_label = c.type_str().unwrap_or("unknown");
                 Line::from(vec![
                     Span::styled(
-                        format!(
-                            "{:<10}",
-                            c.type_str()
-                                .expect("mcu expects Chart::Known; got Chart::Unknown")
-                        ),
+                        format!("{:<10}", type_label),
                         Style::default().fg(Color::Yellow),
                     ),
                     Span::styled(
-                        format!("{:<14}", id_short),
+                        format!("{:<14}", id_str),
                         Style::default().fg(Color::DarkGray),
                     ),
-                    Span::raw(b.name.clone().unwrap_or_else(|| "-".to_string())),
+                    Span::raw(name_str),
                 ])
             }))
             .collect();

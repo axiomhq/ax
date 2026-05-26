@@ -11,7 +11,12 @@ impl App {
         let mpl = self
             .loaded_dashboard
             .as_ref()
-            .and_then(|r| r.dashboard.charts.iter().find(|c| c.known_base().id == id))
+            .and_then(|r| {
+                r.dashboard
+                    .charts
+                    .iter()
+                    .find(|c| c.base().is_some_and(|b| b.id == id))
+            })
             .and_then(|c| match crate::dashboard::extract_query(c) {
                 crate::dashboard::Query::Mpl(s) => Some(s),
                 _ => None,

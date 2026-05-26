@@ -21,7 +21,7 @@ fn finished_query_loads_legend_tags_from_cache() {
     let mut app = test_app();
     // Seed cache with a (dataset, metric) entry (no hash match).
     {
-        let mut c = app.cache.write().unwrap();
+        let mut c = app.cache.write();
         c.set_legend_tags(
             "hash-x",
             "home",
@@ -87,7 +87,12 @@ fn dash_new_buffer_builds_timeseries_chart_with_mpl() {
     assert_eq!(doc.charts.len(), 1);
     assert_eq!(doc.charts[0].type_str(), Some("TimeSeries"));
     // MPL survives through the opaque query JSON.
-    let q = doc.charts[0].known_base().query.as_ref().unwrap();
+    let q = doc.charts[0]
+        .base()
+        .expect("test fixture is Chart::Known")
+        .query
+        .as_ref()
+        .unwrap();
     assert_eq!(q["mpl"], "http_rps:rate");
     // Layout placed in the top-left corner spanning full width.
     assert_eq!(doc.layout[0].i, "c1");

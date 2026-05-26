@@ -1225,6 +1225,7 @@ dependencies = [
  "mpl-lang",
  "mpl-language-server",
  "nucleo-matcher",
+ "parking_lot",
  "pest",
  "ratatui",
  "reqwest 0.13.3",

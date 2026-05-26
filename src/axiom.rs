@@ -13,8 +13,9 @@
 //!
 //! Edge URL resolution and caching still live in `crate::cache`.
 
+use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
@@ -62,29 +63,15 @@ impl DashboardSummaryExt for DashboardSummary {
     }
 }
 
-/// `Chart::base()` returns `Option<&ChartBase>` because the SDK can
-/// carry forward-compat `Chart::Unknown` variants. mcu only
-/// ever round-trips charts it constructed itself via
-/// `VizKind::to_chart`, which always builds `Chart::Known`, so the
-/// invariant holds. If a future server response contains an Unknown
-/// chart, code paths that hit `known_base*` will panic with a
-/// diagnostic message rather than silently misrender.
-pub trait ChartKnownExt {
-    fn known_base(&self) -> &ChartBase;
-    fn known_base_mut(&mut self) -> &mut ChartBase;
-}
-
-impl ChartKnownExt for Chart {
-    fn known_base(&self) -> &ChartBase {
-        self.base()
-            .expect("mcu expects Chart::Known; got Chart::Unknown")
-    }
-
-    fn known_base_mut(&mut self) -> &mut ChartBase {
-        self.base_mut()
-            .expect("mcu expects Chart::Known; got Chart::Unknown")
-    }
-}
+// `Chart::base()` / `Chart::base_mut()` already return `Option<&ChartBase>`
+// because the SDK carries forward-compat `Chart::Unknown` variants holding
+// raw JSON. mcu never builds an Unknown itself (`VizKind::to_chart` only
+// produces `Chart::Known`), but a fresh server payload with a chart type
+// the SDK doesn't model yet will arrive as `Chart::Unknown`. We keep
+// those tiles in `dashboard.charts` so `:w` round-trips the raw JSON
+// instead of silently dropping them; iteration and lookup sites use
+// `.base()` / `.base_mut()` and skip Unknowns (Unknowns have no
+// `ChartBase.id` to navigate, mutate, or correlate tile results by).
 
 /// Thin wrapper around [`axiom_rs::Client`] plus a raw [`reqwest::Client`]
 /// for the one endpoint (`GET /v1/datasets`) where we need fields the SDK
@@ -156,7 +143,11 @@ impl Client {
         if key.is_empty() {
             return Ok(self.inner.clone());
         }
-        if let Some(c) = self.edge_clients.lock().unwrap().get(&key) {
+        // `parking_lot::Mutex::lock` returns a guard directly: no
+        // `Result` to unwrap, and no poisoning to cascade into the
+        // main thread if a background task ever panics while holding
+        // the lock.
+        if let Some(c) = self.edge_clients.lock().get(&key) {
             return Ok(c.clone());
         }
         let mut builder = axiom_rs::Client::builder()
@@ -170,10 +161,7 @@ impl Client {
         let client = builder
             .build()
             .with_context(|| format!("building axiom-rs client for edge {key}"))?;
-        self.edge_clients
-            .lock()
-            .unwrap()
-            .insert(key, client.clone());
+        self.edge_clients.lock().insert(key, client.clone());
         Ok(client)
     }
 

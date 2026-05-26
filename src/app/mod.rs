@@ -1,11 +1,17 @@
+use parking_lot::RwLock;
+use std::sync::Arc;
 use std::sync::mpsc;
-use std::sync::{Arc, RwLock};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tokio::runtime::Handle;
+
+/// Max concurrent per-tile MPL fetches in flight at once. A typical
+/// dashboard has ≤1 dozen tiles so this is mostly a hard cap against
+/// pathological 50+ tile dashboards bursting the Axiom edge.
+const TILE_FETCH_CONCURRENCY: usize = 8;
 use tui_textarea::{CursorMove, TextArea};
 
-use crate::axiom::{ChartKnownExt, Client as AxiomClient, DashboardSummary};
+use crate::axiom::{Client as AxiomClient, DashboardSummary};
 use crate::cache::Cache;
 use crate::chart::Series;
 use crate::command::{self, Command, InsertAt, Motion, Operator, Step, Target};
@@ -224,6 +230,11 @@ pub struct App {
     events_tx: mpsc::Sender<AppEvent>,
     events_rx: mpsc::Receiver<AppEvent>,
     client: Option<AxiomClient>,
+    /// Caps concurrent in-flight per-tile MPL fetches. `run_tile_queries`
+    /// spawns one task per MPL chart; on a large dashboard (e.g. 50
+    /// tiles) the unthrottled burst would routinely 429 the Axiom
+    /// edge. 8 keeps interactive latency low without flooding.
+    pub(super) tile_fetch_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl App {
@@ -314,6 +325,7 @@ impl App {
             last_query_context: None,
             pending_ctrl_w: false,
             last_query_id: 0,
+            tile_fetch_semaphore: Arc::new(tokio::sync::Semaphore::new(TILE_FETCH_CONCURRENCY)),
             runtime,
             events_tx,
             events_rx,
@@ -329,10 +341,12 @@ impl App {
     }
 
     fn current_chart_id(&self) -> Option<String> {
+        // `Chart::Unknown` has no `ChartBase.id`, so a focused Unknown
+        // tile has no current id; callers already handle `None`.
         self.loaded_dashboard
             .as_ref()
             .and_then(|r| r.dashboard.charts.get(self.selected_chart_idx))
-            .map(|c| c.known_base().id.clone())
+            .and_then(|c| c.base().map(|b| b.id.clone()))
     }
 
     /// Reload `legend_label_tags` from the cache for the current
@@ -359,11 +373,10 @@ impl App {
             // by `(dataset, metric)`. Empty hash misses the
             // by-hash store; `resolve_legend_tags` then falls
             // through to the per-metric one.
-            self.cache.read().unwrap().resolve_legend_tags("", &ds, &m)
+            self.cache.read().resolve_legend_tags("", &ds, &m)
         } else if let Some(ctx) = self.last_query_context.clone() {
             self.cache
                 .read()
-                .unwrap()
                 .resolve_legend_tags(&ctx.hash, &ctx.dataset, &ctx.metric)
         } else {
             Vec::new()
@@ -380,7 +393,8 @@ impl App {
         if self.view_mode == ViewMode::Grid
             && let Some(resource) = self.loaded_dashboard.as_ref()
             && let Some(chart) = resource.dashboard.charts.get(self.selected_chart_idx)
-            && let Some(tr) = self.tile_results.get(&chart.known_base().id)
+            && let Some(base) = chart.base()
+            && let Some(tr) = self.tile_results.get(&base.id)
         {
             return &tr.series;
         }
@@ -605,7 +619,7 @@ impl App {
             return;
         }
         let text = self.query_text();
-        if let Err(e) = self.cache.read().unwrap().save_query(&text) {
+        if let Err(e) = self.cache.read().save_query(&text) {
             eprintln!("mcu: query cache save failed: {e}");
         }
     }
@@ -631,7 +645,7 @@ impl App {
             let plural = if n == 1 { "param" } else { "params" };
             self.status = format!("{}; {n} CLI {plural}", self.status);
         }
-        if self.cache.read().unwrap().dataset_count() == 0 {
+        if self.cache.read().dataset_count() == 0 {
             self.fetch_datasets();
         }
         self.recompute_diagnostics();

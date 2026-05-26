@@ -7,12 +7,12 @@
 //! always captured *before* any mutation, so even partial failures
 //! can be reverted.
 
-use crate::axiom::{Chart, ChartBase, ChartKnownExt, LayoutItem};
+use crate::axiom::{Chart, ChartBase, LayoutItem};
 use crate::dashboard::VizKind;
 
+use super::App;
 use super::tile_ops_shove::{ShoveDir, ShoveOutcome, shove_insert};
 use super::types::{DashboardSnapshot, PickVizAction, TileSnapshot, TileSubMode};
-use super::{App, ViewMode};
 
 impl App {
     // ── snapshot / undo plumbing ─────────────────────────────────
@@ -119,16 +119,25 @@ impl App {
             }
         };
         self.snapshot_dashboard_for_undo();
+        // `collect_tile_snapshots` already filters out `Chart::Unknown`
+        // (no `ChartBase.id` to key on), so every snapshot here is a
+        // `Chart::Known` with a stable id. `base()` only returns `None`
+        // for `Chart::Unknown`, so `filter_map` here is a forward-compat
+        // belt: we still produce the right id set even if a future SDK
+        // upgrade lets Unknowns slip in.
         let ids: Vec<String> = snapshots
             .iter()
-            .map(|s| s.chart.known_base().id.clone())
+            .filter_map(|s| s.chart.base().map(|b| b.id.clone()))
             .collect();
         let count = snapshots.len();
         if let Some(resource) = self.loaded_dashboard.as_mut() {
+            // Keep `Chart::Unknown` tiles intact — we couldn't have
+            // identified them by id, so they were never in the cut set
+            // and shouldn't be silently removed by the retain.
             resource
                 .dashboard
                 .charts
-                .retain(|c| !ids.contains(&c.known_base().id));
+                .retain(|c| c.base().is_none_or(|b| !ids.contains(&b.id)));
             resource.dashboard.layout.retain(|l| !ids.contains(&l.i));
             let new_len = resource.dashboard.charts.len();
             if self.selected_chart_idx >= new_len {
@@ -160,27 +169,33 @@ impl App {
         // Build row-major order of (chart_idx, layout_clone). Charts
         // without a layout entry get a synthesised (0,0,6,6) so
         // yank-then-paste never silently drops them.
+        // Skip `Chart::Unknown` tiles: they have no `ChartBase.id`,
+        // so we can't correlate them to a layout entry, can't yank
+        // them into the per-tile snapshot store keyed by id, and
+        // can't paste them back with a fresh unique id. They stay
+        // on the dashboard untouched.
         let mut entries: Vec<(usize, LayoutItem)> = resource
             .dashboard
             .charts
             .iter()
             .enumerate()
-            .map(|(i, c)| {
+            .filter_map(|(i, c)| {
+                let id = &c.base()?.id;
                 let li = resource
                     .dashboard
                     .layout
                     .iter()
-                    .find(|l| l.i == c.known_base().id)
+                    .find(|l| &l.i == id)
                     .cloned()
                     .unwrap_or(LayoutItem {
-                        i: c.known_base().id.clone(),
+                        i: id.clone(),
                         x: 0,
                         y: Some(0),
                         w: 6,
                         h: 6,
                         extras: Default::default(),
                     });
-                (i, li)
+                Some((i, li))
             })
             .collect();
         entries.sort_by(|(_, a), (_, b)| {
@@ -191,7 +206,7 @@ impl App {
             .dashboard
             .charts
             .get(self.selected_chart_idx)
-            .map(|c| c.known_base().id.as_str())?;
+            .and_then(|c| c.base().map(|b| b.id.as_str()))?;
         let start = entries
             .iter()
             .position(|(_, li)| li.i == focus_id)
@@ -306,7 +321,7 @@ impl App {
                 .dashboard
                 .charts
                 .iter()
-                .position(|c| c.known_base().id == id)
+                .position(|c| c.base().is_some_and(|b| b.id == id))
         {
             self.selected_chart_idx = pos;
             // Paste focus moved to the freshly inserted tile; re-seed
@@ -402,7 +417,8 @@ impl App {
     fn focused_layout_or_default(&self) -> Option<LayoutItem> {
         let resource = self.loaded_dashboard.as_ref()?;
         let chart = resource.dashboard.charts.get(self.selected_chart_idx)?;
-        let id = chart.known_base().id.as_str();
+        // `Chart::Unknown` has no id; "similar to" can't target it.
+        let id = chart.base()?.id.as_str();
         Some(
             resource
                 .dashboard
@@ -419,19 +435,6 @@ impl App {
                     extras: Default::default(),
                 }),
         )
-    }
-
-    /// `true` when the current state permits picking a viz kind for
-    /// `o`/`O`. Convenience for `legend_label_tags` / similar.
-    #[allow(dead_code)]
-    pub(super) fn in_open_pick(&self) -> bool {
-        matches!(
-            self.tile_submode,
-            TileSubMode::PickViz {
-                action: PickVizAction::Open { .. },
-                ..
-            }
-        ) && self.view_mode == ViewMode::Grid
     }
 }
 
@@ -474,8 +477,14 @@ fn bbox_of(snapshots: &[TileSnapshot]) -> Bbox {
 
 /// Generate a `c<n>` id that doesn't collide with any existing chart.
 fn next_unique_chart_id(charts: &[Chart]) -> String {
-    let used: std::collections::HashSet<&str> =
-        charts.iter().map(|c| c.known_base().id.as_str()).collect();
+    // Existing ids reserved against the next unique-id mint. `Chart::Unknown`
+    // tiles contribute nothing (no `ChartBase.id`), which is fine: they
+    // round-trip through their raw JSON envelope and don't collide with the
+    // `"chart-N"` namespace we generate here.
+    let used: std::collections::HashSet<&str> = charts
+        .iter()
+        .filter_map(|c| c.base().map(|b| b.id.as_str()))
+        .collect();
     let mut n = charts.len();
     loop {
         let candidate = format!("c{n}");
@@ -490,5 +499,10 @@ fn next_unique_chart_id(charts: &[Chart]) -> String {
 /// an enum over per-variant `ChartBase`; there's no shared mutable
 /// accessor on the type.
 fn set_chart_id(chart: &mut Chart, id: String) {
-    chart.known_base_mut().id = id;
+    // Callers (paste path) only feed `Chart::Known` here —
+    // `collect_tile_snapshots` filters Unknowns out at yank time —
+    // but bail safely instead of panicking if that ever changes.
+    if let Some(base) = chart.base_mut() {
+        base.id = id;
+    }
 }

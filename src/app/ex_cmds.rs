@@ -316,16 +316,18 @@ impl App {
     fn cmd_trace(&mut self) {
         // Prefer the focused tile's trace when we're actually looking
         // at a panel; this is the whole point of the command.
+        // `Chart::Unknown` has no `ChartBase` (and so no id to key
+        // `tile_results` on, nor name to label), so trace-lookup on a
+        // focused Unknown tile silently falls through to the editor's
+        // last query trace below — same UX as a focused tile that
+        // hasn't returned yet.
         if self.view_mode == ViewMode::Grid
             && let Some(resource) = self.loaded_dashboard.as_ref()
             && let Some(chart) = resource.dashboard.charts.get(self.selected_chart_idx)
+            && let Some(base) = chart.base()
         {
-            let chart_id = chart.known_base().id.clone();
-            let label = chart
-                .known_base()
-                .name
-                .clone()
-                .unwrap_or_else(|| chart_id.clone());
+            let chart_id = base.id.clone();
+            let label = base.name.clone().unwrap_or_else(|| chart_id.clone());
             match self
                 .tile_results
                 .get(&chart_id)
@@ -775,7 +777,7 @@ impl App {
     fn cmd_dashboards(&mut self) {
         // Snappy path: serve the cache, then refresh in the background
         // (silent prepare, fire-and-forget). Otherwise fetch foreground.
-        let cached = self.cache.read().unwrap().cached_dashboards();
+        let cached = self.cache.read().cached_dashboards();
         let (status, event_ctor): (Option<String>, fn(_) -> AppEvent) = match &cached {
             Some(items) => {
                 let n = items.len();

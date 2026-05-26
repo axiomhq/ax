@@ -81,10 +81,20 @@ impl App {
                         self.adopt_dashboard(uid, resource);
                         self.status = format!("refreshed `{name}`");
                     } else {
-                        // Editor has unsaved work — don't clobber it.
-                        // Refresh just the resource metadata so saves
-                        // round-trip against the latest version.
-                        self.loaded_dashboard = Some(resource);
+                        // Editor has unsaved work — leave `loaded_dashboard`
+                        // (charts, layout, time window, and especially
+                        // `version`) untouched. Replacing the resource
+                        // here would lose the user's pending edits;
+                        // bumping just `version` to match the server
+                        // would silently defeat optimistic concurrency,
+                        // turning the next `:w` into a quiet clobber
+                        // of whatever the other writer changed. The
+                        // fresh server snapshot is already in the
+                        // cache for the next session; if the server
+                        // moved on, `:w` will surface a version
+                        // conflict and the user can `:w!` to
+                        // overwrite or reload to discard local edits.
+                        let _ = resource;
                         self.status = "dashboard refreshed (editor kept; reload to discard edits)"
                             .to_string();
                     }
