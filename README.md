@@ -58,7 +58,7 @@ supply values from the command line:
 mcu -p host=db-01 -p region=us-east
 ```
 
-`--help` prints the full list.
+`--help` prints the full list; `--version` prints the build version.
 
 ## Using it
 
