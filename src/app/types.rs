@@ -101,6 +101,15 @@ pub struct TileQueryResult {
     /// Server trace id from the most recent successful fetch.
     /// Surfaced by `:trace` so the user can grab it for support/debug.
     pub trace_id: Option<String>,
+    /// Monotonic instant the in-flight fetch was kicked off. `Some`
+    /// while `busy` is `true`, then consumed into [`Self::elapsed`]
+    /// when the result lands. Use `Instant` (not wall clock) so the
+    /// elapsed value can't go negative if the system clock jumps.
+    pub started_at: Option<std::time::Instant>,
+    /// Wall-clock duration of the most recent completed fetch. Cleared
+    /// while a new fetch is in flight so the tile border doesn't
+    /// display a stale time over a spinner.
+    pub elapsed: Option<std::time::Duration>,
 }
 
 /// Default time range applied to every MPL query (the `_mpl` endpoint accepts

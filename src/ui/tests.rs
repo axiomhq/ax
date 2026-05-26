@@ -1,5 +1,6 @@
 use super::grid::{
     InlineLegendPlan, MIN_GRID_ROW_HEIGHT, NOTE_ROW_HEIGHT, compute_row_heights, fit_inline_legend,
+    format_elapsed,
 };
 use super::help::{KEYS_HELP_SOURCE, render_keys_help};
 use crate::axiom::{Chart, ChartBase, KnownChart, LayoutItem};
@@ -178,4 +179,75 @@ fn render_keys_help_drops_single_hash_comments() {
         .join(" ");
     assert!(!rendered.contains("comment"));
     assert!(rendered.contains("up"));
+}
+
+// ---- format_elapsed bucket boundaries -----------------------------
+
+#[test]
+fn format_elapsed_sub_second_is_ms() {
+    use std::time::Duration;
+    assert_eq!(format_elapsed(Duration::from_millis(1)), "1ms");
+    assert_eq!(format_elapsed(Duration::from_millis(850)), "850ms");
+    assert_eq!(format_elapsed(Duration::from_millis(999)), "999ms");
+}
+
+#[test]
+fn format_elapsed_under_10s_is_one_decimal() {
+    use std::time::Duration;
+    // 1s exactly → 1.0s (boundary between ms and 1-decimal).
+    assert_eq!(format_elapsed(Duration::from_millis(1_000)), "1.0s");
+    assert_eq!(format_elapsed(Duration::from_millis(3_500)), "3.5s");
+    assert_eq!(format_elapsed(Duration::from_millis(9_949)), "9.9s");
+}
+
+#[test]
+fn format_elapsed_under_60s_is_whole_seconds() {
+    use std::time::Duration;
+    // 10s exactly → drop the decimal.
+    assert_eq!(format_elapsed(Duration::from_secs(10)), "10s");
+    assert_eq!(format_elapsed(Duration::from_secs(42)), "42s");
+    assert_eq!(format_elapsed(Duration::from_secs(59)), "59s");
+}
+
+#[test]
+fn format_elapsed_minutes_pads_seconds() {
+    use std::time::Duration;
+    // Zero-padded so columns stay aligned across tiles.
+    assert_eq!(format_elapsed(Duration::from_secs(60)), "1m00s");
+    assert_eq!(format_elapsed(Duration::from_secs(62)), "1m02s");
+    assert_eq!(format_elapsed(Duration::from_secs(3_599)), "59m59s");
+}
+
+#[test]
+fn format_elapsed_hours_pads_minutes() {
+    use std::time::Duration;
+    assert_eq!(format_elapsed(Duration::from_secs(3_600)), "1h00m");
+    assert_eq!(format_elapsed(Duration::from_secs(3_600 + 5 * 60)), "1h05m");
+}
+
+#[test]
+fn format_elapsed_width_budget_holds_for_all_buckets() {
+    use std::time::Duration;
+    // The tile border has scarce horizontal room. Keep every formatted
+    // string within 6 chars (incl. the wrapping `[]` that adds 2 more).
+    let samples = [
+        Duration::from_millis(0),
+        Duration::from_millis(1),
+        Duration::from_millis(999),
+        Duration::from_secs(1),
+        Duration::from_secs(9),
+        Duration::from_secs(10),
+        Duration::from_secs(59),
+        Duration::from_secs(60),
+        Duration::from_secs(3_599),
+        Duration::from_secs(3_600),
+        Duration::from_secs(24 * 3_600),
+    ];
+    for d in samples {
+        let s = format_elapsed(d);
+        assert!(
+            s.len() <= 6,
+            "format_elapsed({d:?}) = {s:?} exceeds 6-char budget"
+        );
+    }
 }

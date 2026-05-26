@@ -35,6 +35,9 @@ pub(crate) mod ex_cmds;
 mod fetch;
 mod file_io;
 mod helpers;
+// One UI-facing helper that benefits from being callable from the
+// status-bar renderer; the rest of `helpers` stays private to `app`.
+pub use helpers::humanize_time_range;
 mod keys;
 mod tile_layout;
 mod tile_ops_shove;

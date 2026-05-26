@@ -142,6 +142,7 @@ fn legend_details_picker_reads_focused_dashboard_tile_series() {
             series: tile_series,
             error: None,
             trace_id: None,
+            ..Default::default()
         },
     );
     assert_eq!(app.selected_chart_idx, 0); // `tl`
@@ -204,6 +205,7 @@ fn legend_e_opens_picker_for_dashboard_tile_even_when_editor_empty() {
             }],
             error: None,
             trace_id: None,
+            ..Default::default()
         },
     );
     // set_focus(Legend) refuses on empty editor series; route
@@ -242,6 +244,7 @@ fn legend_label_tags_swap_per_tile_when_switching_focus() {
             series: series_a,
             error: None,
             trace_id: None,
+            ..Default::default()
         },
     );
     app.tile_results.insert(
@@ -251,6 +254,7 @@ fn legend_label_tags_swap_per_tile_when_switching_focus() {
             series: series_b,
             error: None,
             trace_id: None,
+            ..Default::default()
         },
     );
     // Pick `host` on tile A via the picker (cursor starts at 0).

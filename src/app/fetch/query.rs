@@ -43,9 +43,15 @@ impl App {
             Err(e) => return self.set_error(format!("tile fetch: {e}")),
         };
         // Mark the tile busy in-place so the chrome flips to the spinner pip.
+        // Clear the previous run's `elapsed` so the border stops
+        // displaying a stale duration over the spinner, and stamp
+        // `started_at` so the post-result handler can compute the
+        // new elapsed.
         let entry = self.tile_results.entry(id.clone()).or_default();
         entry.busy = true;
         entry.error = None;
+        entry.elapsed = None;
+        entry.started_at = Some(std::time::Instant::now());
         let cache = self.cache.clone();
         let params = self.params.cli.clone();
         let (start, end) = self.active_time_range();

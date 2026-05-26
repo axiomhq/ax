@@ -82,6 +82,14 @@ pub(super) fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     let left = Line::from(left_spans);
 
     let mut right_parts: Vec<String> = Vec::new();
+    // Compact summary of the active query window (e.g. `3h`, `7d`,
+    // or `2026-05-01 → 2026-05-05`). Helps the user glance at the
+    // status bar and know whether they're looking at last hour or
+    // last week without parsing `now-Xh` themselves.
+    right_parts.push(format!(
+        "range: {}",
+        crate::app::humanize_time_range(&app.time.range.start, &app.time.range.end)
+    ));
     if let Some(resource) = app.loaded_dashboard.as_ref() {
         right_parts.push(format!("dash: {}", resource.uid));
     }

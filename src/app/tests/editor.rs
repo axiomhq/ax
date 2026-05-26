@@ -479,6 +479,7 @@ fn esc_from_solo_with_dashboard_returns_to_grid() {
             }],
             error: None,
             trace_id: None,
+            ..Default::default()
         },
     );
     app.zoom_selected_chart();

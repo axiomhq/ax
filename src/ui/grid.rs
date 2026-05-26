@@ -417,10 +417,30 @@ fn draw_grid_tile(f: &mut Frame, app: &App, chart: &Chart, area: Rect, highlight
         }
     };
 
-    let block = Block::default()
+    let mut block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
         .title(Span::styled(title, border_style));
+    // Bottom-right border annotation showing the most recent fetch's
+    // wall-clock duration (e.g. `[3.5s]`). The pip in the top title
+    // tells you the *state* (loading / ok / errored); this tells you
+    // *how long it took* — useful for spotting slow tiles at a glance.
+    // Hidden while the fetch is in flight so the spinner isn't paired
+    // with a stale time.
+    if let Some(t) = app.tile_results.get(base_id)
+        && !t.busy
+        && let Some(elapsed) = t.elapsed
+    {
+        let dim = Style::default().fg(Color::DarkGray);
+        block = block.title_bottom(
+            ratatui::text::Line::from(vec![
+                Span::styled("[", dim),
+                Span::styled(format_elapsed(elapsed), dim),
+                Span::styled("]", dim),
+            ])
+            .right_aligned(),
+        );
+    }
 
     match body {
         Body::Viz { series } => {
@@ -663,4 +683,41 @@ pub(super) fn fit_inline_legend(labels: &[&str], width: usize) -> InlineLegendPl
 pub(super) struct InlineLegendPlan {
     pub(super) shown: Vec<usize>,
     pub(super) ellipsis: bool,
+}
+
+/// Format a fetch duration for the tile's bottom-right border
+/// annotation. Picks units so the rendered string is always ≤5 chars:
+///
+/// - sub-second  →  `850ms`
+/// - <10s        →  `3.5s` (one decimal)
+/// - <60s        →  `12s`  (whole seconds)
+/// - <1h         →  `1m02s` (minutes + zero-padded seconds)
+/// - ≥1h         →  `1h05m` (hours + zero-padded minutes)
+///
+/// The width budget matters: the tile border is narrow and we render
+/// this on the inner edge of a `Block`, so an overflowing string
+/// would shove the right corner off-screen.
+pub(super) fn format_elapsed(d: std::time::Duration) -> String {
+    let ms = d.as_millis();
+    if ms < 1_000 {
+        return format!("{ms}ms");
+    }
+    let total_secs = d.as_secs();
+    if total_secs < 10 {
+        // One-decimal seconds. Round half-to-even via `as f64` is fine
+        // for display.
+        let s = d.as_secs_f64();
+        return format!("{s:.1}s");
+    }
+    if total_secs < 60 {
+        return format!("{total_secs}s");
+    }
+    if total_secs < 3_600 {
+        let m = total_secs / 60;
+        let s = total_secs % 60;
+        return format!("{m}m{s:02}s");
+    }
+    let h = total_secs / 3_600;
+    let m = (total_secs % 3_600) / 60;
+    format!("{h}h{m:02}m")
 }

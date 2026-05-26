@@ -28,6 +28,7 @@ fn zoom_promotes_tile_series_into_solo_view_not_sin_demo() {
             series: tile_series.clone(),
             error: None,
             trace_id: Some("abc123".into()),
+            ..Default::default()
         },
     );
     // tl is selected by default.

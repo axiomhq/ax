@@ -176,6 +176,12 @@ impl App {
                     return;
                 };
                 entry.busy = false;
+                // Consume `started_at` into `elapsed` so the grid
+                // renderer can show `[3.5s]` in the bottom border.
+                // Failed fetches still get a duration — it's useful
+                // for debugging slow errors ("timed out after 30s"
+                // looks very different from "failed in 80ms").
+                entry.elapsed = entry.started_at.take().map(|t| t.elapsed());
                 match result {
                     Ok(resp) => {
                         entry.trace_id = resp.trace_id.clone();

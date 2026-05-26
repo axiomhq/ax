@@ -238,6 +238,49 @@ pub(super) fn normalize_time_expr(s: &str) -> String {
     s.strip_prefix("qr-").unwrap_or(s).to_string()
 }
 
+/// Compact human label for the active query window, suitable for the
+/// status bar's right-hand side. The user wants to know at a glance
+/// whether they're looking at the last 3 hours or the last 7 days,
+/// without having to mentally parse `now-Xh` versus an absolute
+/// `2026-05-01T...` pair.
+///
+/// The rule set is intentionally small:
+///
+/// - `now-<dur>` → `<dur>` paired with `now` end → just `<dur>`
+///   (e.g. `now-3h` → `"3h"`, `qr-now-7d` → `"7d"`).
+/// - Both sides absolute (RFC3339 / `YYYY-MM-DD`) → `"YYYY-MM-DD → YYYY-MM-DD"`
+///   (we drop the time-of-day since the status bar is a glance, not a
+///   forensic readout; `:dashinfo` has the precise values).
+/// - Anything else (mixed absolute/relative, unusual relative forms) →
+///   fall back to `"<start> → <end>"` verbatim. Truncated by the
+///   caller if necessary.
+pub fn humanize_time_range(start: &str, end: &str) -> String {
+    let s = start.strip_prefix("qr-").unwrap_or(start).trim();
+    let e = end.strip_prefix("qr-").unwrap_or(end).trim();
+
+    // Common case: `now-<dur>` paired with `now`.
+    if e == "now"
+        && let Some(dur) = s.strip_prefix("now-")
+        && !dur.is_empty()
+    {
+        return dur.to_string();
+    }
+    // Symmetric "future" form is rare but cheap to support.
+    if s == "now"
+        && let Some(dur) = e.strip_prefix("now+")
+        && !dur.is_empty()
+    {
+        return format!("+{dur}");
+    }
+    // Both sides absolute — show dates only.
+    if let (Some(sd), Some(ed)) = (parse_iso_date(s), parse_iso_date(e)) {
+        return format!("{sd} → {ed}");
+    }
+    // Fallback: raw expressions joined by an arrow. Status renderer
+    // gets to decide if it needs to truncate further.
+    format!("{s} → {e}")
+}
+
 /// Parse a date out of the configured time-range string when it's an
 /// RFC3339 timestamp (e.g. `2024-05-01T00:00:00Z` or just `2024-05-01`).
 /// Returns `None` for relative expressions (`now-1h`, `qr-now-7d`), in
@@ -467,4 +510,53 @@ pub(super) fn demo_series() -> Vec<Series> {
             color: color_for(1),
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn humanize_time_range_relative_with_now_end() {
+        assert_eq!(humanize_time_range("now-3h", "now"), "3h");
+        assert_eq!(humanize_time_range("now-7d", "now"), "7d");
+        assert_eq!(humanize_time_range("now-30m", "now"), "30m");
+        // Quickrange prefix (dashboard schema) collapses to the same.
+        assert_eq!(humanize_time_range("qr-now-7d", "qr-now"), "7d");
+        assert_eq!(humanize_time_range("qr-now-1h", "now"), "1h");
+    }
+
+    #[test]
+    fn humanize_time_range_absolute_dates_show_yyyy_mm_dd() {
+        let label = humanize_time_range("2026-05-01T00:00:00Z", "2026-05-05T12:00:00Z");
+        // Time-of-day is intentionally dropped — `:dashinfo` has it.
+        assert_eq!(label, "2026-05-01 → 2026-05-05");
+    }
+
+    #[test]
+    fn humanize_time_range_bare_yyyy_mm_dd_dates() {
+        // `parse_iso_date` accepts the plain `YYYY-MM-DD` shorthand;
+        // make sure it surfaces the same way.
+        let label = humanize_time_range("2026-05-01", "2026-05-05");
+        assert_eq!(label, "2026-05-01 → 2026-05-05");
+    }
+
+    #[test]
+    fn humanize_time_range_falls_back_to_arrow_form() {
+        // Unusual / mixed inputs that don't match the relative-with-now
+        // or both-absolute fast paths land in the verbatim arrow form.
+        // The caller can truncate further if needed.
+        let label = humanize_time_range("2026-05-01T00:00:00Z", "now");
+        assert_eq!(label, "2026-05-01T00:00:00Z → now");
+        let label = humanize_time_range("now-3h", "now-1h");
+        assert_eq!(label, "now-3h → now-1h");
+    }
+
+    #[test]
+    fn humanize_time_range_empty_duration_is_not_relative() {
+        // `now-` with no duration suffix is malformed; fall through to
+        // the arrow form rather than rendering an empty label.
+        let label = humanize_time_range("now-", "now");
+        assert_eq!(label, "now- → now");
+    }
 }

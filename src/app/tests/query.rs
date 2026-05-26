@@ -385,3 +385,98 @@ fn trace_command_in_grid_reports_pending_when_tile_has_no_result() {
         app.status
     );
 }
+
+// ---- Per-tile elapsed-time bookkeeping --------------------------------
+
+#[test]
+fn tile_query_finished_consumes_started_at_into_elapsed() {
+    // Simulate a tile that's been kicked off (busy + started_at)
+    // and verify that delivering a `TileQueryFinished` event computes
+    // an `elapsed` duration from it. We can't assert an exact value
+    // (Instant is monotonic), but we can assert the transition
+    // happens and the duration is non-negative.
+    let mut app = test_app();
+    app.handle_event(AppEvent::DashboardOpened {
+        uid: "u".into(),
+        result: Ok(multi_chart_resource()),
+    });
+    let chart_id = app.loaded_dashboard.as_ref().unwrap().dashboard.charts[0]
+        .base()
+        .expect("test fixture is Chart::Known")
+        .id
+        .clone();
+    // Pretend the fetch was kicked off ~50ms ago.
+    let started = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_millis(50))
+        .expect("now - 50ms shouldn't overflow on any sane system");
+    app.tile_results.insert(
+        chart_id.clone(),
+        crate::app::types::TileQueryResult {
+            busy: true,
+            started_at: Some(started),
+            ..Default::default()
+        },
+    );
+    app.handle_event(AppEvent::TileQueryFinished {
+        chart_id: chart_id.clone(),
+        epoch: app.tile_query_epoch,
+        result: Ok(one_series_response("x")),
+    });
+    let tile = app
+        .tile_results
+        .get(&chart_id)
+        .expect("tile_results entry survives finish");
+    assert!(!tile.busy, "fetch is no longer in flight");
+    assert!(
+        tile.started_at.is_none(),
+        "started_at must be consumed, not left dangling"
+    );
+    let elapsed = tile.elapsed.expect("elapsed must be populated");
+    assert!(
+        elapsed >= std::time::Duration::from_millis(50),
+        "elapsed must reflect at least the simulated 50ms gap, got {elapsed:?}"
+    );
+    // Sanity upper bound: even on a slow CI box, the synchronous
+    // handle_event shouldn't add minutes to the wall clock.
+    assert!(
+        elapsed < std::time::Duration::from_secs(60),
+        "elapsed implausibly large: {elapsed:?}"
+    );
+}
+
+#[test]
+fn tile_query_finished_records_elapsed_even_on_error() {
+    // Slow errors are interesting too — "timed out after 30s" tells a
+    // different story than "failed in 80ms". Make sure the error path
+    // still populates `elapsed`.
+    let mut app = test_app();
+    app.handle_event(AppEvent::DashboardOpened {
+        uid: "u".into(),
+        result: Ok(multi_chart_resource()),
+    });
+    let chart_id = app.loaded_dashboard.as_ref().unwrap().dashboard.charts[0]
+        .base()
+        .expect("test fixture is Chart::Known")
+        .id
+        .clone();
+    app.tile_results.insert(
+        chart_id.clone(),
+        crate::app::types::TileQueryResult {
+            busy: true,
+            started_at: Some(std::time::Instant::now()),
+            ..Default::default()
+        },
+    );
+    app.handle_event(AppEvent::TileQueryFinished {
+        chart_id: chart_id.clone(),
+        epoch: app.tile_query_epoch,
+        result: Err(anyhow::anyhow!("synthetic failure")),
+    });
+    let tile = app.tile_results.get(&chart_id).unwrap();
+    assert!(!tile.busy);
+    assert!(
+        tile.elapsed.is_some(),
+        "failed fetches must still record how long they took"
+    );
+    assert!(tile.error.is_some());
+}

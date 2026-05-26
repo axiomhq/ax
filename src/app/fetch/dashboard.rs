@@ -121,10 +121,15 @@ impl App {
         let sem = self.tile_fetch_semaphore.clone();
         for (chart_id, mpl) in charts {
             // Initial busy state — grid renderer reads this to show a “loading…” hint.
+            // Stamp `started_at` here (before the spawn) so the
+            // measured elapsed includes semaphore queue wait, not
+            // just the HTTP round-trip — which is what the user
+            // actually experiences when watching a busy spinner.
             self.tile_results.insert(
                 chart_id.clone(),
                 TileQueryResult {
                     busy: true,
+                    started_at: Some(std::time::Instant::now()),
                     ..Default::default()
                 },
             );
