@@ -117,6 +117,15 @@ pub struct CliArgs {
     )]
     pub dashboard: Option<String>,
 
+    /// Use a specific `[deployments.NAME]` entry from `~/.axiom.toml`.
+    /// Overrides the `active_deployments` field for this launch only.
+    #[arg(
+        short = 'D', long = "deployment",
+        value_name = "NAME",
+        value_parser = parse_deployment_name,
+    )]
+    pub deployment: Option<String>,
+
     /// Holds the assembled `params_kv` as a `BTreeMap` for the rest of
     /// the codebase. Populated by [`CliArgs::params`].
     #[arg(skip)]
@@ -156,6 +165,17 @@ fn parse_dashboard_uid(raw: &str) -> std::result::Result<String, String> {
     Ok(trimmed)
 }
 
+/// Validate a deployment name — must be non-empty after trimming.
+/// Resolution against `~/.axiom.toml` happens later in `Config::select`,
+/// which surfaces a clear error if the name doesn't exist there.
+fn parse_deployment_name(raw: &str) -> std::result::Result<String, String> {
+    let trimmed = raw.trim().to_string();
+    if trimmed.is_empty() {
+        return Err("empty deployment name".to_string());
+    }
+    Ok(trimmed)
+}
+
 fn run(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     runtime: tokio::runtime::Handle,
@@ -163,6 +183,7 @@ fn run(
 ) -> Result<()> {
     let mut app = App::new(runtime);
     app.params.cli = cli.params;
+    app.deployment_override = cli.deployment;
     // CLI file argument takes precedence over the session cache. When the file
     // does not exist yet, we still set it as the current file so `:w` creates it.
     if let Some(path) = cli.file {
@@ -340,5 +361,36 @@ mod tests {
             err.contains("multiple times") || err.contains("more than once"),
             "got {err}"
         );
+    }
+
+    #[test]
+    fn deployment_flag_short_and_long() {
+        let cli = parse(&["-D", "prod"]).unwrap();
+        assert_eq!(cli.deployment.as_deref(), Some("prod"));
+        let cli = parse(&["--deployment=staging"]).unwrap();
+        assert_eq!(cli.deployment.as_deref(), Some("staging"));
+    }
+
+    #[test]
+    fn deployment_flag_missing_value_errors() {
+        let err = parse(&["-D"]).unwrap_err().to_lowercase();
+        assert!(
+            err.contains("requires") || err.contains("missing") || err.contains("value"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn deployment_flag_empty_value_errors() {
+        let err = parse(&["-D", "   "]).unwrap_err();
+        assert!(err.contains("empty deployment name"), "got {err}");
+    }
+
+    #[test]
+    fn deployment_flag_default_is_none() {
+        // Backwards-compatible default: no flag, no override, falls
+        // through to `active_deployments` in the config file.
+        let cli = parse(&[]).unwrap();
+        assert!(cli.deployment.is_none());
     }
 }

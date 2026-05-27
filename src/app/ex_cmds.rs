@@ -188,8 +188,9 @@ impl App {
         // Dataset is best-effort: the explorer just needs `apl` set;
         // `metricsDataset` selects the right tab.
         let dataset = mpl::extract_dataset_metric(&mpl).map(|p| p.0).ok();
+        let override_name = self.deployment_override.clone();
         let (deployment_url, org_id) = match Config::load().and_then(|cfg| {
-            cfg.active()
+            cfg.select(override_name.as_deref())
                 .map(|(_, dep)| (dep.url.clone(), dep.org_id.clone()))
         }) {
             Ok(v) => v,

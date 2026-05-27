@@ -34,7 +34,10 @@ token  = "xaat-..."
 org_id = "..."
 ```
 
-`active_deployments` is optional when you only have one entry.
+`active_deployments` is optional when you only have one entry. To pick
+a different deployment for a single launch without editing the file,
+pass `--deployment NAME` (or `-D NAME`); the flag overrides
+`active_deployments` for that session only.
 
 ## Running
 

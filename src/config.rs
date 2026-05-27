@@ -50,15 +50,27 @@ impl Config {
         Ok(cfg)
     }
 
-    /// Pick the deployment to use. Honors `active_deployments` when present.
-    /// Falls back to a single deployment, or errors when ambiguous.
-    pub fn active(&self) -> Result<(&str, &Deployment)> {
-        if let Some(name) = self.active_deployments.as_deref().filter(|s| !s.is_empty()) {
-            let dep = self
+    /// Pick the deployment to use, with an optional explicit override.
+    ///
+    /// `override_name` takes precedence over `active_deployments`. It's how
+    /// the `--deployment` CLI flag wires in: a launch-time choice beats the
+    /// persistent config field. An unknown override is a hard error so
+    /// typos surface immediately instead of silently falling back.
+    pub fn select(&self, override_name: Option<&str>) -> Result<(&str, &Deployment)> {
+        if let Some(name) = override_name.map(str::trim).filter(|s| !s.is_empty()) {
+            let (key, dep) = self
                 .deployments
-                .get(name)
+                .get_key_value(name)
+                .ok_or_else(|| anyhow!("deployment \"{name}\" not found in ~/.axiom.toml"))?;
+            return Ok((key.as_str(), dep));
+        }
+
+        if let Some(name) = self.active_deployments.as_deref().filter(|s| !s.is_empty()) {
+            let (key, dep) = self
+                .deployments
+                .get_key_value(name)
                 .ok_or_else(|| anyhow!("active_deployments=\"{name}\" not found"))?;
-            return Ok((name, dep));
+            return Ok((key.as_str(), dep));
         }
 
         if self.deployments.len() == 1 {
@@ -68,7 +80,7 @@ impl Config {
 
         bail!(
             "multiple deployments configured but no active_deployments set; \
-             pick one in ~/.axiom.toml"
+             pass --deployment NAME or set active_deployments in ~/.axiom.toml"
         )
     }
 }

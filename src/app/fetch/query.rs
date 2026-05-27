@@ -137,7 +137,7 @@ impl App {
     pub(super) fn ensure_client(&mut self) -> anyhow::Result<&AxiomClient> {
         if self.client.is_none() {
             let cfg = Config::load()?;
-            let (_name, dep) = cfg.active()?;
+            let (_name, dep) = cfg.select(self.deployment_override.as_deref())?;
             self.client = Some(AxiomClient::new(dep)?);
         }
         Ok(self.client.as_ref().unwrap())

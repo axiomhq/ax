@@ -238,6 +238,13 @@ pub struct App {
     events_tx: mpsc::Sender<AppEvent>,
     events_rx: mpsc::Receiver<AppEvent>,
     client: Option<AxiomClient>,
+    /// `~/.axiom.toml` deployment chosen via `--deployment NAME` on the
+    /// command line. Overrides the persistent `active_deployments` field
+    /// for this launch. `None` means "use the config file's default".
+    /// Consulted only when [`Self::ensure_client`] (and the share-URL
+    /// builder in `ex_cmds`) calls `Config::select`; mid-session changes
+    /// have no effect because the `AxiomClient` is cached after first use.
+    pub deployment_override: Option<String>,
     /// Caps concurrent in-flight per-tile MPL fetches. `run_tile_queries`
     /// spawns one task per MPL chart; on a large dashboard (e.g. 50
     /// tiles) the unthrottled burst would routinely 429 the Axiom
@@ -326,6 +333,7 @@ impl App {
             sig_help: None,
             cmd_parser: command::Parser::new(),
             yank: None,
+            deployment_override: None,
             last_find: None,
             last_change: None,
             visual_anchor: None,
