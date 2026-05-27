@@ -295,6 +295,54 @@ pub(super) fn parse_iso_date(s: &str) -> Option<time::Date> {
     time::Date::parse(s, &ymd).ok()
 }
 
+/// Discover the OTEL unit that applies to the current query/tile.
+///
+/// Falls through in the order the project spec mandates:
+///
+/// 1. `MetricInfo.unit` for the `(dataset, metric)` pair, looked up
+///    in the cache. This is the unit the producer declared via the
+///    metrics-info endpoint.
+/// 2. The `otel.metric.unit` tag on any of the returned series.
+///    Producers may emit unit information per-series (rare, but
+///    permitted by OTEL).
+/// 3. The `// @unit <expr>` pragma in the editor buffer / tile MPL.
+///    The user-authoring escape hatch for when neither metadata nor
+///    tag carries a unit.
+///
+/// First match wins; an unparseable value at any tier falls through
+/// to the next tier rather than failing the whole resolution.
+pub fn resolve_unit(
+    cache: &Cache,
+    dataset: &str,
+    metric: &str,
+    series: &[MetricsSeries],
+    query_text: &str,
+) -> Option<crate::unit::Unit> {
+    // Tier 1: MetricInfo.unit from the producer.
+    if let Some(info) = cache.metric_info(dataset, metric)
+        && let Some(raw) = info.unit.as_deref()
+        && let Some(u) = crate::unit::parse(raw)
+    {
+        return Some(u);
+    }
+    // Tier 2: per-series `otel.metric.unit` tag. Walk the series
+    // and use the first one that carries a string-valued tag with
+    // that key. Cross-series disagreement would be unusual; we
+    // treat the first as authoritative.
+    for s in series {
+        if let Some(v) = s.tags.get("otel.metric.unit")
+            && let Some(raw) = v.as_str()
+            && let Some(u) = crate::unit::parse(raw)
+        {
+            return Some(u);
+        }
+    }
+    // Tier 3: `// @unit` pragma in the query buffer.
+    crate::unit::pragma::parse_unit_pragma(query_text)
+        .ok()
+        .flatten()
+}
+
 /// Wall-clock cap on a single user-or-tile MPL query. Without this an
 /// upstream HTTP hang (proxy stall, half-open connection, edge
 /// outage — the SDK builds its own `reqwest::Client` whose timeout we
@@ -558,5 +606,112 @@ mod tests {
         // the arrow form rather than rendering an empty label.
         let label = humanize_time_range("now-", "now");
         assert_eq!(label, "now- → now");
+    }
+
+    // ---------- resolve_unit fall-through priority ------------------
+
+    use crate::axiom::{MetricInfo, MetricsSeries};
+    use std::collections::{BTreeMap, HashMap};
+
+    fn cache_with_metric_unit(dataset: &str, metric: &str, unit: Option<&str>) -> Cache {
+        let mut c = Cache::in_memory(String::new());
+        let mut metrics = BTreeMap::new();
+        metrics.insert(
+            metric.to_string(),
+            MetricInfo {
+                kind: None,
+                temporality: None,
+                unit: unit.map(str::to_string),
+            },
+        );
+        c.replace_metrics(dataset, metrics);
+        c
+    }
+
+    fn series_with_unit_tag(unit: Option<&str>) -> Vec<MetricsSeries> {
+        let mut tags = HashMap::new();
+        if let Some(u) = unit {
+            tags.insert(
+                "otel.metric.unit".to_string(),
+                serde_json::Value::String(u.to_string()),
+            );
+        }
+        vec![MetricsSeries {
+            metric: "m".to_string(),
+            tags,
+            start: 0,
+            resolution: 1_000,
+            data: vec![],
+        }]
+    }
+
+    #[test]
+    fn resolve_unit_tier1_metric_info_wins() {
+        // Producer-declared unit beats every later tier when present.
+        let cache = cache_with_metric_unit("home", "temp", Some("By"));
+        let series = series_with_unit_tag(Some("ms"));
+        let query = "// @unit s\nhome.temp:gauge";
+        let u = resolve_unit(&cache, "home", "temp", &series, query).unwrap();
+        assert_eq!(u.family(), crate::unit::UnitFamily::BytesBinary);
+    }
+
+    #[test]
+    fn resolve_unit_tier2_tag_used_when_metric_info_absent() {
+        let cache = cache_with_metric_unit("home", "temp", None);
+        let series = series_with_unit_tag(Some("ms"));
+        let query = "// @unit s\nhome.temp:gauge";
+        let u = resolve_unit(&cache, "home", "temp", &series, query).unwrap();
+        assert_eq!(u.family(), crate::unit::UnitFamily::Time);
+        assert_eq!(u.raw(), "ms");
+    }
+
+    #[test]
+    fn resolve_unit_tier3_pragma_used_when_metadata_and_tag_absent() {
+        let cache = cache_with_metric_unit("home", "temp", None);
+        let series = series_with_unit_tag(None);
+        let query = "// @unit MiBy\nhome.temp:gauge";
+        let u = resolve_unit(&cache, "home", "temp", &series, query).unwrap();
+        assert_eq!(u.family(), crate::unit::UnitFamily::BytesBinary);
+        assert_eq!(u.raw(), "MiBy");
+    }
+
+    #[test]
+    fn resolve_unit_returns_none_when_no_source_has_a_unit() {
+        let cache = cache_with_metric_unit("home", "temp", None);
+        let series = series_with_unit_tag(None);
+        let query = "home.temp:gauge";
+        assert!(resolve_unit(&cache, "home", "temp", &series, query).is_none());
+    }
+
+    #[test]
+    fn resolve_unit_skips_unparseable_metric_info_and_uses_tag() {
+        // Tier-1 unit is garbage (won't parse); we must NOT return
+        // garbage, we must fall through to tier 2.
+        let cache = cache_with_metric_unit("home", "temp", Some(""));
+        let series = series_with_unit_tag(Some("ms"));
+        let u = resolve_unit(&cache, "home", "temp", &series, "").unwrap();
+        assert_eq!(u.family(), crate::unit::UnitFamily::Time);
+    }
+
+    #[test]
+    fn resolve_unit_skips_non_string_tag_value() {
+        // `otel.metric.unit` tag is supposed to be a string; if a
+        // producer ships a number, we ignore it and try tier 3.
+        let mut tags = HashMap::new();
+        tags.insert(
+            "otel.metric.unit".to_string(),
+            serde_json::Value::Number(42.into()),
+        );
+        let series = vec![MetricsSeries {
+            metric: "m".to_string(),
+            tags,
+            start: 0,
+            resolution: 1_000,
+            data: vec![],
+        }];
+        let cache = cache_with_metric_unit("home", "temp", None);
+        let query = "// @unit s\n";
+        let u = resolve_unit(&cache, "home", "temp", &series, query).unwrap();
+        assert_eq!(u.family(), crate::unit::UnitFamily::Time);
     }
 }

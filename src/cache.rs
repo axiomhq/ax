@@ -235,6 +235,17 @@ impl Cache {
             );
     }
 
+    /// Cached [`MetricInfo`] for a `(dataset, metric)` pair. Used by
+    /// the unit-discovery path to recover the OTEL unit declared by
+    /// the metric's producer. `None` when the metric (or the
+    /// dataset's metric inventory) isn't cached yet.
+    pub fn metric_info(&self, dataset: &str, metric: &str) -> Option<&MetricInfo> {
+        self.data
+            .metrics_by_dataset
+            .get(dataset)
+            .and_then(|m| m.metrics.get(metric))
+    }
+
     /// Cached metric names for a dataset; feeds completions.
     pub fn metric_names(&self, dataset: &str) -> Vec<String> {
         self.data

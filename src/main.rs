@@ -16,6 +16,7 @@ mod params;
 mod share;
 mod term;
 mod ui;
+mod unit;
 mod viz;
 
 use std::collections::BTreeMap;

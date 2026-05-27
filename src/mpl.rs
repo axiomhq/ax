@@ -209,14 +209,6 @@ fn map_severity(s: EngineSeverity) -> Severity {
     }
 }
 
-/// The default system-param registry pre-converted to engine specs.
-/// Convenience entry point for callers (e.g. the dashboard query
-/// classifier) that want the same `$__interval` etc. visibility the
-/// live editor diagnostics get, without duplicating the bridge.
-pub fn engine_specs_for_defaults() -> Vec<SystemParamSpec> {
-    to_engine_specs(&crate::params::default_system_params())
-}
-
 /// Bridge our [`SystemParam`] (host shape) into the engine's
 /// [`SystemParamSpec`] wire shape. Entries whose [`ParamKind`] has no
 /// engine-side type spelling are dropped — same drop-unknown semantics the

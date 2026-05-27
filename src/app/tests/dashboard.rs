@@ -185,7 +185,52 @@ fn dashboard_open_adopts_internal_dashboard_and_seeds_mpl_buffer() {
     assert!(buf.contains("http_requests:rate"), "buffer: {buf:?}");
 }
 #[test]
-fn dashboard_open_with_apl_query_seeds_commented_banner() {
+fn dashboard_open_with_logstream_apl_seeds_commented_banner() {
+    // The APL-banner seed only fires for `LogStream` charts now
+    // that `extract_query` discriminates by chart kind rather than
+    // by parser. Pie / TimeSeries / etc. with APL text in the
+    // `apl` key dispatch as MPL and surface server errors instead
+    // of the read-only banner.
+    let mut app = test_app();
+    let resource = DashboardSummary {
+        uid: "u".into(),
+        id: None,
+        updated_at: None,
+        updated_by: None,
+        version: None,
+        dashboard: crate::axiom::DashboardDocument {
+            name: Some("d".into()),
+            charts: vec![crate::axiom::Chart::Known(
+                crate::axiom::KnownChart::LogStream(crate::axiom::ChartBase {
+                    id: "c1".into(),
+                    name: Some("recent-errors".into()),
+                    query: Some(serde_json::json!({
+                        "apl": "['logs'] | where severity == 'error'"
+                    })),
+                    extras: Default::default(),
+                }),
+            )],
+            ..Default::default()
+        },
+    };
+    app.handle_event(AppEvent::DashboardOpened {
+        uid: "u".into(),
+        result: Ok(resource),
+    });
+    let buf = app.query_text();
+    assert!(buf.contains("// @viz log_stream"));
+    assert!(buf.contains("APL query"));
+    assert!(buf.contains("['logs']"));
+}
+
+#[test]
+fn dashboard_open_with_apl_text_on_pie_seeds_as_plain_text() {
+    // A Pie chart with APL syntax in its `apl` key now seeds as
+    // plain text — the user can see and edit it directly. The
+    // fetcher will hit the metrics endpoint and surface the
+    // server's rejection (e.g. "unknown function summarize") in
+    // the tile's error slot, which is strictly more informative
+    // than the old "not yet executable" banner.
     let mut app = test_app();
     let resource = DashboardSummary {
         uid: "u".into(),
@@ -214,7 +259,8 @@ fn dashboard_open_with_apl_query_seeds_commented_banner() {
     });
     let buf = app.query_text();
     assert!(buf.contains("// @viz pie"));
-    assert!(buf.contains("APL query"));
+    // No banner — the user gets the raw query text.
+    assert!(!buf.contains("APL query"));
     assert!(buf.contains("['logs']"));
 }
 #[test]
@@ -1106,4 +1152,364 @@ fn dashboard_with_chart_unknown_survives_adopt_and_save() {
     let unk_chart = &json["charts"][1];
     assert_eq!(unk_chart["type"], "sankey");
     assert_eq!(unk_chart["weirdField"], serde_json::json!([1, 2, 3]));
+}
+
+// ---- Edit-then-save MPL roundtrip: don't dual-key the wire query ----
+
+#[test]
+fn editing_mpl_query_normalises_to_mpl_key_dropping_apl() {
+    // Regression for the "editing any chart's query produces 400 on
+    // :w" bug.
+    //
+    // Real Axiom dashboards ship MPL queries under the `apl` key
+    // (see `extract_query`'s docstring). The previous implementation
+    // of `sync_buffer_to_focused_tile` always inserted a fresh `mpl`
+    // key on save WITHOUT removing the original `apl` key, so the
+    // resulting `{ apl: stale, mpl: new }` object was rejected by
+    // the server with 400.
+    //
+    // The corrected behaviour: write the new text to the `mpl` key
+    // AND drop any sibling `apl` key. This keeps two invariants:
+    //   (a) single-key payload on PUT, no 400 from the server.
+    //   (b) `extract_query` reads `mpl` first and returns
+    //       `Query::Mpl` directly, taking the explicit-key fast
+    //       path. The chart-kind fallback (LogStream → Apl, else
+    //       → Mpl) only runs when no `mpl` key is present.
+    let mut app = test_app();
+    let resource = DashboardSummary {
+        uid: "u1".into(),
+        id: None,
+        updated_at: None,
+        updated_by: None,
+        version: Some(1),
+        dashboard: crate::axiom::DashboardDocument {
+            name: Some("d".into()),
+            charts: vec![crate::axiom::Chart::Known(
+                crate::axiom::KnownChart::TimeSeries(crate::axiom::ChartBase {
+                    id: "c1".into(),
+                    name: Some("rps".into()),
+                    // Wire shape Axiom actually uses: MPL text under
+                    // the `apl` key, mirroring real production
+                    // dashboards.
+                    query: Some(serde_json::json!({ "apl": "old_metric:rate" })),
+                    extras: Default::default(),
+                }),
+            )],
+            ..Default::default()
+        },
+    };
+    app.handle_event(AppEvent::DashboardOpened {
+        uid: "u1".into(),
+        result: Ok(resource),
+    });
+
+    // Simulate the user editing the buffer: clear it and replace
+    // the MPL with new text. The pragma line stays at the top — it
+    // gets stripped by `strip_viz_pragma` before the write-back.
+    app.editor = tui_textarea::TextArea::from(vec![
+        "// @viz line".to_string(),
+        "new_metric:rate".to_string(),
+    ]);
+
+    // Trigger the write-back path. Focus changes (e.g. `:grid` or
+    // tile navigation) and explicit `:w` both go through
+    // `sync_buffer_to_focused_tile`.
+    app.sync_buffer_to_focused_tile();
+
+    let chart = &app.loaded_dashboard.as_ref().unwrap().dashboard.charts[0];
+    let base = chart.base().expect("Chart::Known has a base");
+    let query = base.query.as_ref().expect("query was set on open");
+    let obj = query.as_object().expect("query is a JSON object");
+
+    // (1) Single-key payload: stale `apl` is gone.
+    assert!(
+        !obj.contains_key("apl"),
+        "stale `apl` key must be dropped to avoid dual-key 400: {obj:?}"
+    );
+    // (2) Edited text lives under the canonical `mpl` key, which
+    //     `extract_query` consults first — no classifier flap.
+    assert_eq!(
+        obj.get("mpl").and_then(|v| v.as_str()),
+        Some("new_metric:rate"),
+        "edited text must live under the `mpl` key: {obj:?}"
+    );
+    // (3) `extract_query` returns `Query::Mpl` via the explicit
+    //     `mpl`-key fast path — no chart-kind fallback needed.
+    match crate::dashboard::extract_query(chart) {
+        crate::dashboard::Query::Mpl(text) => assert_eq!(text, "new_metric:rate"),
+        other => panic!("expected Query::Mpl after edit, got {other:?}"),
+    }
+    // (4) Dirty bit flipped, so the next :w will actually PUT.
+    assert!(app.dashboard_dirty);
+}
+
+#[test]
+fn editing_mpl_query_under_existing_mpl_key_updates_in_place() {
+    // Symmetric case: charts that DO use the `mpl` key (legal per
+    // OpenAPI, observed in fixtures) keep using it on edit. No
+    // stray `apl` key is created.
+    let mut app = test_app();
+    let resource = DashboardSummary {
+        uid: "u1".into(),
+        id: None,
+        updated_at: None,
+        updated_by: None,
+        version: Some(1),
+        dashboard: crate::axiom::DashboardDocument {
+            name: Some("d".into()),
+            charts: vec![crate::axiom::Chart::Known(
+                crate::axiom::KnownChart::TimeSeries(crate::axiom::ChartBase {
+                    id: "c1".into(),
+                    name: Some("rps".into()),
+                    query: Some(serde_json::json!({ "mpl": "old:rate" })),
+                    extras: Default::default(),
+                }),
+            )],
+            ..Default::default()
+        },
+    };
+    app.handle_event(AppEvent::DashboardOpened {
+        uid: "u1".into(),
+        result: Ok(resource),
+    });
+    app.editor =
+        tui_textarea::TextArea::from(vec!["// @viz line".to_string(), "new:rate".to_string()]);
+    app.sync_buffer_to_focused_tile();
+
+    let chart = &app.loaded_dashboard.as_ref().unwrap().dashboard.charts[0];
+    let obj = chart
+        .base()
+        .unwrap()
+        .query
+        .as_ref()
+        .unwrap()
+        .as_object()
+        .unwrap();
+    assert!(!obj.contains_key("apl"), "no stray `apl` key: {obj:?}");
+    assert_eq!(obj.get("mpl").and_then(|v| v.as_str()), Some("new:rate"));
+}
+
+#[test]
+fn editing_mpl_query_with_dual_keys_normalises_to_mpl_only() {
+    // Defence-in-depth: if a malformed dashboard arrives with BOTH
+    // `apl` and `mpl` keys, edits collapse to the single `mpl` key
+    // so the next PUT succeeds and `extract_query` keeps returning
+    // `Query::Mpl` deterministically.
+    let mut app = test_app();
+    let resource = DashboardSummary {
+        uid: "u1".into(),
+        id: None,
+        updated_at: None,
+        updated_by: None,
+        version: Some(1),
+        dashboard: crate::axiom::DashboardDocument {
+            name: Some("d".into()),
+            charts: vec![crate::axiom::Chart::Known(
+                crate::axiom::KnownChart::TimeSeries(crate::axiom::ChartBase {
+                    id: "c1".into(),
+                    name: Some("rps".into()),
+                    query: Some(serde_json::json!({
+                        "apl": "stale:rate",
+                        "mpl": "old:rate",
+                    })),
+                    extras: Default::default(),
+                }),
+            )],
+            ..Default::default()
+        },
+    };
+    app.handle_event(AppEvent::DashboardOpened {
+        uid: "u1".into(),
+        result: Ok(resource),
+    });
+    app.editor =
+        tui_textarea::TextArea::from(vec!["// @viz line".to_string(), "new:rate".to_string()]);
+    app.sync_buffer_to_focused_tile();
+
+    let chart = &app.loaded_dashboard.as_ref().unwrap().dashboard.charts[0];
+    let obj = chart
+        .base()
+        .unwrap()
+        .query
+        .as_ref()
+        .unwrap()
+        .as_object()
+        .unwrap();
+    assert!(
+        !obj.contains_key("apl"),
+        "stale `apl` must be removed: {obj:?}"
+    );
+    assert_eq!(obj.get("mpl").and_then(|v| v.as_str()), Some("new:rate"));
+}
+
+#[test]
+fn editing_mpl_query_keeps_mid_edit_text_routed_as_mpl() {
+    // After the classifier was retired in favour of chart-kind-based
+    // discrimination, this test still earns its keep: it pins down
+    // the `mpl`-key fast path. `extract_query` checks the `mpl` key
+    // before falling back to chart-kind dispatch, so local edits
+    // (which always write to `mpl`) round-trip as `Query::Mpl`
+    // regardless of whether the text is syntactically valid — the
+    // user might be mid-typing or using server-only constructs.
+    let mut app = test_app();
+    let resource = DashboardSummary {
+        uid: "u1".into(),
+        id: None,
+        updated_at: None,
+        updated_by: None,
+        version: Some(1),
+        dashboard: crate::axiom::DashboardDocument {
+            name: Some("d".into()),
+            charts: vec![crate::axiom::Chart::Known(
+                crate::axiom::KnownChart::TimeSeries(crate::axiom::ChartBase {
+                    id: "c1".into(),
+                    name: Some("rps".into()),
+                    query: Some(serde_json::json!({ "apl": "http_requests:rate" })),
+                    extras: Default::default(),
+                }),
+            )],
+            ..Default::default()
+        },
+    };
+    app.handle_event(AppEvent::DashboardOpened {
+        uid: "u1".into(),
+        result: Ok(resource),
+    });
+    // Mid-edit: user has typed an unclosed call. Doesn't matter
+    // whether the local parser accepts it — we no longer ask.
+    let broken_mpl = "rate(http_requests";
+    app.editor =
+        tui_textarea::TextArea::from(vec!["// @viz line".to_string(), broken_mpl.to_string()]);
+    app.sync_buffer_to_focused_tile();
+
+    let chart = &app.loaded_dashboard.as_ref().unwrap().dashboard.charts[0];
+    // `extract_query` returns `Query::Mpl` because the buffer write
+    // landed under the explicit `mpl` key, which the function
+    // checks before consulting the chart kind.
+    match crate::dashboard::extract_query(chart) {
+        crate::dashboard::Query::Mpl(text) => assert_eq!(text, broken_mpl),
+        other => panic!(
+            "mid-edit MPL must stay routed as Query::Mpl, not silently \
+             flip to APL. got {other:?}"
+        ),
+    }
+}
+
+#[test]
+fn normalize_queries_to_wire_moves_mpl_to_apl() {
+    // The local model uses `mpl` keys for edited MPL queries (so
+    // `extract_query` doesn't re-classify mid-edit text). The wire
+    // form the Axiom v2 API expects has every query under `apl`,
+    // regardless of language. `normalize_queries_to_wire` bridges
+    // the two; it runs on a clone of the document just before PUT.
+    let mut doc = crate::axiom::DashboardDocument {
+        name: Some("d".into()),
+        charts: vec![
+            // Chart edited locally → has `mpl` key. Must be moved
+            // to `apl` for the wire.
+            crate::axiom::Chart::Known(crate::axiom::KnownChart::TimeSeries(
+                crate::axiom::ChartBase {
+                    id: "c-edited".into(),
+                    name: Some("edited".into()),
+                    query: Some(serde_json::json!({ "mpl": "new:rate" })),
+                    extras: Default::default(),
+                },
+            )),
+            // Chart untouched since load → already in wire form.
+            // Must stay untouched.
+            crate::axiom::Chart::Known(crate::axiom::KnownChart::TimeSeries(
+                crate::axiom::ChartBase {
+                    id: "c-stable".into(),
+                    name: Some("stable".into()),
+                    query: Some(serde_json::json!({ "apl": "old:rate" })),
+                    extras: Default::default(),
+                },
+            )),
+            // True APL chart → must NOT be turned into an `mpl` key
+            // by some symmetry mistake.
+            crate::axiom::Chart::Known(crate::axiom::KnownChart::Pie(crate::axiom::ChartBase {
+                id: "c-apl".into(),
+                name: Some("by-region".into()),
+                query: Some(serde_json::json!({
+                    "apl": "['logs'] | summarize count() by region"
+                })),
+                extras: Default::default(),
+            })),
+        ],
+        ..Default::default()
+    };
+    crate::dashboard::normalize_queries_to_wire(&mut doc);
+
+    // Chart 0: mpl → apl.
+    let obj0 = doc.charts[0]
+        .base()
+        .unwrap()
+        .query
+        .as_ref()
+        .unwrap()
+        .as_object()
+        .unwrap();
+    assert!(!obj0.contains_key("mpl"), "wire form must drop `mpl` key");
+    assert_eq!(obj0.get("apl").and_then(|v| v.as_str()), Some("new:rate"));
+
+    // Chart 1: untouched.
+    let obj1 = doc.charts[1]
+        .base()
+        .unwrap()
+        .query
+        .as_ref()
+        .unwrap()
+        .as_object()
+        .unwrap();
+    assert_eq!(obj1.get("apl").and_then(|v| v.as_str()), Some("old:rate"));
+    assert!(!obj1.contains_key("mpl"));
+
+    // Chart 2: APL stays APL.
+    let obj2 = doc.charts[2]
+        .base()
+        .unwrap()
+        .query
+        .as_ref()
+        .unwrap()
+        .as_object()
+        .unwrap();
+    assert_eq!(
+        obj2.get("apl").and_then(|v| v.as_str()),
+        Some("['logs'] | summarize count() by region")
+    );
+    assert!(!obj2.contains_key("mpl"));
+}
+
+#[test]
+fn normalize_queries_to_wire_with_dual_keys_prefers_mpl_text() {
+    // Defence-in-depth: if a dual-key state somehow leaks through
+    // to the wire-normalisation step, the `mpl` value (the local
+    // canonical edit) wins. The stale `apl` is dropped, then `mpl`
+    // is moved into the `apl` slot. End state is single-key with
+    // the user's latest text.
+    let mut doc = crate::axiom::DashboardDocument {
+        charts: vec![crate::axiom::Chart::Known(
+            crate::axiom::KnownChart::TimeSeries(crate::axiom::ChartBase {
+                id: "c".into(),
+                name: None,
+                query: Some(serde_json::json!({
+                    "apl": "stale:rate",
+                    "mpl": "new:rate",
+                })),
+                extras: Default::default(),
+            }),
+        )],
+        ..Default::default()
+    };
+    crate::dashboard::normalize_queries_to_wire(&mut doc);
+    let obj = doc.charts[0]
+        .base()
+        .unwrap()
+        .query
+        .as_ref()
+        .unwrap()
+        .as_object()
+        .unwrap();
+    assert!(!obj.contains_key("mpl"));
+    assert_eq!(obj.get("apl").and_then(|v| v.as_str()), Some("new:rate"));
 }

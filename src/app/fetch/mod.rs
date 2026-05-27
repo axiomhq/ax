@@ -170,11 +170,24 @@ impl App {
                     return;
                 }
                 // The slot may also have been removed locally (tile
-                // deleted, dashboard cleared without a re-fetch). In
-                // that case skip the update so we don't resurrect it.
-                let Some(entry) = self.tile_results.get_mut(&chart_id) else {
+                // deleted, dashboard cleared without a re-fetch).
+                // Bail before touching anything if the slot is gone.
+                if !self.tile_results.contains_key(&chart_id) {
                     return;
+                }
+                // Resolve the OTEL unit BEFORE we take the
+                // `tile_results` mutable borrow — `resolve_tile_unit`
+                // needs `&self` to read the loaded dashboard and the
+                // cache. Only call it on success; on error we keep
+                // the previous unit so the axis doesn't shuffle.
+                let resolved_unit = match &result {
+                    Ok(resp) => self.resolve_tile_unit(&chart_id, &resp.series),
+                    Err(_) => None,
                 };
+                let entry = self
+                    .tile_results
+                    .get_mut(&chart_id)
+                    .expect("presence checked above");
                 entry.busy = false;
                 // Consume `started_at` into `elapsed` so the grid
                 // renderer can show `[3.5s]` in the bottom border.
@@ -187,9 +200,14 @@ impl App {
                         entry.trace_id = resp.trace_id.clone();
                         entry.series = response_to_series(&resp);
                         entry.error = None;
+                        entry.unit = resolved_unit;
                     }
                     Err(e) => {
                         entry.error = Some(format!("{e}"));
+                        // Leave `entry.unit` as-is on error so the
+                        // last successful resolution keeps driving
+                        // the axis; clearing it would make the
+                        // chart shuffle units on a flaky tile.
                     }
                 }
 
@@ -279,6 +297,10 @@ impl App {
                 match result {
                     Ok(resp) => {
                         self.last_trace_id = resp.trace_id.clone();
+                        // Resolve the OTEL unit while we still have
+                        // the wire-form series (with typed tag
+                        // values for tier-2 lookup).
+                        self.unit = self.resolve_editor_unit(&resp.series);
                         let new_series = response_to_series(&resp);
                         let count = new_series.len();
                         if count == 0 {

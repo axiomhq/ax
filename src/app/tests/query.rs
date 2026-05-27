@@ -480,3 +480,69 @@ fn tile_query_finished_records_elapsed_even_on_error() {
     );
     assert!(tile.error.is_some());
 }
+
+// ---- OTEL unit resolution on result land ------------------------------
+
+#[test]
+fn tile_query_finished_resolves_unit_from_metric_info() {
+    // End-to-end: seed the cache with `MetricInfo.unit = Some("By")`
+    // for the tile's metric, dispatch a fake `TileQueryFinished`,
+    // and verify the per-tile unit lands. The classify path through
+    // `resolve_unit -> unit::parse` should pick `BytesBinary`.
+    let mut app = test_app();
+    // Adopt a dashboard so the fetched tile has a chart in the
+    // model with a known (dataset, metric) we can stamp the unit
+    // on. `multi_chart_resource()` uses metric `top-left:rate`
+    // (extract_dataset_metric reads "top-left" as the metric and
+    // synthesises dataset from the project default — see fixture
+    // helpers). We'll seed the cache for the dataset extracted
+    // from the first chart's MPL.
+    app.handle_event(AppEvent::DashboardOpened {
+        uid: "u".into(),
+        result: Ok(multi_chart_resource()),
+    });
+    let chart = &app.loaded_dashboard.as_ref().unwrap().dashboard.charts[0];
+    let chart_id = chart
+        .base()
+        .expect("test fixture is Chart::Known")
+        .id
+        .clone();
+    let mpl = match crate::dashboard::extract_query(chart) {
+        crate::dashboard::Query::Mpl(s) => s,
+        other => panic!("test fixture chart must have MPL, got {other:?}"),
+    };
+    let (dataset, metric) =
+        crate::mpl::extract_dataset_metric(&mpl).expect("fixture MPL parses to dataset+metric");
+
+    // Seed MetricInfo.unit on the cache for that metric.
+    {
+        let mut c = app.cache.write();
+        let mut metrics: std::collections::BTreeMap<String, crate::axiom::MetricInfo> =
+            std::collections::BTreeMap::new();
+        metrics.insert(
+            metric,
+            crate::axiom::MetricInfo {
+                kind: None,
+                temporality: None,
+                unit: Some("By".to_string()),
+            },
+        );
+        c.replace_metrics(&dataset, metrics);
+    }
+
+    // The tile_results slot exists because `run_tile_queries` ran
+    // during adoption but it's still busy (no fetch can land in
+    // unit tests). Synthesise the finished event directly.
+    app.handle_event(AppEvent::TileQueryFinished {
+        chart_id: chart_id.clone(),
+        epoch: app.tile_query_epoch,
+        result: Ok(one_series_response("bytes-in")),
+    });
+    let tile = app
+        .tile_results
+        .get(&chart_id)
+        .expect("tile_results entry after fetch land");
+    let unit = tile.unit.as_ref().expect("unit resolved from MetricInfo");
+    assert_eq!(unit.family(), crate::unit::UnitFamily::BytesBinary);
+    assert_eq!(unit.raw(), "By");
+}

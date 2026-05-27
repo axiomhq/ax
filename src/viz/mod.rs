@@ -39,6 +39,12 @@ pub use pragma::{PragmaError, VizSpec, parse_pragma, upsert_pragma};
 /// `body` is the tile's underlying text. For metrics tiles this is the
 /// MPL query (rendered indirectly through `series`); for `note` it is
 /// the markdown body. Most kinds ignore it.
+///
+/// `unit` is the resolved OTEL/UCUM unit for the series (via
+/// [`crate::app::helpers::resolve_unit`]). Time-series renderers use
+/// it to scale y-axis labels (e.g. bytes → MiB); the statistic
+/// renderer uses it to suffix its single big number. Kinds that
+/// can't sensibly carry a unit (Note, Spacer) ignore it.
 #[allow(clippy::too_many_arguments)]
 pub fn draw(
     f: &mut Frame,
@@ -48,14 +54,15 @@ pub fn draw(
     selected: Option<usize>,
     opts: &BTreeMap<String, String>,
     body: &str,
+    unit: Option<&crate::unit::Unit>,
     block: Block<'_>,
     area: Rect,
 ) {
     match kind {
         VizKind::Line | VizKind::Bar | VizKind::Area | VizKind::Scatter => {
-            chart::draw_graph(f, series, hidden, selected, kind, block, area);
+            chart::draw_graph(f, series, hidden, selected, kind, unit, block, area);
         }
-        VizKind::Statistic => statistic::draw_statistic(f, series, hidden, opts, block, area),
+        VizKind::Statistic => statistic::draw_statistic(f, series, hidden, opts, unit, block, area),
         VizKind::TopList => top_list::draw_top_list(f, series, hidden, opts, block, area),
         VizKind::Pie => pie::draw_pie(f, series, hidden, opts, block, area),
         VizKind::Heatmap => heatmap::draw_heatmap(f, series, hidden, opts, block, area),

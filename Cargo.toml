@@ -26,3 +26,9 @@ time = { version = "0.3", features = ["formatting", "macros", "parsing"] }
 nucleo-matcher = "0.3"
 tempfile = "3.27"
 parking_lot = "0.12"
+# UCUM unit parsing + canonicalisation. Used for OTEL instrument unit
+# handling (`By`, `KiBy`, `ms`, `Hz`, compound rates like `By/s`,
+# annotations like `{request}`). We only consume parse + comparability
+# + canonical-factor extraction; the wider FHIR-conversion surface is
+# untouched.
+octofhir-ucum = "0.5"

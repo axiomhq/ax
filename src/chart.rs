@@ -128,6 +128,24 @@ fn axis_labels(lo: f64, hi: f64) -> [String; 3] {
     [format_label(lo), format_label(mid), format_label(hi)]
 }
 
+/// Y-axis labels with optional OTEL/UCUM-aware scaling. When `unit`
+/// is `Some`, the value range picks a display prefix
+/// (e.g. bytes ~2.6e6 → MiB) and every tick is rendered in that
+/// prefix with the suffix appended. When `None`, falls back to the
+/// raw [`axis_labels`].
+fn axis_labels_with_unit(lo: f64, hi: f64, unit: Option<&crate::unit::Unit>) -> [String; 3] {
+    let Some(_) = unit else {
+        return axis_labels(lo, hi);
+    };
+    let scaled = crate::unit::scale_for(unit, lo, hi);
+    let mid = (lo + hi) / 2.0;
+    [
+        crate::unit::format_value(lo, &scaled, 2),
+        crate::unit::format_value(mid, &scaled, 2),
+        crate::unit::format_value(hi, &scaled, 2),
+    ]
+}
+
 /// X-axis label formatter that detects unix timestamps and renders
 /// `HH:MM` for short windows or `MM-DD HH:MM` for longer ones. Falls
 /// back to numeric `axis_labels` for non-time data (synthetic demo,
@@ -230,6 +248,7 @@ pub fn draw_graph(
     hidden: &[bool],
     selected: Option<usize>,
     kind: VizKind,
+    unit: Option<&crate::unit::Unit>,
     block: Block<'_>,
     area: Rect,
 ) {
@@ -279,7 +298,7 @@ pub fn draw_graph(
         .collect();
 
     let x_labels = x_axis_labels(bounds.x[0], bounds.x[1]);
-    let y_labels = axis_labels(bounds.y[0], bounds.y[1]);
+    let y_labels = axis_labels_with_unit(bounds.y[0], bounds.y[1], unit);
 
     let chart = Chart::new(datasets)
         .block(block)

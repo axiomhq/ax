@@ -20,7 +20,11 @@ use crate::chart::Series;
 ///
 /// Options:
 ///   * `agg`      — `last` (default) / `first` / `avg` / `sum` / `min` / `max` / `count`
-///   * `unit`     — free-form suffix appended to the value (`ms`, `req/s`, …)
+///   * `unit`     — free-form suffix appended to the value (`ms`, `req/s`, …).
+///     Legacy escape hatch: when no OTEL/UCUM unit is resolved for
+///     the tile, the pragma option is rendered verbatim with no
+///     scaling. A resolved OTEL unit (`unit_resolved`) takes
+///     precedence and brings UCUM-aware scaling along with it.
 ///   * `decimals` — digits after the decimal point (default 2)
 ///
 /// `compare=` is reserved for a later step (it needs a second query
@@ -31,6 +35,7 @@ pub(super) fn draw_statistic(
     series: &[Series],
     hidden: &[bool],
     opts: &BTreeMap<String, String>,
+    unit_resolved: Option<&crate::unit::Unit>,
     block: Block<'_>,
     area: Rect,
 ) {
@@ -38,7 +43,7 @@ pub(super) fn draw_statistic(
         .get("agg")
         .and_then(|s| Agg::parse(s))
         .unwrap_or(Agg::Last);
-    let unit = opts.get("unit").cloned();
+    let unit_opt = opts.get("unit").cloned();
     let decimals: usize = opts
         .get("decimals")
         .and_then(|s| s.parse().ok())
@@ -65,7 +70,19 @@ pub(super) fn draw_statistic(
     };
 
     let value_text = match agg.apply(&s.points) {
-        Some(v) => format_value(v, decimals, unit.as_deref()),
+        Some(v) => {
+            // Resolved OTEL unit beats the legacy pragma option:
+            // when both are present, the metric's declared unit is
+            // authoritative and gets the UCUM scaling. The pragma
+            // option survives as a verbatim suffix only when no
+            // OTEL unit is resolved.
+            if let Some(u) = unit_resolved {
+                let scaled = crate::unit::scale_for(Some(u), v, v);
+                crate::unit::format_value(v, &scaled, decimals)
+            } else {
+                format_value(v, decimals, unit_opt.as_deref())
+            }
+        }
         None => "—".to_string(),
     };
 

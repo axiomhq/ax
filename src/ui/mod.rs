@@ -191,6 +191,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             selected_for_graph,
             &viz_opts,
             &viz_body,
+            app.unit.as_ref(),
             pane_block(&format!("graph · {}", viz_kind.as_str()), false),
             top[0],
         );

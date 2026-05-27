@@ -362,6 +362,50 @@ impl App {
     ///
     /// Only MPL tiles get live diagnostics. APL banners and Empty seeds
     /// are comment-only buffers that the MPL parser would reject —
+    /// Resolve the OTEL unit for the tile identified by `chart_id`,
+    /// given the just-arrived wire-form `series`. Looks up
+    /// (dataset, metric) from the tile's MPL query, then runs the
+    /// shared three-tier discovery. `None` when no source carries a
+    /// recognised unit, or when the tile has no MPL (APL/unknown).
+    pub(super) fn resolve_tile_unit(
+        &self,
+        chart_id: &str,
+        series: &[crate::axiom::MetricsSeries],
+    ) -> Option<crate::unit::Unit> {
+        let resource = self.loaded_dashboard.as_ref()?;
+        let chart = resource
+            .dashboard
+            .charts
+            .iter()
+            .find(|c| c.base().is_some_and(|b| b.id == chart_id))?;
+        let crate::dashboard::Query::Mpl(mpl) = crate::dashboard::extract_query(chart) else {
+            return None;
+        };
+        let (dataset, metric) = crate::mpl::extract_dataset_metric(&mpl).ok()?;
+        let cache = self.cache.read();
+        crate::app::helpers::resolve_unit(&cache, &dataset, &metric, series, &mpl)
+    }
+
+    /// Resolve the OTEL unit for the editor's last query. Used by the
+    /// solo-view `QueryFinished` handler. Pulls (dataset, metric)
+    /// from `last_query_context` (set when the query was kicked off,
+    /// so it survives buffer edits between dispatch and response)
+    /// and the editor's current text for the tier-3 pragma.
+    pub(super) fn resolve_editor_unit(
+        &self,
+        series: &[crate::axiom::MetricsSeries],
+    ) -> Option<crate::unit::Unit> {
+        let ctx = self.last_query_context.as_ref()?;
+        let cache = self.cache.read();
+        crate::app::helpers::resolve_unit(
+            &cache,
+            &ctx.dataset,
+            &ctx.metric,
+            series,
+            &self.query_text(),
+        )
+    }
+
     /// surfacing that as a status-bar error is noise, so we suppress it.
     /// Returns the extracted [`Query`] so callers (zoom) can use it for
     /// follow-up state updates without re-extracting.
@@ -438,11 +482,28 @@ impl App {
         let Some(base) = chart.base_mut() else {
             return;
         };
-        // Preserve any sibling keys (e.g. extras) on the existing
-        // query object; only the `mpl` key is rewritten.
+        // Write the edited text into the `mpl` key, and drop any
+        // sibling `apl` key. Two independent constraints both point
+        // to this shape:
+        //
+        //  1. Server side: dual-keyed `{ apl, mpl }` PUTs are
+        //     rejected with 400 — the root cause of the "editing a
+        //     chart's query breaks :w" bug. A single-key object
+        //     (either key alone) is accepted per the v2 OpenAPI.
+        //
+        //  2. Local side: `extract_query` checks `mpl` first and
+        //     returns `Query::Mpl` without consulting the chart
+        //     kind. The kind-based dispatch is a fallback for
+        //     server-loaded charts that never went through the
+        //     editor; for edited tiles we encode the user's MPL
+        //     intent explicitly so subsequent renders take the
+        //     direct path.
+        //
+        // Sibling extras on the query object are preserved.
         let new_query = match base.query.take() {
             Some(mut v) if v.is_object() => {
                 if let Some(obj) = v.as_object_mut() {
+                    obj.remove("apl");
                     obj.insert(
                         "mpl".to_string(),
                         serde_json::Value::String(new_mpl.to_string()),

@@ -719,7 +719,7 @@ impl App {
     /// client) means no `DashboardSaved` event will ever arrive, and
     /// arming the flag would hang the app waiting for it.
     pub(super) fn put_loaded_dashboard(&mut self, overwrite: bool) -> bool {
-        let Some((uid, doc, version)) = self
+        let Some((uid, mut doc, version)) = self
             .loaded_dashboard
             .as_ref()
             .map(|r| (r.uid.clone(), r.dashboard.clone(), r.version))
@@ -727,6 +727,16 @@ impl App {
             self.set_error(":w: no dashboard loaded".to_string());
             return false;
         };
+        // Wire-shape normalisation: the v2 dashboards API expects
+        // every chart's query to live under the `apl` key, even
+        // when the text is MPL (matches what the server returns on
+        // GET, see `extract_query`'s docstring). Locally we keep
+        // edited MPL under the explicit `mpl` key so
+        // `extract_query` takes the direct path instead of falling
+        // back to chart-kind dispatch. Bridge the two forms by
+        // moving any `mpl` key over to `apl` on the cloned
+        // document just before it crosses the wire.
+        crate::dashboard::normalize_queries_to_wire(&mut doc);
         let verb = if overwrite { ":w!" } else { ":w" };
         let Some((client, tx, _)) =
             self.fetch_prepare(Some(format!("{verb}: saving dashboard {uid}…")))

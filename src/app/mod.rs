@@ -56,6 +56,11 @@ pub struct App {
     pub mode: Mode,
     pub editor: TextArea<'static>,
     pub series: Vec<Series>,
+    /// OTEL/UCUM unit resolved for the editor's current query, set
+    /// when `QueryFinished` lands. Drives axis scaling in the solo
+    /// chart pane the same way `TileQueryResult.unit` drives grid
+    /// tiles. `None` when the discovery fall-through finds no unit.
+    pub unit: Option<crate::unit::Unit>,
     pub status: String,
     /// Most recent error in full. Surfaced as a centred overlay over the chart
     /// pane when present; dismissed with `Esc` in Normal mode.
@@ -307,6 +312,7 @@ impl App {
             last_adopted_seed: None,
             last_error: None,
             series: demo_series(),
+            unit: None,
             status,
             should_quit: false,
             busy: false,

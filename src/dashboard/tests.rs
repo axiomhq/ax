@@ -119,40 +119,63 @@ fn real_home_overview_mpl_timeseries_classifies_as_mpl() {
 }
 
 #[test]
-fn real_probe_apl_with_bracketed_dataset_classifies_as_apl() {
-    // `["axiom-audit-logs"] | summarize n=count() by …` — stored
-    // under `apl` on a TimeSeries chart. Pipes don't make this
-    // MPL; the leading `[` does make it APL.
+fn apl_text_on_timeseries_chart_dispatches_as_mpl() {
+    // Discrimination is by chart kind, not by parsing. A
+    // TimeSeries chart with APL syntax in its `apl` key still
+    // routes as `Query::Mpl` and will surface the server's
+    // error in the tile when the metrics endpoint rejects it.
+    // That's a deliberate trade-off: the previous classifier-based
+    // path silently flipped real MPL to `Query::Apl` whenever the
+    // local `mpl_lang` grammar diverged from the Axiom server's,
+    // showing the "not yet executable" banner with no hint of
+    // what went wrong.
     let chart = Chart::Known(KnownChart::TimeSeries(crate::axiom::ChartBase {
         id: "c1".into(),
         name: None,
         query: Some(json!({ "apl": REAL_APL_BRACKET })),
         extras: Default::default(),
     }));
-    assert!(matches!(extract_query(&chart), Query::Apl(_)));
+    assert!(matches!(extract_query(&chart), Query::Mpl(_)));
 }
 
 #[test]
-fn bare_metric_classifies_as_mpl() {
-    // Bare `metric:agg` shape — valid MPL the engine accepts.
+fn bare_metric_on_statistic_chart_classifies_as_mpl() {
+    // Standard `metric:agg` MPL shape on a Statistic chart.
     let chart = statistic_with_apl("cpu:rate");
     assert!(matches!(extract_query(&chart), Query::Mpl(_)));
 }
 
 #[test]
-fn invalid_mpl_syntax_classifies_as_apl() {
-    // Anything the engine rejects — even if it textually looks
-    // metric-shaped — falls through to APL so the metrics endpoint
-    // doesn't get pinged with garbage.
+fn arbitrary_text_on_statistic_chart_dispatches_as_mpl() {
+    // Even unparseable text on a metrics chart kind dispatches as
+    // MPL. The fetcher's call to the metrics endpoint will fail
+    // with a server error message landed in `tile_results.error`,
+    // which surfaces in the tile. Strictly better than the prior
+    // "APL (not yet executable)" banner that hid the cause.
     let chart = statistic_with_apl("this is definitely not a valid query");
-    assert!(matches!(extract_query(&chart), Query::Apl(_)));
+    assert!(matches!(extract_query(&chart), Query::Mpl(_)));
 }
 
 #[test]
-fn bare_identifier_dataset_with_pipes_classifies_as_apl() {
-    // `axiom-history | count` is valid APL (dataset name without
-    // brackets). No colon before the pipe → not MPL.
+fn bare_identifier_with_pipes_on_statistic_chart_dispatches_as_mpl() {
+    // No way to tell from the text whether this is genuinely APL
+    // a user pasted in, or MPL the local crate doesn't accept yet.
+    // The chart kind says metrics, so we trust it.
     let chart = statistic_with_apl("axiom-history | count");
+    assert!(matches!(extract_query(&chart), Query::Mpl(_)));
+}
+
+#[test]
+fn logstream_chart_with_apl_text_classifies_as_apl() {
+    // The one place `Query::Apl` actually fires: `LogStream` is
+    // genuinely APL on the Axiom side. Pins down the only path
+    // that still hits the "not yet executable" banner.
+    let chart = Chart::Known(KnownChart::LogStream(crate::axiom::ChartBase {
+        id: "c1".into(),
+        name: None,
+        query: Some(json!({ "apl": REAL_APL_BRACKET })),
+        extras: Default::default(),
+    }));
     assert!(matches!(extract_query(&chart), Query::Apl(_)));
 }
 

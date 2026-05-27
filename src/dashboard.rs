@@ -184,20 +184,37 @@ pub enum Query {
 
 /// Extract the executable query string from an Axiom `Chart`.
 ///
-/// **Reality check (verified against the real v2 API)**: the public
-/// OpenAPI documents `{ "mpl": "…" }` and `{ "apl": "…" }` as
-/// alternative shapes, but every chart in practice ships its query
-/// under the `apl` key regardless of language. We can't trust the
-/// key name to discriminate, so we feed the text to `mpl_lang::compile`
-/// and let the real parser decide: if it parses as MPL, it's MPL;
-/// otherwise it's APL.
+/// Discrimination strategy: **chart kind, not parser**. Earlier
+/// revisions ran `mpl_lang::compile` on the text and inferred the
+/// language from the parser's verdict. That doesn't work in
+/// practice — the local `mpl_lang` crate's grammar and stdlib are
+/// subsets of what the Axiom server accepts, so valid real-world
+/// MPL (queries that work fine on the server) routinely failed the
+/// local check, flipped to `Query::Apl`, and rendered as the
+/// "not yet executable" banner with no data. Picking by chart kind
+/// dodges that drift entirely.
 ///
-/// Why parse-then-classify instead of pattern-match: APL and MPL both
-/// use pipes, both can lead with a bare identifier, and the only
-/// truly reliable answer comes from running the actual grammar.
+/// Rules:
+///   1. Explicit `mpl` key wins (set by local edits in
+///      [`crate::app::App::sync_buffer_to_focused_tile`] to keep
+///      the local model classifier-free).
+///   2. `apl` key on a `LogStream` chart → `Query::Apl`. LogStream
+///      is genuinely APL on the Axiom side.
+///   3. `apl` key on any other chart kind (or `Chart::Unknown`)
+///      → `Query::Mpl`. Metrics chart kinds (TimeSeries,
+///      Statistic, TopK, Heatmap, Pie, Scatter, Table, Note) ship
+///      with MPL queries.
+///   4. No query → `Query::Empty`.
 ///
-/// Charts with no `query` fall back to `Query::Empty`.
+/// Trade-off: a `TimeSeries` chart whose user genuinely wrote APL
+/// will now be dispatched to the MPL endpoint and fail with a
+/// server-side error in `tile_results.error`. That's strictly
+/// better than the previous behaviour, where the local classifier
+/// also returned APL but the fetcher then refused to dispatch the
+/// query at all — the user saw "APL (not yet executable)" with no
+/// hint of what was actually wrong.
 pub fn extract_query(chart: &Chart) -> Query {
+    use crate::axiom::KnownChart;
     let Some(base) = chart.base() else {
         return Query::Empty;
     };
@@ -205,38 +222,51 @@ pub fn extract_query(chart: &Chart) -> Query {
         Some(v) => v,
         None => return Query::Empty,
     };
-    // Explicit `mpl` key always wins (defensive: spec allows it).
+    // Explicit `mpl` key wins. Used by local edits so
+    // `sync_buffer_to_focused_tile` round-trips don't depend on any
+    // classifier behaviour.
     if let Some(mpl) = q.get("mpl").and_then(|v| v.as_str()) {
         return Query::Mpl(mpl.to_string());
     }
-    // The `apl` key holds either language in practice. Try the MPL
-    // parser; success means it's MPL, failure means APL.
     if let Some(text) = q.get("apl").and_then(|v| v.as_str()) {
-        if is_valid_mpl(text) {
-            return Query::Mpl(text.to_string());
-        }
-        return Query::Apl(text.to_string());
+        return match chart {
+            Chart::Known(KnownChart::LogStream(_)) => Query::Apl(text.to_string()),
+            _ => Query::Mpl(text.to_string()),
+        };
     }
     Query::Empty
 }
 
-/// Run the query through `mpl_lang::compile` with the host's
-/// default system-param registry (notably `$__interval`, which the
-/// Axiom server substitutes at runtime on every dashboard tile).
-/// Returns `true` when the engine accepts it as MPL.
+/// Convert the local-canonical query form into the wire form the v2
+/// dashboards API expects. Locally, queries the editor mutated live
+/// under the `mpl` key (so [`extract_query`] takes the explicit-key
+/// shortcut and never has to ask the chart kind). On the wire,
+/// every chart's query MUST live under the `apl` key regardless of
+/// language — matching what the server returns on GET. Mutates the
+/// passed document in place; intended to be called on a clone right
+/// before PUT.
 ///
-/// Without the registry, real-world MPL dashboards (e.g. the Home
-/// Assistant one with 19 charts) all fail to compile with
-/// `UndefinedParam { param: "__interval" }` even though their syntax
-/// is perfectly valid MPL. Using the same registry the live editor
-/// uses keeps classification consistent with what users see in solo
-/// mode.
-fn is_valid_mpl(text: &str) -> bool {
-    use mpl_language_server::to_compile_params;
-    use std::collections::HashMap;
-    let specs = crate::mpl::engine_specs_for_defaults();
-    let params: HashMap<_, _> = to_compile_params(&specs);
-    mpl_lang::compile(text, params).is_ok()
+/// Any sibling extras on the query object are preserved. A chart
+/// with no `mpl` key (e.g. a true APL banner, or already in wire
+/// form) is left untouched.
+pub fn normalize_queries_to_wire(doc: &mut crate::axiom::DashboardDocument) {
+    for chart in &mut doc.charts {
+        let Some(base) = chart.base_mut() else {
+            continue;
+        };
+        let Some(query) = base.query.as_mut() else {
+            continue;
+        };
+        let Some(obj) = query.as_object_mut() else {
+            continue;
+        };
+        if let Some(mpl_val) = obj.remove("mpl") {
+            // If both keys somehow co-existed at this point, the
+            // `mpl` value is authoritative — it carries the user's
+            // most recent edit. The pre-existing `apl` is dropped.
+            obj.insert("apl".to_string(), mpl_val);
+        }
+    }
 }
 
 /// A time-range expression. Strings are stored verbatim so they

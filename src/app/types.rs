@@ -110,6 +110,13 @@ pub struct TileQueryResult {
     /// while a new fetch is in flight so the tile border doesn't
     /// display a stale time over a spinner.
     pub elapsed: Option<std::time::Duration>,
+    /// OTEL/UCUM unit resolved for this tile's series. Set when the
+    /// fetch lands, via the three-tier discovery in
+    /// [`crate::app::helpers::resolve_unit`]: metric metadata, then
+    /// `otel.metric.unit` series tag, then `// @unit` pragma. `None`
+    /// when no source carried a recognised unit; the renderer
+    /// formats axis ticks with no suffix and no scaling.
+    pub unit: Option<crate::unit::Unit>,
 }
 
 /// Default time range applied to every MPL query (the `_mpl` endpoint accepts

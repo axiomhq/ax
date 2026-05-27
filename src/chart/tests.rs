@@ -187,3 +187,44 @@ fn summarize_no_shared_tags_keeps_full_per_row() {
     assert_eq!(got.header, "cpu");
     assert_eq!(got.rows, vec!["host=h1".to_string(), "host=h2".to_string()]);
 }
+
+// ---- OTEL-unit-aware Y-axis labelling ---------------------------------
+
+#[test]
+fn axis_labels_with_unit_scales_bytes_to_mib() {
+    // y-range 0..2.6e6 raw bytes should produce axis tick labels in
+    // MiB (2^20 ≈ 1.05e6, so 2.6e6 is between MiB and 4 MiB).
+    let u = crate::unit::parse("By").unwrap();
+    let labels = super::axis_labels_with_unit(0.0, 2_621_440.0, Some(&u));
+    for label in &labels {
+        assert!(
+            label.ends_with("MiB"),
+            "expected MiB-suffixed label, got {label:?}"
+        );
+    }
+    // Top label is 2.50 MiB; bottom is 0.00 MiB; mid is 1.25 MiB.
+    assert_eq!(labels[0], "0.00 MiB");
+    assert_eq!(labels[1], "1.25 MiB");
+    assert_eq!(labels[2], "2.50 MiB");
+}
+
+#[test]
+fn axis_labels_with_unit_promotes_seconds_to_minutes() {
+    // y-range 0..180 raw seconds → minute labels (180 s = 3 min,
+    // above the 120 s = 2 × 60 s threshold).
+    let u = crate::unit::parse("s").unwrap();
+    let labels = super::axis_labels_with_unit(0.0, 180.0, Some(&u));
+    for label in &labels {
+        assert!(label.ends_with("min"), "expected min label, got {label:?}");
+    }
+    assert_eq!(labels[0], "0.00 min");
+    assert_eq!(labels[2], "3.00 min");
+}
+
+#[test]
+fn axis_labels_with_unit_none_falls_back_to_raw_format() {
+    // No unit → same labels as the legacy axis_labels.
+    let labels = super::axis_labels_with_unit(0.0, 100.0, None);
+    let raw = super::axis_labels(0.0, 100.0);
+    assert_eq!(labels, raw);
+}

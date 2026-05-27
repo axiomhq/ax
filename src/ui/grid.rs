@@ -486,6 +486,7 @@ fn draw_grid_tile(f: &mut Frame, app: &App, chart: &Chart, area: Rect, highlight
                     None,
                     &std::collections::BTreeMap::new(),
                     &body_text,
+                    app.tile_results.get(base_id).and_then(|t| t.unit.as_ref()),
                     Block::default(),
                     chart_area,
                 );
@@ -499,6 +500,7 @@ fn draw_grid_tile(f: &mut Frame, app: &App, chart: &Chart, area: Rect, highlight
                     None,
                     &std::collections::BTreeMap::new(),
                     &body_text,
+                    app.tile_results.get(base_id).and_then(|t| t.unit.as_ref()),
                     block,
                     area,
                 );
@@ -562,6 +564,7 @@ fn draw_grid_tile(f: &mut Frame, app: &App, chart: &Chart, area: Rect, highlight
                 None,
                 &std::collections::BTreeMap::new(),
                 &text,
+                None,
                 block,
                 area,
             );
