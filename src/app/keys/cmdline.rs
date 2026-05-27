@@ -77,6 +77,8 @@ impl App {
                 let from = self.cmdline.byte_cursor();
                 self.cmdline.buf.truncate(from);
             }
+            // Vim's cmdline Ctrl-W: delete the word before the cursor.
+            (Char('w'), M::CONTROL) => self.cmdline.delete_word_backward(),
             (Char(c), m) if m == M::NONE || m == M::SHIFT => self.cmdline.insert_char(c),
             _ => {}
         }

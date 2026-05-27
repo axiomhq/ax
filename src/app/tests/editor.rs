@@ -762,3 +762,41 @@ fn count_then_motion_repeats_navigation() {
     app.on_key(key(KeyCode::Char('l')));
     assert_eq!(app.selected_chart_idx, 2);
 }
+
+#[test]
+fn ctrl_w_in_insert_mode_deletes_previous_word() {
+    // Vim's insert-mode Ctrl-W: delete the word before the cursor.
+    // tui-textarea binds this natively; the test guards against the
+    // global window-prefix swallowing the key before it reaches the
+    // editor.
+    let mut app = test_app();
+    // Start from a clean buffer so the cursor sits at end-of-text and
+    // there's no starter MPL to interleave with the typed text.
+    app.editor = tui_textarea::TextArea::default();
+    app.on_key(key(KeyCode::Char('i')));
+    type_text(&mut app, "hello world");
+    assert_eq!(app.editor.lines().join("\n"), "hello world");
+    app.on_key(ctrl(KeyCode::Char('w')));
+    assert_eq!(app.mode, Mode::Insert, "must stay in Insert after Ctrl-W");
+    assert_eq!(app.editor.lines().join("\n"), "hello ");
+}
+
+#[test]
+fn ctrl_w_in_normal_mode_still_acts_as_window_prefix() {
+    // The text-entry bypass must not regress the window-prefix in
+    // Normal mode. `Ctrl-W` arms the prefix; the next key (`w`) cycles
+    // focus to the next pane.
+    let mut app = test_app();
+    app.completions.hide();
+    assert_eq!(app.mode, Mode::Normal);
+    app.on_key(ctrl(KeyCode::Char('w')));
+    // The window prefix is armed; the next key picks the target pane.
+    // We follow up with `w` and expect focus to cycle to the next
+    // pane (the legend is empty so it skips to Params).
+    let before = app.focus;
+    app.on_key(key(KeyCode::Char('w')));
+    assert_ne!(
+        app.focus, before,
+        "Ctrl-W w in Normal mode must cycle focus"
+    );
+}

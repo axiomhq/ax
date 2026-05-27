@@ -444,3 +444,60 @@ fn write_in_dashboard_mode_with_path_writes_json_file() {
     // earlier rustc versions.
     let _ = writeln!(std::io::sink(), "{}", path.display());
 }
+
+// ---------- Ctrl-W: delete word backward (vim cmdline behaviour) ----
+
+#[test]
+fn ctrl_w_in_cmdline_deletes_last_word() {
+    let mut app = test_app();
+    app.on_key(key(KeyCode::Char(':')));
+    type_text(&mut app, "dash ls");
+    app.on_key(ctrl(KeyCode::Char('w')));
+    assert_eq!(app.mode, Mode::Command, "Ctrl-W must stay in cmdline");
+    assert_eq!(app.cmdline.buf, "dash ");
+    app.on_key(ctrl(KeyCode::Char('w')));
+    // Trailing space is consumed with the next word, like vim.
+    assert_eq!(app.cmdline.buf, "");
+}
+
+#[test]
+fn ctrl_w_on_empty_cmdline_is_noop() {
+    let mut app = test_app();
+    app.on_key(key(KeyCode::Char(':')));
+    app.on_key(ctrl(KeyCode::Char('w')));
+    assert_eq!(app.mode, Mode::Command, "empty Ctrl-W must not cancel");
+    assert_eq!(app.cmdline.buf, "");
+}
+
+#[test]
+fn ctrl_w_splits_keyword_and_symbol_runs() {
+    // Vim treats keyword chars (alphanumeric + `_`) and non-keyword
+    // symbols as separate classes. `--deployment=prod` peels off
+    // `prod`, then `=`, then `deployment`, then `--`.
+    let mut app = test_app();
+    app.on_key(key(KeyCode::Char(':')));
+    type_text(&mut app, "--deployment=prod");
+    app.on_key(ctrl(KeyCode::Char('w')));
+    assert_eq!(app.cmdline.buf, "--deployment=");
+    app.on_key(ctrl(KeyCode::Char('w')));
+    assert_eq!(app.cmdline.buf, "--deployment");
+    app.on_key(ctrl(KeyCode::Char('w')));
+    assert_eq!(app.cmdline.buf, "--");
+    app.on_key(ctrl(KeyCode::Char('w')));
+    assert_eq!(app.cmdline.buf, "");
+}
+
+#[test]
+fn ctrl_w_respects_cursor_position() {
+    // Cursor mid-buffer: Ctrl-W deletes only the word to the left,
+    // leaving the text to the right untouched.
+    let mut app = test_app();
+    app.on_key(key(KeyCode::Char(':')));
+    type_text(&mut app, "open abc def");
+    // Move cursor back over "def" so it sits just after "abc ".
+    for _ in 0..3 {
+        app.on_key(key(KeyCode::Left));
+    }
+    app.on_key(ctrl(KeyCode::Char('w')));
+    assert_eq!(app.cmdline.buf, "open def");
+}

@@ -40,14 +40,22 @@ impl App {
             return;
         }
 
-        // `Ctrl-w` is the window-prefix in any mode; the next key picks
-        // the target pane. Handled before pane/mode dispatch so it works
-        // from Insert, Visual, and the legend itself.
+        // `Ctrl-w` is the window-prefix in Normal/Visual modes only.
+        // Vim repurposes it in the two text-entry modes:
+        //   - Insert mode: `delete-word-backward` (handled natively by
+        //     `tui-textarea` when we let the key reach `editor.input`).
+        //   - Command mode: `delete-word-backward` (handled by our own
+        //     `CmdLine::delete_word_backward` in `handle_command_key`).
+        // To switch windows from either entry mode, press Esc first.
         if self.pending_ctrl_w {
             self.pending_ctrl_w = false;
             return self.handle_ctrl_w_followup(key);
         }
-        if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('w') {
+        let in_text_entry = matches!(self.mode, Mode::Command | Mode::Insert);
+        if !in_text_entry
+            && key.modifiers == KeyModifiers::CONTROL
+            && key.code == KeyCode::Char('w')
+        {
             self.pending_ctrl_w = true;
             return;
         }

@@ -521,6 +521,40 @@ impl CmdLine {
         self.buf.drain(start..end);
     }
 
+    /// Delete the word before the cursor, vim-style.
+    ///
+    /// Skips trailing whitespace, then removes a run of characters of
+    /// the same class as the one just before the cursor — either
+    /// keyword chars (alphanumeric and `_`, matching vim's default
+    /// `iskeyword`) or non-keyword non-whitespace symbols. So
+    /// `:dash ls|` becomes `:dash |` becomes `:|`, and `--deployment=|`
+    /// peels off `deployment`, then `=`, then `--`. A pure-whitespace
+    /// run before the cursor drains everything to the start.
+    pub fn delete_word_backward(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let end = self.byte_cursor();
+        let chars: Vec<char> = self.buf.chars().collect();
+        let mut i = self.cursor;
+        while i > 0 && chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        if i == 0 {
+            self.buf.drain(..end);
+            self.cursor = 0;
+            return;
+        }
+        let keyword = |c: char| c.is_alphanumeric() || c == '_';
+        let target_kw = keyword(chars[i - 1]);
+        while i > 0 && !chars[i - 1].is_whitespace() && keyword(chars[i - 1]) == target_kw {
+            i -= 1;
+        }
+        self.cursor = i;
+        let start = self.byte_cursor();
+        self.buf.drain(start..end);
+    }
+
     pub fn delete_forward(&mut self) {
         let start = self.byte_cursor();
         if start >= self.buf.len() {
