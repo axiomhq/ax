@@ -305,16 +305,23 @@ impl App {
                 self.snapshot_dashboard_for_undo();
                 match action {
                     PickVizAction::Add => {
+                        // Inherit the active edit context's language so
+                        // `a` from inside an APL-flavoured tile adds
+                        // an APL tile. `:tile add ... apl` (or `:apl`
+                        // after the fact) is the explicit override.
+                        let lang = self.active_lang();
                         if let Some(resource) = self.loaded_dashboard.as_mut() {
                             let id = tile_ops::insert_tile(
                                 &mut resource.dashboard.charts,
                                 &mut resource.dashboard.layout,
                                 kind,
+                                lang,
                                 "new tile",
                             );
                             self.dashboard_dirty = true;
                             self.selected_chart_idx = resource.dashboard.charts.len() - 1;
-                            self.status = format!("added {} tile {id}", kind.as_str());
+                            self.status =
+                                format!("added {} {} tile {id}", lang.label(), kind.as_str());
                             // Refocus the new tile in the editor.
                             self.seed_editor_from_focused_tile();
                         }

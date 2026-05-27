@@ -83,23 +83,24 @@ impl App {
             return;
         };
         // Snapshot what we need to spawn without holding any borrow.
-        // Uses `extract_query` so MPL-stored-under-`apl` charts
-        // (the home-overview case) also get fetched.
-        let charts: Vec<(String, String)> = resource
+        // Each entry is `(chart_id, Query)` so the dispatch loop below
+        // can decide endpoint per tile (MPL vs APL).
+        let charts: Vec<(String, crate::dashboard::Query)> = resource
             .dashboard
             .charts
             .iter()
             .filter_map(|c| {
-                let mpl = match crate::dashboard::extract_query(c) {
-                    crate::dashboard::Query::Mpl(s) if !s.trim().is_empty() => s,
-                    _ => return None,
+                let q = crate::dashboard::extract_query(c);
+                let non_empty = match &q {
+                    crate::dashboard::Query::Mpl(s) | crate::dashboard::Query::Apl(s) => {
+                        !s.trim().is_empty()
+                    }
+                    crate::dashboard::Query::Empty => false,
                 };
-                // `extract_query` falls back to `Query::Empty` for
-                // `Chart::Unknown` (no `query` field surfaced), so the
-                // arm above already filters them. The `base()` here
-                // is a forward-compat belt against an SDK upgrade
-                // that ever lets Unknown carry an MPL string.
-                Some((c.base()?.id.clone(), mpl))
+                if !non_empty {
+                    return None;
+                }
+                Some((c.base()?.id.clone(), q))
             })
             .collect();
         if charts.is_empty() {
@@ -119,7 +120,7 @@ impl App {
         // the cap survives across waves of `run_tile_queries` calls
         // so back-to-back refreshes don't double-spawn.
         let sem = self.tile_fetch_semaphore.clone();
-        for (chart_id, mpl) in charts {
+        for (chart_id, query) in charts {
             // Initial busy state — grid renderer reads this to show a “loading…” hint.
             // Stamp `started_at` here (before the spawn) so the
             // measured elapsed includes semaphore queue wait, not
@@ -133,19 +134,6 @@ impl App {
                     ..Default::default()
                 },
             );
-            let dataset = match mpl::extract_dataset_metric(&mpl) {
-                Ok((d, _)) => d,
-                Err(e) => {
-                    self.tile_results.insert(
-                        chart_id.clone(),
-                        TileQueryResult {
-                            error: Some(format!("MPL: {e}")),
-                            ..Default::default()
-                        },
-                    );
-                    continue;
-                }
-            };
             let tx = self.events_tx.clone();
             let client = client.clone();
             let cache = cache.clone();
@@ -154,22 +142,48 @@ impl App {
             let end = end.clone();
             let epoch = self.tile_query_epoch;
             let sem = sem.clone();
-            self.runtime.spawn(async move {
-                // Acquire a permit and hold it through the HTTP call;
-                // dropping the guard at end-of-block releases it.
-                // `acquire_owned` only errors if the semaphore is
-                // closed, which we never do — fall through on error
-                // so the request still goes (better to over-spawn
-                // once than to silently lose the tile).
-                let _permit = sem.acquire_owned().await.ok();
-                let result =
-                    run_query_task(&cache, &client, &dataset, &mpl, &start, &end, &params).await;
-                let _ = tx.send(AppEvent::TileQueryFinished {
-                    chart_id,
-                    epoch,
-                    result,
-                });
-            });
+            match query {
+                crate::dashboard::Query::Mpl(mpl) => {
+                    let dataset = match mpl::extract_dataset_metric(&mpl) {
+                        Ok((d, _)) => d,
+                        Err(e) => {
+                            self.tile_results.insert(
+                                chart_id.clone(),
+                                TileQueryResult {
+                                    error: Some(format!("MPL: {e}")),
+                                    ..Default::default()
+                                },
+                            );
+                            continue;
+                        }
+                    };
+                    self.runtime.spawn(async move {
+                        let _permit = sem.acquire_owned().await.ok();
+                        let result =
+                            run_query_task(&cache, &client, &dataset, &mpl, &start, &end, &params)
+                                .await;
+                        let _ = tx.send(AppEvent::TileQueryFinished {
+                            chart_id,
+                            epoch,
+                            result,
+                        });
+                    });
+                }
+                crate::dashboard::Query::Apl(apl) => {
+                    self.runtime.spawn(async move {
+                        let _permit = sem.acquire_owned().await.ok();
+                        let result = run_apl_query_task(&client, &apl, &start, &end).await;
+                        let _ = tx.send(AppEvent::TileAplFinished {
+                            chart_id,
+                            epoch,
+                            result,
+                        });
+                    });
+                }
+                crate::dashboard::Query::Empty => {
+                    // Filtered out above; keep the arm exhaustive.
+                }
+            }
         }
     }
 }

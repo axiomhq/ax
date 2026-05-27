@@ -24,6 +24,7 @@ use crate::chart::{self, Series};
 use crate::dashboard::VizKind;
 
 mod agg;
+pub mod apl_decode;
 mod heatmap;
 mod note;
 mod pie;
@@ -33,6 +34,7 @@ mod table;
 mod top_list;
 
 pub use pragma::{PragmaError, VizSpec, parse_pragma, upsert_pragma};
+pub use table::{TableResult, draw_table_result};
 
 /// Render the focused tile into `area`.
 ///

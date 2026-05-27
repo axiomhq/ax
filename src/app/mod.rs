@@ -160,6 +160,14 @@ pub struct App {
     /// truth); `Dashboard` means `loaded_dashboard` holds the canonical
     /// state and `:w` writes the dashboard JSON, not the buffer text.
     pub buffer_mode: BufferMode,
+    /// Language of the standalone editor buffer when
+    /// [`BufferMode::Mpl`] is active. Ignored in
+    /// [`BufferMode::Dashboard`] mode — there the focused tile's
+    /// language is the source of truth (see [`App::active_lang`]).
+    /// Flipped by `:apl` / `:mpl` in standalone mode. Defaults to
+    /// [`crate::dashboard::Lang::Mpl`] so existing `.mpl` workflows
+    /// behave unchanged.
+    pub buffer_lang: crate::dashboard::Lang,
     /// Top-pane view: single-tile (`Solo`) or multi-tile (`Grid`).
     /// Auto-flips to `Grid` when a dashboard with ≥2 charts loads;
     /// `:solo` / `:grid` toggle manually.
@@ -304,6 +312,7 @@ impl App {
             loaded_dashboard: None,
             dashinfo_visible: false,
             buffer_mode: BufferMode::Mpl,
+            buffer_lang: crate::dashboard::Lang::default(),
             tile_inspect_json: None,
             view_mode: ViewMode::Solo,
             selected_chart_idx: 0,
@@ -682,7 +691,16 @@ impl App {
     /// pure cursor moves are no-ops on `dashboard_dirty`.
     pub fn recompute_diagnostics(&mut self) {
         let text = self.query_text();
-        self.diagnostics = mpl::analyze(&text, &self.params.system);
+        // Only run the MPL analyzer on MPL buffers. APL buffers
+        // would otherwise pick up a spurious "MPL syntax error" on
+        // every keystroke; the APL parser lives server-side and
+        // surfaces real errors through `tile_results.error` after
+        // a `:r`.
+        if self.active_lang() == crate::dashboard::Lang::Mpl {
+            self.diagnostics = mpl::analyze(&text, &self.params.system);
+        } else {
+            self.diagnostics.clear();
+        }
         self.sync_dashboard_from_buffer(&text);
         self.recompute_sig_help();
         self.sync_buffer_to_focused_tile();
@@ -693,6 +711,13 @@ impl App {
     /// Cheap (single backwards byte scan + one stdlib lookup); fine to call
     /// on every keystroke and cursor move.
     pub fn recompute_sig_help(&mut self) {
+        // APL buffers don't have MPL signature data — suppress so
+        // an APL `summarize(...)` doesn't display the unrelated MPL
+        // `summarize` signature.
+        if self.active_lang() != crate::dashboard::Lang::Mpl {
+            self.sig_help = None;
+            return;
+        }
         let text = self.query_text();
         let cursor = editor_cursor_byte_offset(&self.editor);
         self.sig_help = hover::find_call_context(&text, cursor);

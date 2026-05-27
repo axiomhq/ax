@@ -119,23 +119,39 @@ fn real_home_overview_mpl_timeseries_classifies_as_mpl() {
 }
 
 #[test]
-fn apl_text_on_timeseries_chart_dispatches_as_mpl() {
-    // Discrimination is by chart kind, not by parsing. A
-    // TimeSeries chart with APL syntax in its `apl` key still
-    // routes as `Query::Mpl` and will surface the server's
-    // error in the tile when the metrics endpoint rejects it.
-    // That's a deliberate trade-off: the previous classifier-based
-    // path silently flipped real MPL to `Query::Apl` whenever the
-    // local `mpl_lang` grammar diverged from the Axiom server's,
-    // showing the "not yet executable" banner with no hint of
-    // what went wrong.
+fn bracket_apl_text_on_timeseries_chart_classifies_as_apl() {
+    // Foreign-authored APL on a metrics chart (Axiom web UI lets
+    // users write APL on any chart kind). No `mcuLang` sidecar, so
+    // the layered detector falls through to the narrow syntax
+    // sniff in `extract_query` — the leading `[` is unambiguously
+    // APL (MPL grammar never starts with a bracket), so the chart
+    // is routed through the APL endpoint and the tile actually
+    // renders data instead of triggering an MPL parse error.
+    //
+    // The old `mpl_lang`-parse-based classifier was rejected
+    // because it false-flipped real MPL to APL when the local
+    // grammar drifted from the server's. The current sniff only
+    // accepts two prefixes (`[…` and `let …`) that MPL provably
+    // never produces, so the drift class can't recur.
     let chart = Chart::Known(KnownChart::TimeSeries(crate::axiom::ChartBase {
         id: "c1".into(),
         name: None,
         query: Some(json!({ "apl": REAL_APL_BRACKET })),
         extras: Default::default(),
     }));
-    assert!(matches!(extract_query(&chart), Query::Mpl(_)));
+    assert!(matches!(extract_query(&chart), Query::Apl(_)));
+}
+
+#[test]
+fn let_prefixed_apl_text_on_timeseries_chart_classifies_as_apl() {
+    // Mirror of the above for the second unambiguous APL prefix.
+    let chart = Chart::Known(KnownChart::TimeSeries(crate::axiom::ChartBase {
+        id: "c1".into(),
+        name: None,
+        query: Some(json!({ "apl": "let cutoff = ago(1h); ['logs'] | where _time > cutoff" })),
+        extras: Default::default(),
+    }));
+    assert!(matches!(extract_query(&chart), Query::Apl(_)));
 }
 
 #[test]

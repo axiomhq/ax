@@ -224,6 +224,83 @@ impl App {
                     self.reload_legend_label_tags();
                 }
             }
+            AppEvent::TileAplFinished {
+                chart_id,
+                epoch,
+                result,
+            } => {
+                // Same stale-result + slot-removed guards as MPL.
+                if epoch != self.tile_query_epoch {
+                    return;
+                }
+                if !self.tile_results.contains_key(&chart_id) {
+                    return;
+                }
+                // Resolve the focused viz kind for this tile up front
+                // so we don't have to re-walk `loaded_dashboard` under
+                // the mutable borrow. APL doesn't have a metrics-
+                // metadata unit, so `entry.unit` stays at its last
+                // value (typically None for APL-only tiles).
+                let viz_kind = self
+                    .loaded_dashboard
+                    .as_ref()
+                    .and_then(|r| {
+                        r.dashboard
+                            .charts
+                            .iter()
+                            .find(|c| c.base().is_some_and(|b| b.id == chart_id))
+                    })
+                    .map(crate::dashboard::VizKind::from_chart)
+                    .unwrap_or(crate::dashboard::VizKind::Line);
+                let entry = self
+                    .tile_results
+                    .get_mut(&chart_id)
+                    .expect("presence checked above");
+                entry.busy = false;
+                entry.elapsed = entry.started_at.take().map(|t| t.elapsed());
+                match result {
+                    Ok(resp) => {
+                        entry.trace_id = resp.trace_id.clone();
+                        // Per-kind decoder routing:
+                        //   * Table / LogStream — render the raw
+                        //     tabular response.
+                        //   * Everything else — reshape into
+                        //     `Vec<Series>`; on shape mismatch
+                        //     surface the decoder's error message
+                        //     (e.g. "no time column found…") so the
+                        //     user knows what to fix.
+                        let wants_table = matches!(
+                            viz_kind,
+                            crate::dashboard::VizKind::Table | crate::dashboard::VizKind::LogStream
+                        );
+                        if wants_table {
+                            entry.table = Some(crate::viz::apl_decode::to_table_result(&resp));
+                            entry.series.clear();
+                            entry.error = None;
+                        } else {
+                            match crate::viz::apl_decode::to_series(
+                                &resp,
+                                &std::collections::BTreeMap::new(),
+                            ) {
+                                Ok(series) => {
+                                    entry.series = series;
+                                    entry.table = None;
+                                    entry.error = None;
+                                }
+                                Err(e) => {
+                                    entry.error = Some(format!("APL: {e}"));
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        entry.error = Some(format!("{e}"));
+                    }
+                }
+                if self.current_chart_id().as_deref() == Some(&chart_id) {
+                    self.reload_legend_label_tags();
+                }
+            }
             AppEvent::DashboardDeleted { uid, result } => {
                 self.busy = false;
                 match result {

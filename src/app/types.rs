@@ -10,7 +10,8 @@
 use std::collections::BTreeMap;
 
 use crate::axiom::{
-    DashboardSummary, DashboardSummaryExt, DatasetSummary, MetricInfo, MetricsQueryResponse,
+    AplQueryResult, DashboardSummary, DashboardSummaryExt, DatasetSummary, MetricInfo,
+    MetricsQueryResponse,
 };
 use crate::chart::Series;
 use crate::completions;
@@ -71,6 +72,18 @@ pub enum AppEvent {
         epoch: u64,
         result: anyhow::Result<MetricsQueryResponse>,
     },
+    /// Per-tile APL query result. Parallel to
+    /// [`AppEvent::TileQueryFinished`] but carries the
+    /// [`AplQueryResult`] table shape; the handler picks between
+    /// [`crate::viz::apl_decode::to_series`] and
+    /// [`crate::viz::apl_decode::to_table_result`] based on the
+    /// focused tile's current viz kind. Stale-result protection via
+    /// the same `epoch` mechanism.
+    TileAplFinished {
+        chart_id: String,
+        epoch: u64,
+        result: anyhow::Result<AplQueryResult>,
+    },
     /// Background refresh of the org's dashboard list. Fires after a
     /// cached list was shown immediately on `:dash ls`. Errors are
     /// surfaced quietly via `status` so they don't disrupt the picker.
@@ -94,8 +107,17 @@ pub struct TileQueryResult {
     /// success or error.
     pub busy: bool,
     /// Last successful series snapshot. Kept across errors so an
-    /// occasional failed refresh doesn't blank the tile.
+    /// occasional failed refresh doesn't blank the tile. Populated by
+    /// the MPL path and by the APL path when the response decodes
+    /// into series via [`crate::viz::apl_decode::to_series`].
     pub series: Vec<Series>,
+    /// Last successful tabular result, when the tile's viz kind is
+    /// `Table` / `LogStream` or when the APL response can't be
+    /// reshaped into series. Mutually exclusive with a non-empty
+    /// [`Self::series`] in practice — the dispatch in
+    /// [`crate::app::App::run_tile_queries`] writes into exactly one
+    /// of the two based on the viz kind + decoder verdict.
+    pub table: Option<crate::viz::TableResult>,
     /// Last error message, if the most recent fetch failed.
     pub error: Option<String>,
     /// Server trace id from the most recent successful fetch.

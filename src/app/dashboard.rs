@@ -5,6 +5,29 @@
 use super::*;
 
 impl App {
+    /// Resolve the language the user is currently editing in.
+    ///
+    /// * [`BufferMode::Dashboard`]: the focused tile's language
+    ///   (`extract_lang` on the chart). Falls back to
+    ///   [`App::buffer_lang`] when the dashboard has no charts or
+    ///   the focused tile has no query (Note / Spacer / Unknown).
+    /// * [`BufferMode::Mpl`]: the standalone-buffer
+    ///   [`App::buffer_lang`], flipped by `:apl` / `:mpl`.
+    ///
+    /// Used by the status bar to render `NORMAL · APL` /
+    /// `NORMAL · MPL` and by `run_query` to dispatch standalone
+    /// queries to the right endpoint.
+    pub fn active_lang(&self) -> crate::dashboard::Lang {
+        if self.buffer_mode != BufferMode::Dashboard {
+            return self.buffer_lang;
+        }
+        self.loaded_dashboard
+            .as_ref()
+            .and_then(|r| r.dashboard.charts.get(self.selected_chart_idx))
+            .and_then(crate::dashboard::extract_lang)
+            .unwrap_or(self.buffer_lang)
+    }
+
     /// Active query time range, in the order the Axiom API wants it
     /// (`start`, `end`). Sourced from `self.time.range`, which is
     /// seeded from the loaded dashboard's `timeWindowStart`/`End`
@@ -301,20 +324,17 @@ impl App {
     /// flicker between renders while the user is mid-edit.
     /// Build the editor seed for `query` using the supplied `// @viz`
     /// pragma line. Returns `None` for `Query::Empty` (caller leaves
-    /// the editor untouched). APL queries get a `// APL query —
-    /// execution lands in step 14b` banner so the MPL parser doesn't
-    /// flag every line.
+    /// the editor untouched). Both MPL and APL queries seed as raw
+    /// text — the language is tracked separately (via the chart's
+    /// `mcuLang` sidecar or `App.buffer_lang`) and surfaced in the
+    /// status bar so the user always knows which dialect they're in.
     pub(super) fn build_query_seed(
         pragma_line: &str,
         query: &crate::dashboard::Query,
     ) -> Option<String> {
         use crate::dashboard::Query;
         match query {
-            Query::Mpl(mpl) => Some(format!("{pragma_line}{mpl}")),
-            Query::Apl(apl) => Some(format!(
-                "{pragma_line}// APL query — execution lands in step 14b\n// {}\n",
-                apl.replace('\n', "\n// ")
-            )),
+            Query::Mpl(text) | Query::Apl(text) => Some(format!("{pragma_line}{text}")),
             Query::Empty => None,
         }
     }
@@ -506,21 +526,23 @@ impl App {
         Some(query)
     }
 
-    /// Push the editor buffer back into the focused tile's MPL query.
-    /// No-op outside Dashboard mode, when the focused tile isn't MPL,
-    /// or when the stripped MPL already matches the chart's stored MPL
-    /// (the equality guard keeps `dashboard_dirty` from flipping on
-    /// cursor moves, undo/redo round-trips, or seed operations that
-    /// just loaded the same text we're about to write).
+    /// Push the editor buffer back into the focused tile's query,
+    /// honouring whichever language ([`Lang::Mpl`] / [`Lang::Apl`])
+    /// the tile is currently in. No-op outside Dashboard mode, when
+    /// the focused tile has no query (Note/Spacer), or when the
+    /// stripped text already matches the chart's stored text (the
+    /// equality guard keeps `dashboard_dirty` from flipping on cursor
+    /// moves, undo/redo round-trips, or seed operations that just
+    /// loaded the same text we're about to write).
     ///
     /// The buffer's leading `// @viz <kind>` pragma is stripped — the
     /// chart's wire kind comes from `Chart::Known(…)`, not the pragma.
     /// Changing the pragma in the buffer adjusts the TUI render kind
     /// for the current session but doesn't rewrite the server-side
-    /// chart variant (that would be a separate "convert chart type"
-    /// command).
+    /// chart variant (that's `:viz <kind>` for the editor / a separate
+    /// "convert chart type" command for the dashboard).
     pub(super) fn sync_buffer_to_focused_tile(&mut self) {
-        use crate::dashboard::Query;
+        use crate::dashboard::{Lang, Query};
         if self.buffer_mode != BufferMode::Dashboard {
             return;
         }
@@ -530,56 +552,65 @@ impl App {
         let Some(chart) = resource.dashboard.charts.get_mut(self.selected_chart_idx) else {
             return;
         };
-        // Only MPL tiles accept buffer-driven edits. APL banners and
-        // empty placeholders are read-only views in the editor.
-        let existing = crate::dashboard::extract_query(chart);
-        let Query::Mpl(existing_mpl) = existing else {
-            return;
+        // Note / Spacer tiles still have no editable body — the seed
+        // path shows the `// (no query for this tile)` placeholder
+        // and we drop edits silently so the user doesn't accidentally
+        // convert a Note into a query tile by typing into it.
+        let (lang, existing_text) = match crate::dashboard::extract_query(chart) {
+            Query::Mpl(s) => (Lang::Mpl, s),
+            Query::Apl(s) => (Lang::Apl, s),
+            Query::Empty => return,
         };
         let buf = self.editor.lines().join("\n");
-        let new_mpl = strip_viz_pragma(&buf);
-        if new_mpl == existing_mpl {
+        let new_text = strip_viz_pragma(&buf);
+        if new_text == existing_text {
             return;
         }
-        // Apply the editor's new MPL back onto the focused tile.
+        // Apply the editor's new text back onto the focused tile.
         // `Chart::Unknown` carries raw JSON with no `ChartBase`, so
         // there's nothing to mutate; we skip silently — the editor
         // shouldn't have been routed to an Unknown tile in the first
-        // place (Unknowns have no MPL to extract), but bail safely
-        // either way.
+        // place, but bail safely either way.
         let Some(base) = chart.base_mut() else {
             return;
         };
-        // Write the edited text into the `mpl` key, and drop any
-        // sibling `apl` key. Two independent constraints both point
-        // to this shape:
+        // Stamp the language sidecar so the next reload classifies
+        // deterministically without falling back to chart-kind
+        // heuristics. Round-trips through `ChartBase.extras`.
+        base.extras.insert(
+            crate::dashboard::LANG_SIDECAR_KEY.to_string(),
+            serde_json::Value::String(lang.as_sidecar().to_string()),
+        );
+        // Write the edited text into the language's key, drop the
+        // sibling, preserve any other extras on the query object.
+        // Two independent constraints both point to single-key
+        // objects:
         //
         //  1. Server side: dual-keyed `{ apl, mpl }` PUTs are
         //     rejected with 400 — the root cause of the "editing a
         //     chart's query breaks :w" bug. A single-key object
         //     (either key alone) is accepted per the v2 OpenAPI.
         //
-        //  2. Local side: `extract_query` checks `mpl` first and
-        //     returns `Query::Mpl` without consulting the chart
-        //     kind. The kind-based dispatch is a fallback for
-        //     server-loaded charts that never went through the
-        //     editor; for edited tiles we encode the user's MPL
-        //     intent explicitly so subsequent renders take the
-        //     direct path.
-        //
-        // Sibling extras on the query object are preserved.
+        //  2. Local side: `extract_query` short-circuits when the
+        //     key matches the sidecar's language. Encoding the
+        //     user's intent explicitly makes renders take the
+        //     direct path on the next read.
+        let (write_key, drop_key) = match lang {
+            Lang::Mpl => ("mpl", "apl"),
+            Lang::Apl => ("apl", "mpl"),
+        };
         let new_query = match base.query.take() {
             Some(mut v) if v.is_object() => {
                 if let Some(obj) = v.as_object_mut() {
-                    obj.remove("apl");
+                    obj.remove(drop_key);
                     obj.insert(
-                        "mpl".to_string(),
-                        serde_json::Value::String(new_mpl.to_string()),
+                        write_key.to_string(),
+                        serde_json::Value::String(new_text.to_string()),
                     );
                 }
                 v
             }
-            _ => serde_json::json!({ "mpl": new_mpl }),
+            _ => serde_json::json!({ write_key: new_text }),
         };
         base.query = Some(new_query);
         self.dashboard_dirty = true;

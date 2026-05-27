@@ -375,8 +375,8 @@ fn draw_grid_tile(f: &mut Frame, app: &App, chart: &Chart, area: Rect, highlight
     // Decide what to render in the tile body.
     enum Body<'a> {
         Viz { series: &'a [crate::chart::Series] },
+        Table(&'a crate::viz::TableResult),
         Loading,
-        Apl(String),
         Note(String),
         Empty,
         Error(String),
@@ -398,23 +398,25 @@ fn draw_grid_tile(f: &mut Frame, app: &App, chart: &Chart, area: Rect, highlight
     } else if let Some(t) = app.tile_results.get(base_id) {
         if let Some(err) = t.error.as_deref() {
             Body::Error(err.to_string())
+        } else if let Some(table) = t.table.as_ref()
+            && !table.rows.is_empty()
+        {
+            // Tabular APL response (Table / LogStream kinds, or any
+            // APL response the series decoder couldn't reshape).
+            Body::Table(table)
         } else if !t.series.is_empty() {
             Body::Viz { series: &t.series }
         } else if t.busy {
             Body::Loading
         } else {
-            // Finished, no error, no series - "no data" outcome.
+            // Finished, no error, no series, no table — "no data" outcome.
             Body::Empty
         }
     } else {
-        // No entry means we never kicked off a fetch. The shared
-        // classifier decides whether the chart is truly APL (only
-        // those should render the APL placeholder) versus "no query
-        // at all".
-        match crate::dashboard::extract_query(chart) {
-            crate::dashboard::Query::Apl(text) => Body::Apl(text),
-            _ => Body::Empty,
-        }
+        // No entry means we never kicked off a fetch. Render as empty;
+        // pre-execution APL placeholders no longer apply now that the
+        // APL fetcher is wired up.
+        Body::Empty
     };
 
     let mut block = Block::default()
@@ -516,21 +518,12 @@ fn draw_grid_tile(f: &mut Frame, app: &App, chart: &Chart, area: Rect, highlight
                 inner,
             );
         }
-        Body::Apl(text) => {
-            let inner = block.inner(area);
-            f.render_widget(block, area);
-            let lines = vec![
-                Line::from(Span::styled(
-                    "APL (not yet executable)",
-                    Style::default().fg(Color::Yellow),
-                )),
-                Line::from(""),
-                Line::from(Span::styled(text, Style::default().fg(Color::Gray))),
-            ];
-            f.render_widget(
-                Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: true }),
-                inner,
-            );
+        Body::Table(t) => {
+            // APL-table response (or any TableResult-shaped tile).
+            // Routed through the dedicated table renderer so column
+            // types survive (the series-adapter path would force every
+            // cell through `Agg::Last`).
+            viz::draw_table_result(f, t, block, area);
         }
         Body::Empty => {
             let inner = block.inner(area);

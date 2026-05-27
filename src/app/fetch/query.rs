@@ -2,13 +2,15 @@ use super::*;
 
 impl App {
     /// `R` shortcut in the dashboard pane: refetch just the focused
-    /// tile's MPL query. APL / no-query tiles surface a status hint.
+    /// tile, dispatching to the MPL or APL endpoint based on the
+    /// tile's language. Tiles with no query (Note/Spacer/Empty)
+    /// surface a status hint.
     pub fn run_focused_tile_query(&mut self) {
         let Some(id) = self.current_chart_id() else {
             self.status = "no tile selected".to_string();
             return;
         };
-        let mpl = self
+        let query = self
             .loaded_dashboard
             .as_ref()
             .and_then(|r| {
@@ -17,24 +19,16 @@ impl App {
                     .iter()
                     .find(|c| c.base().is_some_and(|b| b.id == id))
             })
-            .and_then(|c| match crate::dashboard::extract_query(c) {
-                crate::dashboard::Query::Mpl(s) => Some(s),
-                _ => None,
-            });
-        let Some(mpl) = mpl else {
-            self.status = format!("tile {id}: no MPL query to rerun");
-            return;
-        };
-        let dataset = match mpl::extract_dataset_metric(&mpl) {
-            Ok((d, _)) => d,
-            Err(e) => {
-                self.tile_results.insert(
-                    id.clone(),
-                    TileQueryResult {
-                        error: Some(format!("MPL: {e}")),
-                        ..Default::default()
-                    },
-                );
+            .map(crate::dashboard::extract_query);
+        let query = match query {
+            Some(crate::dashboard::Query::Mpl(s)) if !s.trim().is_empty() => {
+                crate::dashboard::Query::Mpl(s)
+            }
+            Some(crate::dashboard::Query::Apl(s)) if !s.trim().is_empty() => {
+                crate::dashboard::Query::Apl(s)
+            }
+            _ => {
+                self.status = format!("tile {id}: no query to rerun");
                 return;
             }
         };
@@ -58,15 +52,44 @@ impl App {
         let tx = self.events_tx.clone();
         let chart_id = id.clone();
         let epoch = self.tile_query_epoch;
-        self.runtime.spawn(async move {
-            let result =
-                run_query_task(&cache, &client, &dataset, &mpl, &start, &end, &params).await;
-            let _ = tx.send(AppEvent::TileQueryFinished {
-                chart_id,
-                epoch,
-                result,
-            });
-        });
+        match query {
+            crate::dashboard::Query::Mpl(mpl) => {
+                let dataset = match mpl::extract_dataset_metric(&mpl) {
+                    Ok((d, _)) => d,
+                    Err(e) => {
+                        self.tile_results.insert(
+                            id.clone(),
+                            TileQueryResult {
+                                error: Some(format!("MPL: {e}")),
+                                ..Default::default()
+                            },
+                        );
+                        return;
+                    }
+                };
+                self.runtime.spawn(async move {
+                    let result =
+                        run_query_task(&cache, &client, &dataset, &mpl, &start, &end, &params)
+                            .await;
+                    let _ = tx.send(AppEvent::TileQueryFinished {
+                        chart_id,
+                        epoch,
+                        result,
+                    });
+                });
+            }
+            crate::dashboard::Query::Apl(apl) => {
+                self.runtime.spawn(async move {
+                    let result = run_apl_query_task(&client, &apl, &start, &end).await;
+                    let _ = tx.send(AppEvent::TileAplFinished {
+                        chart_id,
+                        epoch,
+                        result,
+                    });
+                });
+            }
+            crate::dashboard::Query::Empty => unreachable!("filtered above"),
+        }
         self.status = format!("refetching tile {id}…");
     }
 

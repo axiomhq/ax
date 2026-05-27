@@ -57,6 +57,12 @@ pub(super) fn draw_status(f: &mut Frame, app: &App, area: Rect) {
 
     // Left chunk: mode badge + (diagnostic summary OR signature help OR
     // running status). Priority: errors > warnings > sig help > status.
+    // Language badge sits right next to the mode badge so the user
+    // always sees `NORMAL · APL` / `NORMAL · MPL` without having to
+    // remember which tile is in which dialect. Resolved via
+    // [`App::active_lang`] — focused tile's lang in dashboard mode,
+    // [`App::buffer_lang`] in standalone mode.
+    let lang_label = app.active_lang().label();
     let mut left_spans = vec![
         Span::styled(
             format!(" {mode_label} "),
@@ -64,6 +70,11 @@ pub(super) fn draw_status(f: &mut Frame, app: &App, area: Rect) {
                 .fg(mode_fg)
                 .bg(mode_bg)
                 .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            format!("· {lang_label}"),
+            Style::default().fg(Color::DarkGray),
         ),
         Span::raw("  "),
     ];

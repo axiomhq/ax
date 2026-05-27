@@ -26,6 +26,7 @@ pub use axiom_rs::dashboards::{
     Chart, ChartBase, CreateOptions, Dashboard as DashboardSummary, DashboardDocument,
     DashboardWriteResponse, DashboardWriteStatus, KnownChart, LayoutItem, UpsertOptions,
 };
+pub use axiom_rs::datasets::QueryResult as AplQueryResult;
 pub use axiom_rs::metrics::{MetricInfo, MetricsQueryResponse, MetricsSeries};
 
 // Used by tests that round-trip the upsert request body. Re-exported under
@@ -315,6 +316,32 @@ impl Client {
             .query(mpl, start, end, opts)
             .await
             .map_err(map_axiom_err)
+    }
+
+    /// Execute an APL query against `POST /v1/datasets/_apl`.
+    ///
+    /// Routed through the control-plane [`Self::inner`] client (not
+    /// an edge-bound one): unlike `_mpl`, the `_apl` endpoint is not
+    /// dataset-scoped — the dataset name lives inside the APL text
+    /// (`['logs'] | summarize …`) and Axiom handles cross-edge
+    /// dispatch server-side. Avoiding edge resolution here also
+    /// dodges the need to parse the leading dataset out of the APL
+    /// (which can be quoted, dotted, or absent for `let`-prefixed
+    /// queries).
+    ///
+    /// The dashboards layer drives this via
+    /// [`crate::dashboard::Lang::Apl`]-classified tiles; mismatch
+    /// (APL text on an MPL-classified tile, or vice versa) surfaces
+    /// as a real server error in `tile_results.error` rather than a
+    /// silent placeholder.
+    pub async fn query_apl(&self, apl: &str, start: &str, end: &str) -> Result<AplQueryResult> {
+        let (start_dt, end_dt) = parse_range(start, end)?;
+        let opts = axiom_rs::datasets::QueryOptions {
+            start_time: Some(start_dt),
+            end_time: Some(end_dt),
+            ..Default::default()
+        };
+        self.inner.query(apl, opts).await.map_err(map_axiom_err)
     }
 }
 

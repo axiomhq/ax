@@ -206,6 +206,7 @@ pub(super) fn mk_layout(i: &str, x: u32, y: u32, w: u32, h: u32) -> crate::axiom
     }
 }
 
+mod apl;
 mod cmdline;
 mod completion;
 mod dashboard;

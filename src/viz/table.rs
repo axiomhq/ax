@@ -121,7 +121,15 @@ pub(super) fn draw_table(
         .and_then(|s| Agg::parse(s))
         .unwrap_or(Agg::Last);
     let t = series_to_table(series, hidden, agg);
+    draw_table_result(f, &t, block, area);
+}
 
+/// Render a pre-built [`TableResult`] (the APL path). Same chrome as
+/// [`draw_table`] but skips the series → table adapter — the APL
+/// decoder already produced the table-shaped result, so feeding it
+/// back through `series_to_table` would lose column types and force
+/// every cell through the `Agg::Last` aggregation.
+pub fn draw_table_result(f: &mut Frame, t: &TableResult, block: Block<'_>, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {

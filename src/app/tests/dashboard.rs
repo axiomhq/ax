@@ -185,12 +185,18 @@ fn dashboard_open_adopts_internal_dashboard_and_seeds_mpl_buffer() {
     assert!(buf.contains("http_requests:rate"), "buffer: {buf:?}");
 }
 #[test]
-fn dashboard_open_with_logstream_apl_seeds_commented_banner() {
-    // The APL-banner seed only fires for `LogStream` charts now
-    // that `extract_query` discriminates by chart kind rather than
-    // by parser. Pie / TimeSeries / etc. with APL text in the
-    // `apl` key dispatch as MPL and surface server errors instead
-    // of the read-only banner.
+fn dashboard_open_with_logstream_apl_seeds_raw_apl_text() {
+    // Since APL execution landed, APL tiles seed as raw editable
+    // text (no `//` comment prefix). The language is tracked via
+    // the chart's `mcuLang` sidecar / `App.buffer_lang` and
+    // surfaced in the status bar; the buffer itself is just the
+    // APL query the user can type into directly.
+    //
+    // Pie / TimeSeries / etc. with APL text in the `apl` key
+    // still dispatch as MPL (kind-based fallback) and surface
+    // server errors, unless the user runs `:apl` to flip the
+    // sidecar.
+    use crate::dashboard::Lang;
     let mut app = test_app();
     let resource = DashboardSummary {
         uid: "u".into(),
@@ -218,9 +224,19 @@ fn dashboard_open_with_logstream_apl_seeds_commented_banner() {
         result: Ok(resource),
     });
     let buf = app.query_text();
-    assert!(buf.contains("// @viz log_stream"));
-    assert!(buf.contains("APL query"));
-    assert!(buf.contains("['logs']"));
+    assert!(buf.contains("// @viz log_stream"), "buffer: {buf:?}");
+    assert!(
+        !buf.contains("// APL query"),
+        "old comment-banner must be gone: {buf:?}"
+    );
+    // Raw APL text, no `//` line prefix.
+    assert!(
+        buf.contains("['logs'] | where severity == 'error'"),
+        "buffer: {buf:?}"
+    );
+    // Language discriminator is APL for a LogStream chart.
+    let chart = &app.loaded_dashboard.as_ref().unwrap().dashboard.charts[0];
+    assert_eq!(crate::dashboard::extract_lang(chart), Some(Lang::Apl));
 }
 
 #[test]

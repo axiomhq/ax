@@ -87,6 +87,8 @@ impl App {
             "help" | "h" => self.open_help(),
             "ax" | "axiom" => self.cmd_axiom_open(),
             "viz" => self.cmd_viz(args.first().copied()),
+            "apl" => self.cmd_lang(crate::dashboard::Lang::Apl),
+            "mpl" => self.cmd_lang(crate::dashboard::Lang::Mpl),
             "open" => self.cmd_open(args.first().copied()),
             "trace" => self.cmd_trace(),
             "time" => self.cmd_time(&args),
@@ -229,6 +231,82 @@ impl App {
         // Re-sync diagnostics + dashboard from the rewritten buffer.
         self.recompute_diagnostics();
         self.status = format!("viz: {}", kind.as_str());
+    }
+
+    /// `:apl` / `:mpl` — flip the current edit context's language.
+    ///
+    /// In dashboard mode this rewrites the focused tile's query-object
+    /// key (`mpl` ↔ `apl`), stamps the `mcuLang` sidecar so the next
+    /// reload classifies deterministically, and marks the dashboard
+    /// dirty. In standalone MPL-buffer mode it flips
+    /// [`App::buffer_lang`] for the duration of the session.
+    ///
+    /// Text is **not** auto-converted — the user is expected to
+    /// rewrite the query when changing dialects. The next `:r` will
+    /// dispatch the buffer text to the language's endpoint and
+    /// surface any server-side rejection in the usual place.
+    pub(super) fn cmd_lang(&mut self, lang: crate::dashboard::Lang) {
+        let current = self.active_lang();
+        if current == lang && self.buffer_mode != BufferMode::Dashboard {
+            self.status = format!("lang: {} (unchanged)", lang.label());
+            return;
+        }
+        if self.buffer_mode != BufferMode::Dashboard {
+            self.buffer_lang = lang;
+            self.status = format!("lang: {} (buffer)", lang.label());
+            return;
+        }
+        // Dashboard mode: rewrite the focused tile's query-object key.
+        // Persist any pending editor edits first so we don't lose them
+        // when we rewrite the query object underneath the buffer.
+        self.sync_buffer_to_focused_tile();
+        let Some(resource) = self.loaded_dashboard.as_mut() else {
+            self.buffer_lang = lang;
+            self.status = format!("lang: {} (buffer)", lang.label());
+            return;
+        };
+        let Some(chart) = resource.dashboard.charts.get_mut(self.selected_chart_idx) else {
+            self.set_error(":".to_string() + lang.ex_command() + ": no tile selected");
+            return;
+        };
+        // Note / Spacer tiles have no query to flip.
+        let Some(base) = chart.base_mut() else {
+            self.set_error(format!(
+                ":{}: tile has no chart base (Unknown variant)",
+                lang.ex_command()
+            ));
+            return;
+        };
+        // Move text between keys. Both keys may be missing (newly
+        // created tile that hasn't had text typed in yet) — that's
+        // fine, we just stamp the sidecar so future edits land in the
+        // right key.
+        let (write_key, drop_key) = match lang {
+            crate::dashboard::Lang::Mpl => ("mpl", "apl"),
+            crate::dashboard::Lang::Apl => ("apl", "mpl"),
+        };
+        let mut query = base.query.take().unwrap_or_else(|| serde_json::json!({}));
+        if !query.is_object() {
+            query = serde_json::json!({});
+        }
+        if let Some(obj) = query.as_object_mut() {
+            let text = obj
+                .remove(drop_key)
+                .or_else(|| obj.remove(write_key))
+                .unwrap_or_else(|| serde_json::Value::String(String::new()));
+            obj.insert(write_key.to_string(), text);
+        }
+        base.query = Some(query);
+        base.extras.insert(
+            crate::dashboard::LANG_SIDECAR_KEY.to_string(),
+            serde_json::Value::String(lang.as_sidecar().to_string()),
+        );
+        self.dashboard_dirty = true;
+        // Re-seed the editor so the buffer reflects the new key
+        // (text is the same; only the underlying storage flipped).
+        // Diagnostics get re-evaluated as part of seeding.
+        self.seed_editor_from_focused_tile();
+        self.status = format!("lang: {} (tile)", lang.label());
     }
 
     /// `:open [uid]` — fetch a single dashboard by uid. With no
@@ -556,20 +634,33 @@ impl App {
         }
     }
 
-    /// `:tile add <kind> [name]` body. Kept separate from `tile_op`
-    /// because it adds a chart instead of mutating an existing one
-    /// and updates `selected_chart_idx` so the newly-added tile is
-    /// focused.
+    /// `:tile add <kind> [apl|mpl] [name…]` body. Kept separate from
+    /// `tile_op` because it adds a chart instead of mutating an
+    /// existing one and updates `selected_chart_idx` so the newly
+    /// added tile is focused.
+    ///
+    /// The second token is an optional language; defaults to
+    /// [`App::active_lang`] so adding into an APL-flavoured editor
+    /// keeps the dialect. The rest is the (optional) tile name.
     fn tile_add(&mut self, args: &[&str]) {
         let Some(kind_str) = args.first() else {
-            self.set_error(":tile add <kind>: kind required".to_string());
+            self.set_error(":tile add <kind> [apl|mpl] [name]: kind required".to_string());
             return;
         };
         let Some(kind) = crate::dashboard::VizKind::parse(kind_str) else {
             self.set_error(format!(":tile add {kind_str}: unknown viz kind"));
             return;
         };
-        let name = args[1..].join(" ");
+        // Optional language token immediately after kind. We don't
+        // accept `apl` / `mpl` as tile names — if the user wants a
+        // tile literally called `apl`, they need to specify the
+        // language explicitly first (`:tile add line mpl apl`).
+        let (lang, name_start) = match args.get(1).copied() {
+            Some("apl") => (crate::dashboard::Lang::Apl, 2),
+            Some("mpl") => (crate::dashboard::Lang::Mpl, 2),
+            _ => (self.active_lang(), 1),
+        };
+        let name = args[name_start..].join(" ");
         let name = if name.is_empty() {
             "new tile".to_string()
         } else {
@@ -580,6 +671,7 @@ impl App {
             &mut resource.dashboard.charts,
             &mut resource.dashboard.layout,
             kind,
+            lang,
             &name,
         );
         self.dashboard_dirty = true;
@@ -587,7 +679,7 @@ impl App {
         // Newly added tile becomes the focus — re-seed so the
         // editor reflects its (empty) body, not the old tile's MPL.
         self.seed_editor_from_focused_tile();
-        self.status = format!("added {} tile {id}", kind.as_str());
+        self.status = format!("added {} {} tile {id}", lang.label(), kind.as_str());
     }
 
     /// `:grid` — enter multi-tile grid view. Only meaningful when a

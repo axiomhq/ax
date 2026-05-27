@@ -12,6 +12,88 @@
 
 use crate::axiom::{Chart, ChartBase, DashboardSummary, KnownChart};
 
+/// Sidecar key on `ChartBase.extras` that records the query language
+/// mcu wrote for a tile. Lets [`extract_query`] reach a deterministic
+/// verdict on tiles we authored without falling back to chart-kind
+/// heuristics — flip a Statistic chart to APL with `:apl` and the
+/// next reload still classifies it as APL even though the chart kind
+/// would otherwise say MPL.
+///
+/// Foreign-authored charts (Axiom web UI, other tools) won't carry
+/// this; they fall through to the kind-based rules below. Round-trips
+/// because [`ChartBase.extras`] is a serde passthrough.
+pub const LANG_SIDECAR_KEY: &str = "mcuLang";
+
+/// Query language a tile is authored in. The discriminator that
+/// [`extract_query`] returns alongside the query text.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Lang {
+    #[default]
+    Mpl,
+    Apl,
+}
+
+impl Lang {
+    /// Sidecar-value form, written under [`LANG_SIDECAR_KEY`] in
+    /// `ChartBase.extras` and read back by [`lang_from_sidecar`].
+    pub fn as_sidecar(self) -> &'static str {
+        match self {
+            Lang::Mpl => "mpl",
+            Lang::Apl => "apl",
+        }
+    }
+
+    /// Display label for the status bar (`NORMAL · APL`).
+    pub fn label(self) -> &'static str {
+        match self {
+            Lang::Mpl => "MPL",
+            Lang::Apl => "APL",
+        }
+    }
+
+    /// `:apl` / `:mpl` command name.
+    pub fn ex_command(self) -> &'static str {
+        match self {
+            Lang::Mpl => "mpl",
+            Lang::Apl => "apl",
+        }
+    }
+}
+
+/// Read the explicit-language sidecar from a chart, if mcu wrote one.
+/// Returns `None` for foreign charts that never carried the marker.
+fn lang_from_sidecar(chart: &Chart) -> Option<Lang> {
+    let base = chart.base()?;
+    match base.extras.get(LANG_SIDECAR_KEY)?.as_str()? {
+        "apl" => Some(Lang::Apl),
+        "mpl" => Some(Lang::Mpl),
+        _ => None,
+    }
+}
+
+/// Narrow syntax sniff: `true` only when the leading non-whitespace
+/// shape is **unambiguously** APL. We deliberately accept just two
+/// prefixes — bracketed dataset (`['logs'] | ...`) and `let`
+/// bindings (`let foo = ...`) — because MPL grammar permits
+/// neither. Everything else (backtick datasets, bare identifiers,
+/// comments, even unparseable garbage) is left to the chart-kind
+/// fallback so we don't reintroduce the classifier drift the old
+/// `mpl_lang::compile` approach suffered.
+///
+/// Used by [`extract_query`] as a final disambiguator when no
+/// sidecar is present and the chart kind alone would mis-classify
+/// user-authored APL on a metrics chart as MPL.
+fn looks_like_apl(text: &str) -> bool {
+    let s = text.trim_start();
+    if s.starts_with('[') {
+        return true;
+    }
+    if let Some(rest) = s.strip_prefix("let") {
+        return rest.starts_with(|c: char| c.is_ascii_whitespace());
+    }
+    false
+}
+
 /// Which Axiom dashboard element a tile renders. Variants outside
 /// `Line/Bar/Area/Scatter` are accepted by the parser so files authored
 /// ahead of the implementation produce an "unsupported yet" diagnostic
@@ -184,35 +266,42 @@ pub enum Query {
 
 /// Extract the executable query string from an Axiom `Chart`.
 ///
-/// Discrimination strategy: **chart kind, not parser**. Earlier
-/// revisions ran `mpl_lang::compile` on the text and inferred the
-/// language from the parser's verdict. That doesn't work in
-/// practice — the local `mpl_lang` crate's grammar and stdlib are
-/// subsets of what the Axiom server accepts, so valid real-world
-/// MPL (queries that work fine on the server) routinely failed the
-/// local check, flipped to `Query::Apl`, and rendered as the
-/// "not yet executable" banner with no data. Picking by chart kind
-/// dodges that drift entirely.
+/// Discrimination strategy: **sidecar marker, then chart kind**.
+/// Earlier revisions ran `mpl_lang::compile` on the text and
+/// inferred the language from the parser's verdict. That doesn't
+/// work in practice — the local `mpl_lang` crate's grammar and
+/// stdlib are subsets of what the Axiom server accepts, so valid
+/// real-world MPL routinely failed the local check, flipped to
+/// `Query::Apl`, and rendered as the "not yet executable" banner
+/// with no data. The sidecar lets mcu-authored tiles claim a
+/// language explicitly; everything else falls through to the
+/// kind-based rules.
 ///
-/// Rules:
-///   1. Explicit `mpl` key wins (set by local edits in
-///      [`crate::app::App::sync_buffer_to_focused_tile`] to keep
-///      the local model classifier-free).
-///   2. `apl` key on a `LogStream` chart → `Query::Apl`. LogStream
+/// Rules (in order):
+///   1. `chart.extras["mcuLang"] == "apl"` → `Query::Apl` (mcu wrote
+///      this tile and stamped its language).
+///   2. `chart.extras["mcuLang"] == "mpl"` → `Query::Mpl`.
+///   3. Explicit `mpl` key on the query object → `Query::Mpl`.
+///      Set by local edits in
+///      [`crate::app::App::sync_buffer_to_focused_tile`] for MPL
+///      tiles authored before sidecars existed; still honoured for
+///      round-trip stability.
+///   4. `apl` key on a `LogStream` chart → `Query::Apl`. LogStream
 ///      is genuinely APL on the Axiom side.
-///   3. `apl` key on any other chart kind (or `Chart::Unknown`)
+///   5. `apl` key on any other chart kind (or `Chart::Unknown`)
 ///      → `Query::Mpl`. Metrics chart kinds (TimeSeries,
 ///      Statistic, TopK, Heatmap, Pie, Scatter, Table, Note) ship
-///      with MPL queries.
-///   4. No query → `Query::Empty`.
+///      with MPL queries by default in the Axiom UI.
+///   6. No query → `Query::Empty`.
 ///
-/// Trade-off: a `TimeSeries` chart whose user genuinely wrote APL
-/// will now be dispatched to the MPL endpoint and fail with a
-/// server-side error in `tile_results.error`. That's strictly
-/// better than the previous behaviour, where the local classifier
-/// also returned APL but the fetcher then refused to dispatch the
-/// query at all — the user saw "APL (not yet executable)" with no
-/// hint of what was actually wrong.
+/// Trade-off for rule 5: a foreign-authored `TimeSeries` chart with
+/// genuine APL (no sidecar) will be dispatched to the MPL endpoint
+/// and surface a server-side error in `tile_results.error`. That's
+/// strictly better than the previous behaviour where the local
+/// classifier also returned APL but the fetcher refused to dispatch
+/// at all — the user saw "APL (not yet executable)" with no hint of
+/// what was actually wrong. To flip a foreign tile to APL
+/// explicitly, run `:apl` once and the sidecar takes over.
 pub fn extract_query(chart: &Chart) -> Query {
     use crate::axiom::KnownChart;
     let Some(base) = chart.base() else {
@@ -222,19 +311,50 @@ pub fn extract_query(chart: &Chart) -> Query {
         Some(v) => v,
         None => return Query::Empty,
     };
-    // Explicit `mpl` key wins. Used by local edits so
-    // `sync_buffer_to_focused_tile` round-trips don't depend on any
-    // classifier behaviour.
+    // The sidecar wins outright when it pins the language. Pull the
+    // text from whichever key carries it; allow either so a tile that
+    // was MPL yesterday and got `:apl`-flipped today still reads
+    // cleanly even before the next save normalises the keys.
+    let pick_text = |obj: &serde_json::Value| -> Option<String> {
+        if let Some(v) = obj.get("mpl").and_then(|v| v.as_str()) {
+            return Some(v.to_string());
+        }
+        if let Some(v) = obj.get("apl").and_then(|v| v.as_str()) {
+            return Some(v.to_string());
+        }
+        None
+    };
+    match lang_from_sidecar(chart) {
+        Some(Lang::Apl) => return pick_text(q).map(Query::Apl).unwrap_or(Query::Empty),
+        Some(Lang::Mpl) => return pick_text(q).map(Query::Mpl).unwrap_or(Query::Empty),
+        None => {}
+    }
+    // No sidecar: kind-based fallback (the historical behaviour),
+    // plus a narrow syntax sniff to catch foreign-authored APL on
+    // non-LogStream chart kinds (the Axiom web UI lets users write
+    // APL on a TimeSeries/Pie/etc. chart; those have no sidecar so
+    // chart-kind alone would mis-classify them as MPL).
     if let Some(mpl) = q.get("mpl").and_then(|v| v.as_str()) {
         return Query::Mpl(mpl.to_string());
     }
     if let Some(text) = q.get("apl").and_then(|v| v.as_str()) {
         return match chart {
             Chart::Known(KnownChart::LogStream(_)) => Query::Apl(text.to_string()),
+            _ if looks_like_apl(text) => Query::Apl(text.to_string()),
             _ => Query::Mpl(text.to_string()),
         };
     }
     Query::Empty
+}
+
+/// The language a chart's query is in. Convenience wrapper around
+/// [`extract_query`] when the caller only needs the discriminator.
+pub fn extract_lang(chart: &Chart) -> Option<Lang> {
+    match extract_query(chart) {
+        Query::Mpl(_) => Some(Lang::Mpl),
+        Query::Apl(_) => Some(Lang::Apl),
+        Query::Empty => None,
+    }
 }
 
 /// Convert the local-canonical query form into the wire form the v2
@@ -254,6 +374,16 @@ pub fn normalize_queries_to_wire(doc: &mut crate::axiom::DashboardDocument) {
         let Some(base) = chart.base_mut() else {
             continue;
         };
+        // `extras` is `#[serde(flatten)]`, so any key here serializes
+        // as a top-level field on the chart object. The Axiom server
+        // PUT endpoint rejects unknown chart fields with a schema
+        // error, so the language sidecar — a local-only marker —
+        // must not leave the process. It's restored automatically on
+        // reload via the layered classifier (sidecar would come back,
+        // but in its absence the syntax sniff + chart-kind fallback
+        // cover the common cases).
+        base.extras.remove(LANG_SIDECAR_KEY);
+
         let Some(query) = base.query.as_mut() else {
             continue;
         };

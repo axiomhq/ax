@@ -351,6 +351,26 @@ pub fn resolve_unit(
 /// configure for the `_v1_datasets` endpoint in `axiom.rs`.
 const QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Execute an APL query through the control-plane client, with the
+/// same wall-clock cap as [`run_query_task`]. No dataset / edge
+/// resolution — APL routes through
+/// `POST {base}/v1/datasets/_apl` and Axiom dispatches across
+/// edges server-side.
+pub(super) async fn run_apl_query_task(
+    client: &AxiomClient,
+    apl: &str,
+    start: &str,
+    end: &str,
+) -> anyhow::Result<crate::axiom::AplQueryResult> {
+    match tokio::time::timeout(QUERY_TIMEOUT, client.query_apl(apl, start, end)).await {
+        Ok(r) => r,
+        Err(_) => Err(anyhow::anyhow!(
+            "APL query timed out after {}s",
+            QUERY_TIMEOUT.as_secs()
+        )),
+    }
+}
+
 pub(super) async fn run_query_task(
     cache: &Arc<RwLock<Cache>>,
     client: &AxiomClient,

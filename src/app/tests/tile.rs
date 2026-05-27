@@ -170,6 +170,7 @@ fn tile_ops_insert_and_delete_round_trip() {
         &mut charts,
         &mut layout,
         crate::dashboard::VizKind::TopList,
+        crate::dashboard::Lang::Mpl,
         "top errors",
     );
     assert_eq!(charts.len(), 1);
