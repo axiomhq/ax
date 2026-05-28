@@ -186,8 +186,7 @@ impl App {
         }
         let len = self.quickfix.actions.len();
         let i = self.quickfix.selected as isize + delta;
-        let wrapped = ((i % len as isize) + len as isize) % len as isize;
-        self.quickfix.selected = wrapped as usize;
+        self.quickfix.selected = crate::util::wrap_index(i, len);
     }
 
     pub(super) fn accept_quickfix(&mut self) {
@@ -235,8 +234,7 @@ impl App {
         }
         let len = self.completions.items.len();
         let i = self.completions.selected as isize + delta;
-        let wrapped = ((i % len as isize) + len as isize) % len as isize;
-        self.completions.selected = wrapped as usize;
+        self.completions.selected = crate::util::wrap_index(i, len);
     }
 
     pub(super) fn accept_completion(&mut self) {

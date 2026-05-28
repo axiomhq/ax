@@ -152,9 +152,10 @@ pub struct TileQueryResult {
     /// when the result lands. Use `Instant` (not wall clock) so the
     /// elapsed value can't go negative if the system clock jumps.
     pub started_at: Option<std::time::Instant>,
-    /// Wall-clock duration of the most recent completed fetch. Cleared
-    /// while a new fetch is in flight so the tile border doesn't
-    /// display a stale time over a spinner.
+    /// Elapsed duration of the most recent completed fetch, measured
+    /// monotonically as `Instant::now() - started_at` (not wall clock).
+    /// Cleared while a new fetch is in flight so the tile border
+    /// doesn't display a stale time over a spinner.
     pub elapsed: Option<std::time::Duration>,
     /// OTEL/UCUM unit resolved for this tile's series. Set when the
     /// fetch lands, via the three-tier discovery in
@@ -481,14 +482,10 @@ impl TraceFetchWindow {
     }
 
     /// Short human-readable label used in status-bar messages
-    /// (`searching now-7d…`).
+    /// (`searching now-7d…`). Identical to the relative-start
+    /// expression today, so it just forwards.
     pub fn label(self) -> &'static str {
-        match self {
-            Self::Hour => "now-1h",
-            Self::Day => "now-24h",
-            Self::Week => "now-7d",
-            Self::Month => "now-30d",
-        }
+        self.as_relative_start()
     }
 
     /// Next wider window in the ladder, or `None` when we've

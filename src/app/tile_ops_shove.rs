@@ -256,7 +256,10 @@ fn layout_max_y(layout: &[LayoutItem]) -> u32 {
     layout.iter().map(|l| y_of(l) + l.h).max().unwrap_or(0)
 }
 
-fn rects_overlap(a: &LayoutItem, b: &LayoutItem) -> bool {
+/// AABB overlap test for two grid tiles. Shared with
+/// [`crate::app::tile_layout`]'s `overlaps_any` so the rectangle math
+/// lives in exactly one place.
+pub(crate) fn rects_overlap(a: &LayoutItem, b: &LayoutItem) -> bool {
     let (ax1, ay1) = (a.x, y_of(a));
     let (ax2, ay2) = (ax1 + a.w, ay1 + a.h);
     let (bx1, by1) = (b.x, y_of(b));

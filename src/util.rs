@@ -14,9 +14,31 @@ pub fn take_chars(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
+/// Euclidean wrap-around for cyclic selection: maps any (possibly
+/// negative) index into `0..len`, wrapping at both ends. Returns 0
+/// when `len == 0`. Replaces the open-coded `((i % n) + n) % n`
+/// idiom used by the completion / picker movers.
+pub fn wrap_index(i: isize, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let len = len as isize;
+    (((i % len) + len) % len) as usize
+}
+
 #[cfg(test)]
 mod tests {
-    use super::take_chars;
+    use super::{take_chars, wrap_index};
+
+    #[test]
+    fn wrap_index_cycles_both_directions() {
+        assert_eq!(wrap_index(0, 3), 0);
+        assert_eq!(wrap_index(3, 3), 0);
+        assert_eq!(wrap_index(-1, 3), 2);
+        assert_eq!(wrap_index(4, 3), 1);
+        assert_eq!(wrap_index(-4, 3), 2);
+        assert_eq!(wrap_index(5, 0), 0); // empty → 0, no panic
+    }
 
     #[test]
     fn take_chars_ascii() {

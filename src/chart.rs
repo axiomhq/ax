@@ -62,7 +62,7 @@ impl Bounds {
         }
     }
 
-    pub fn from_series(series: &[Series]) -> Self {
+    pub fn from_series<'a>(series: impl IntoIterator<Item = &'a Series>) -> Self {
         let mut x_min = f64::INFINITY;
         let mut x_max = f64::NEG_INFINITY;
         let mut y_min = f64::INFINITY;
@@ -267,9 +267,9 @@ pub fn draw_graph(
     }
 
     // Bounds only consider visible series so the y-axis isn't dragged by
-    // a hidden outlier.
-    let visible_series: Vec<Series> = visible.iter().map(|(_, s)| (*s).clone()).collect();
-    let bounds = Bounds::from_series(&visible_series);
+    // a hidden outlier. Borrow the series — no need to clone every
+    // visible series (and all its points) just to scan for min/max.
+    let bounds = Bounds::from_series(visible.iter().map(|(_, s)| *s));
     // ratatui's `Chart` paints datasets in order; later datasets win on
     // overlap. Render non-selected first so the selected series visibly
     // sits on top of the dimmed background.

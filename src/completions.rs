@@ -255,8 +255,14 @@ fn filter_by_partial(pool: Vec<String>, partial: &str) -> Vec<String> {
         return pool;
     }
     let needle = partial.to_ascii_lowercase();
+    let nb = needle.as_bytes();
     pool.into_iter()
-        .filter(|s| s.to_ascii_lowercase().starts_with(&needle))
+        .filter(|s| {
+            // ASCII case-insensitive prefix without allocating a
+            // lowercased String per candidate (this runs per keystroke).
+            let sb = s.as_bytes();
+            sb.len() >= nb.len() && sb[..nb.len()].eq_ignore_ascii_case(nb)
+        })
         .collect()
 }
 

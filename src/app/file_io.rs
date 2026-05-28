@@ -84,7 +84,9 @@ impl App {
     ///   edits a dashboard's structure through `:dash`-prefixed
     ///   commands.
     ///
-    /// Writes go through a `<path>.tmp` → rename dance so a crash
+    /// Writes go through a uniquely-named temp file in the target's
+    /// directory followed by an atomic rename (see
+    /// [`crate::util::atomic::atomic_write_text`]) so a crash
     /// mid-write doesn't truncate the previous good copy.
     pub fn write_file(
         &mut self,
@@ -98,12 +100,6 @@ impl App {
                 .clone()
                 .ok_or_else(|| anyhow!("E32: No file name"))?,
         };
-        if let Some(parent) = target.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", display_path(parent)))?;
-        }
         let text = match self.buffer_mode {
             BufferMode::Mpl => self.query_text(),
             BufferMode::Dashboard => {
@@ -114,24 +110,12 @@ impl App {
                 serde_json::to_string_pretty(resource).context("serialising dashboard JSON")?
             }
         };
-        // Atomic write: a uniquely-named temp file in the target's
-        // directory followed by `persist` (which is a same-filesystem
-        // rename, atomic on POSIX). Survives concurrent writers and
-        // partial-write crashes — the file on disk is either the old
-        // contents or the fully-flushed new contents.
-        use std::io::Write;
-        let parent = target
-            .parent()
-            .ok_or_else(|| anyhow!("target has no parent directory"))?;
-        let mut tmp = tempfile::NamedTempFile::new_in(parent)
-            .with_context(|| format!("creating temp file in {}", display_path(parent)))?;
-        tmp.write_all(text.as_bytes())
-            .with_context(|| format!("writing {}", display_path(tmp.path())))?;
-        tmp.as_file()
-            .sync_all()
-            .with_context(|| format!("flushing {}", display_path(tmp.path())))?;
-        tmp.persist(&target)
-            .with_context(|| format!("renaming temp file into {}", display_path(&target)))?;
+        // Atomic write via the shared helper (temp file in the target's
+        // directory, fsync, rename — atomic on POSIX; survives
+        // concurrent writers and partial-write crashes). It also
+        // creates parent dirs as needed.
+        crate::util::atomic::atomic_write_text(&target, &text)
+            .with_context(|| format!("writing {}", display_path(&target)))?;
         self.saved_buffer = text;
         self.current_file = Some(target.clone());
         if self.buffer_mode == BufferMode::Dashboard {

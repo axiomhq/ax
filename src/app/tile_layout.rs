@@ -105,16 +105,9 @@ pub(crate) mod tile_ops {
     /// **not** `ignore_id`. Two rectangles overlap when they share at
     /// least one cell in both axes.
     pub fn overlaps_any(candidate: &LayoutItem, layout: &[LayoutItem], ignore_id: &str) -> bool {
-        let (ax1, ay1) = (candidate.x, candidate.y.unwrap_or(0));
-        let (ax2, ay2) = (ax1 + candidate.w, ay1 + candidate.h);
-        layout.iter().any(|l| {
-            if l.i == ignore_id {
-                return false;
-            }
-            let (bx1, by1) = (l.x, l.y.unwrap_or(0));
-            let (bx2, by2) = (bx1 + l.w, by1 + l.h);
-            ax1 < bx2 && ax2 > bx1 && ay1 < by2 && ay2 > by1
-        })
+        layout
+            .iter()
+            .any(|l| l.i != ignore_id && crate::app::tile_ops_shove::rects_overlap(candidate, l))
     }
 
     /// Translate the tile `chart_id` by `(dx, dy)` virtual-grid cells.

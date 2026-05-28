@@ -121,7 +121,9 @@ impl App {
             "ds" | "datasets" => self.fetch_datasets(),
             "m" | "metrics" => self.fetch_metrics_for_current_query(),
             "refresh" => {
-                // Refresh both discovery layers and re-run the current query.
+                // Re-fetch the dataset list (discovery layer 1). Metric
+                // discovery refreshes lazily per query; this does not
+                // re-run the current query.
                 self.fetch_datasets();
             }
             "help" | "h" => self.open_help(),

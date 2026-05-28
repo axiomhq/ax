@@ -526,27 +526,29 @@ impl App {
         for lc in c.to_lowercase() {
             view.filter.push(lc);
         }
-        let q = view.filter.clone();
-        // Snapshot the prior matches and blobs before re-borrowing.
-        let prior = view.filter_matches.clone();
-        let blobs = view.search_blobs.clone().unwrap_or_default();
-        let new_matches: Vec<usize> = match prior {
-            Some(prev) => prev
-                .into_iter()
-                .filter(|&i| {
-                    blobs
-                        .get(i)
-                        .map(|b| span_matches_query(b, &q))
-                        .unwrap_or(false)
-                })
-                .collect(),
-            None => (0..blobs.len())
-                .filter(|&i| span_matches_query(&blobs[i], &q))
-                .collect(),
+        // Borrow the cached blobs / prior matches instead of cloning
+        // the whole Vec<String> on every keystroke. The block ends all
+        // immutable field borrows before we write `filter_matches`.
+        let new_matches: Vec<usize> = {
+            let q = &view.filter;
+            let blobs = view.search_blobs.as_deref().unwrap_or(&[]);
+            match &view.filter_matches {
+                Some(prev) => prev
+                    .iter()
+                    .copied()
+                    .filter(|&i| {
+                        blobs
+                            .get(i)
+                            .map(|b| span_matches_query(b, q))
+                            .unwrap_or(false)
+                    })
+                    .collect(),
+                None => (0..blobs.len())
+                    .filter(|&i| span_matches_query(&blobs[i], q))
+                    .collect(),
+            }
         };
-        if let Some(view) = self.trace_view.as_mut() {
-            view.filter_matches = Some(new_matches);
-        }
+        view.filter_matches = Some(new_matches);
     }
 
     /// Full rescan against every span. Used by Backspace and
@@ -554,13 +556,13 @@ impl App {
     /// reopened without a cached match set.
     fn refilter_full(&mut self, q: &str) {
         let view = self.trace_view.as_mut().expect("guarded by caller");
-        let blobs = view.search_blobs.clone().unwrap_or_default();
-        let matches: Vec<usize> = (0..blobs.len())
-            .filter(|&i| span_matches_query(&blobs[i], q))
-            .collect();
-        if let Some(view) = self.trace_view.as_mut() {
-            view.filter_matches = Some(matches);
-        }
+        let matches: Vec<usize> = {
+            let blobs = view.search_blobs.as_deref().unwrap_or(&[]);
+            (0..blobs.len())
+                .filter(|&i| span_matches_query(&blobs[i], q))
+                .collect()
+        };
+        view.filter_matches = Some(matches);
     }
 
     // ============================================================
