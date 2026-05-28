@@ -218,3 +218,4 @@ mod params;
 mod query;
 mod tile;
 mod time;
+mod trace;

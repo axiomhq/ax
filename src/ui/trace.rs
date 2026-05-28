@@ -1,0 +1,953 @@
+//! Trace view renderer (`ViewMode::Trace`).
+//!
+//! Step 23: tree + waterfall on the left, span-detail pane on
+//! the right. The body splits 65/35 with a soft 20-column floor
+//! on the detail pane; tighter terminals collapse to "tree only"
+//! to avoid rendering a vestigial 5-column detail strip.
+//!
+//! ## Layout
+//!
+//! ```text
+//! ┌──────────────────────────────────────┬──────────────────────────────┐
+//! │ trace 7ab6afba… · /POST checkout …   │ identity                     │
+//! ├──────────────────────────────────────┤   trace_id  7ab6afba…        │
+//! │ ▸ [api]    http.handle ████  130ms   │   span_id   89f0…            │
+//! │   ▸ [db]   query.exec   ▌▌    52ms   │   …                          │
+//! └──────────────────────────────────────┴──────────────────────────────┘
+//! ```
+//!
+//! ## Virtualization
+//!
+//! Both panes virtualize: the tree iterates only rows in
+//! `[scroll, scroll + body_h)`, and the detail pane materialises
+//! section lines lazily — long attribute / event maps don't pay
+//! a render cost for rows that scroll off-screen. The 1,498-span
+//! production fixture renders cleanly inside the same per-frame
+//! budget as the 47-span fixture.
+
+use ratatui::{
+    Frame,
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Paragraph},
+};
+use serde_json::Value as Json;
+
+use crate::app::{App, Pane, TraceInputMode, TraceView};
+use crate::trace::{Span as TraceSpan, SpanEvent, TreeRow};
+
+// Body split: 65% tree, remainder detail; floor 20 cols on detail.
+const DETAIL_MIN_COLS: u16 = 20;
+const TREE_DEFAULT_PCT: u16 = 65;
+const DUR_COL_WIDTH: u16 = 9;
+const BAR_COL_WIDTH: u16 = 18;
+
+/// Entry point — called by `src/ui/mod.rs` when
+/// `app.view_mode == ViewMode::Trace`.
+pub fn draw_trace(f: &mut Frame, app: &mut App, area: Rect) {
+    let Some(_) = app.trace_view.as_ref() else {
+        let line = Paragraph::new(Line::from(Span::styled(
+            "loading trace…",
+            Style::default().fg(Color::DarkGray),
+        )));
+        f.render_widget(line, area);
+        return;
+    };
+
+    // ---- Header (1 row + 1-row separator) ----------------------------
+    let header_h: u16 = 1;
+    let sep_h: u16 = 1;
+    let header_rect = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: header_h.min(area.height),
+    };
+    {
+        let view = app.trace_view.as_ref().expect("checked above");
+        f.render_widget(Paragraph::new(build_header(view)), header_rect);
+    }
+    if area.height > header_h {
+        let sep_rect = Rect {
+            x: area.x,
+            y: area.y + header_h,
+            width: area.width,
+            height: sep_h,
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "─".repeat(area.width as usize),
+                Style::default().fg(Color::DarkGray),
+            ))),
+            sep_rect,
+        );
+    }
+
+    // ---- Body split ---------------------------------------------------
+    let body_h = area.height.saturating_sub(header_h + sep_h);
+    if body_h == 0 {
+        return;
+    }
+    let body_rect = Rect {
+        x: area.x,
+        y: area.y + header_h + sep_h,
+        width: area.width,
+        height: body_h,
+    };
+    let detail_visible = area.width >= DETAIL_MIN_COLS * 2;
+    let (tree_rect, detail_rect_opt) = if detail_visible {
+        let split = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(TREE_DEFAULT_PCT),
+                Constraint::Min(DETAIL_MIN_COLS),
+            ])
+            .split(body_rect);
+        (split[0], Some(split[1]))
+    } else {
+        (body_rect, None)
+    };
+
+    draw_tree(f, app, tree_rect);
+    if let Some(detail_rect) = detail_rect_opt {
+        draw_detail(f, app, detail_rect);
+    }
+
+    // Stash heights so the keymap's half-page math is exact next
+    // frame. Use the inner rect (post-border) for the detail pane.
+    app.last_trace_body_height = tree_rect.height;
+    app.last_trace_detail_height = detail_rect_opt
+        .map(|r| r.height.saturating_sub(2))
+        .unwrap_or(0);
+}
+
+// ============================================================
+//                          Header
+// ============================================================
+
+fn build_header(view: &TraceView) -> Line<'static> {
+    let trace_id = short_id(&view.model.trace_id);
+    let root_label = view
+        .model
+        .roots
+        .first()
+        .and_then(|&i| view.model.spans.get(i))
+        .map(|s| {
+            format!(
+                "{} [{}]",
+                display_name(&s.name),
+                display_service(&s.service)
+            )
+        })
+        .unwrap_or_else(|| "no root".to_string());
+    let dur = humanize_duration_ns(view.model.duration_ns());
+    let span_count = view.model.spans.len();
+    let err_count = view.model.spans.iter().filter(|s| s.is_error).count();
+    let err_segment = if err_count == 0 {
+        String::new()
+    } else {
+        format!("  ·  {err_count} err")
+    };
+    let mut parts: Vec<Span<'static>> = vec![
+        Span::styled(
+            format!("trace {trace_id}"),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  ·  "),
+        Span::styled(root_label, Style::default().fg(Color::White)),
+        Span::raw("  ·  "),
+        Span::styled(dur, Style::default().fg(Color::LightGreen)),
+        Span::raw("  ·  "),
+        Span::styled(
+            format!("{span_count} spans"),
+            Style::default().fg(Color::Gray),
+        ),
+        Span::styled(err_segment, Style::default().fg(Color::Red)),
+    ];
+    // Filter badge: stays visible after the user commits with
+    // Enter. The keymap clears `filter` on Esc, which makes the
+    // badge disappear next frame.
+    if !view.filter.is_empty() {
+        let match_count = view.filter_matches.as_ref().map(Vec::len).unwrap_or(0);
+        parts.push(Span::raw("  ·  "));
+        parts.push(Span::styled(
+            format!("[/ {}]", view.filter),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::LightYellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+        parts.push(Span::styled(
+            format!(" {match_count} hit"),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    Line::from(parts)
+}
+
+// ============================================================
+//                         Tree pane
+// ============================================================
+
+fn draw_tree(f: &mut Frame, app: &mut App, area: Rect) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+
+    // Filter input prompt steals one row at the bottom of the
+    // pane, vim-style. The rest of the body is the waterfall.
+    let in_filter_input = app
+        .trace_view
+        .as_ref()
+        .map(|v| v.input_mode == TraceInputMode::Filter)
+        .unwrap_or(false);
+    let prompt_h: u16 = if in_filter_input && area.height > 0 {
+        1
+    } else {
+        0
+    };
+    let body_area = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: area.height.saturating_sub(prompt_h),
+    };
+
+    // Compute visible rows + cursor position within them, then
+    // reclamp scroll. `cursor` lives in `model.tree` index space
+    // so its identity survives fold/filter operations — we just
+    // look up its position in the visible set per frame.
+    let visible: Vec<usize> = {
+        let Some(view) = app.trace_view.as_ref() else {
+            return;
+        };
+        if view.model.tree.is_empty() {
+            return;
+        }
+        view.visible_rows()
+    };
+
+    if visible.is_empty() {
+        // Filter hid everything. Draw a placeholder so the user
+        // doesn't think the pane crashed.
+        let line = Paragraph::new(Line::from(vec![
+            Span::styled("no matches", Style::default().fg(Color::DarkGray)),
+            Span::raw("  ("),
+            Span::styled("Esc", Style::default().fg(Color::Yellow)),
+            Span::raw(" clears the filter)"),
+        ]));
+        f.render_widget(line, body_area);
+        if prompt_h > 0 {
+            draw_filter_prompt(
+                f,
+                Rect {
+                    x: area.x,
+                    y: area.y + body_area.height,
+                    width: area.width,
+                    height: prompt_h,
+                },
+                app.trace_view.as_ref().unwrap(),
+            );
+        }
+        return;
+    }
+
+    // Find cursor's position in the visible window; if hidden,
+    // snap to the nearest visible row. Renderer-side fallback for
+    // edge cases the keymap might miss (e.g. filter just cleared
+    // the cursor's row).
+    let (cursor_tree, cursor_vis, scroll) = {
+        let view = app.trace_view.as_ref().expect("checked above");
+        let cursor_tree = view.cursor.min(view.model.tree.len() - 1);
+        let cursor_vis = visible.iter().position(|&i| i == cursor_tree).unwrap_or(0);
+        let body_h = body_area.height as usize;
+        let max_scroll = visible.len().saturating_sub(body_h);
+        let mut scroll = (view.scroll as usize).min(max_scroll);
+        if cursor_vis < scroll {
+            scroll = cursor_vis;
+        } else if body_h > 0 && cursor_vis >= scroll + body_h {
+            scroll = (cursor_vis + 1).saturating_sub(body_h);
+        }
+        (visible[cursor_vis], cursor_vis, scroll)
+    };
+    if let Some(v) = app.trace_view.as_mut() {
+        // Snap-back: if the cursor's original row was hidden, the
+        // tree index we settled on (visible[cursor_vis]) replaces
+        // it so subsequent keystrokes step from a visible row.
+        v.cursor = cursor_tree;
+        v.scroll = scroll as u16;
+    }
+
+    let view = app.trace_view.as_ref().expect("checked above");
+    let model = &view.model;
+    let body_h = body_area.height as usize;
+    let focused_tree = app.focus == Pane::TraceTree;
+    let t0 = model.t0_ns;
+    let t1 = model.t1_ns;
+
+    let visible_end = (scroll + body_h).min(visible.len());
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(body_h);
+    for (vis_idx, &row_idx) in visible.iter().enumerate().take(visible_end).skip(scroll) {
+        let row = model.tree[row_idx];
+        let span = &model.spans[row.span_idx];
+        let selected = vis_idx == cursor_vis;
+        let collapsed = view.collapsed.contains(&row.span_idx) && row.has_children;
+        lines.push(build_tree_row(
+            span,
+            row,
+            collapsed,
+            t0,
+            t1,
+            body_area.width as usize,
+            selected,
+            focused_tree,
+        ));
+    }
+    f.render_widget(Paragraph::new(lines), body_area);
+
+    if prompt_h > 0 {
+        draw_filter_prompt(
+            f,
+            Rect {
+                x: area.x,
+                y: area.y + body_area.height,
+                width: area.width,
+                height: prompt_h,
+            },
+            view,
+        );
+    }
+}
+
+/// One-row vim-style search prompt: `/<query>█`. Yellow on the
+/// `/` so the user knows they're in input mode. The cursor cell
+/// is rendered as a literal `█` (we don't move the terminal
+/// cursor; the trace pane never showed it). `Esc` cancels and
+/// `Enter` commits in the keymap.
+fn draw_filter_prompt(f: &mut Frame, area: Rect, view: &TraceView) {
+    let line = Line::from(vec![
+        Span::styled("/", Style::default().fg(Color::Yellow)),
+        Span::raw(view.filter.clone()),
+        Span::styled(
+            "█",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::SLOW_BLINK),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(line), area);
+}
+
+/// Compose one span row:
+/// `<indent>▸ [<svc>] <name>  <bar>  <duration>`
+///
+/// Layout reservations (right-to-left, in cells):
+/// * `DUR_COL_WIDTH` for the duration column.
+/// * `BAR_COL_WIDTH` for the waterfall bar.
+/// * Remainder for indent + marker + service tag + name.
+#[allow(clippy::too_many_arguments)]
+fn build_tree_row(
+    span: &TraceSpan,
+    row: TreeRow,
+    collapsed: bool,
+    t0: i64,
+    t1: i64,
+    width: usize,
+    selected: bool,
+    focused: bool,
+) -> Line<'static> {
+    let indent = "  ".repeat(row.depth as usize);
+    // Marker semantics:
+    //   ⚠   orphan (takes precedence — most important signal)
+    //   ▾   collapsed parent (fold closed)
+    //   ▸   expanded parent (fold open)
+    //   ·   leaf (no children)
+    let marker = if row.is_orphan {
+        "⚠ "
+    } else if row.has_children {
+        if collapsed { "▾ " } else { "▸ " }
+    } else {
+        "· "
+    };
+    let service = display_service(&span.service);
+    let name = display_name(&span.name);
+
+    let label_text = format!("{indent}{marker}[{service}] {name}");
+    let dur_text = humanize_duration_ns(span.duration_ns);
+
+    // Cell budget for the label segment.
+    let reserved = DUR_COL_WIDTH as usize + BAR_COL_WIDTH as usize + 2; // 2 spaces between cols
+    let label_budget = width.saturating_sub(reserved);
+    let label_display = truncate_for_display(&label_text, label_budget);
+    let label_pad = label_budget.saturating_sub(visual_width(&label_display));
+
+    // Bar geometry: project the span onto BAR_COL_WIDTH cells.
+    let (bar_off, bar_w) = bar_extent(span.start_ns, span.end_ns, t0, t1, BAR_COL_WIDTH);
+    let bar_string = render_bar(bar_off, bar_w, BAR_COL_WIDTH);
+
+    // Style resolution.
+    let row_style = if selected && focused {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else if selected {
+        // Focus is elsewhere (detail pane) but show a dim marker.
+        Style::default().add_modifier(Modifier::REVERSED | Modifier::DIM)
+    } else if span.is_error {
+        Style::default().fg(Color::Red)
+    } else if row.is_orphan {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::DIM)
+    } else {
+        Style::default()
+    };
+    // Bar colour: red on error, palette-hashed on service otherwise.
+    let bar_colour = if span.is_error {
+        Color::Red
+    } else {
+        service_colour(&span.service)
+    };
+
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(5);
+    spans.push(Span::styled(
+        format!("{label_display}{}", " ".repeat(label_pad)),
+        row_style,
+    ));
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(
+        bar_string,
+        Style::default().fg(bar_colour).patch(
+            row_style
+                .bg
+                .map_or(Style::default(), |bg| Style::default().bg(bg)),
+        ),
+    ));
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(
+        format!("{dur_text:>width$}", width = DUR_COL_WIDTH as usize),
+        if selected && focused {
+            row_style
+        } else {
+            Style::default().fg(Color::DarkGray)
+        },
+    ));
+    Line::from(spans)
+}
+
+/// Bar projection. Returns `(col_offset, col_width)` within the
+/// `bar_width`-cell column, with these guarantees:
+///
+/// * Inputs that produce a non-zero pixel width are clamped to
+///   `>= 1` so non-degenerate spans always render *something*.
+/// * Inputs with `total <= 0` (degenerate trace) produce a single
+///   1-cell tick at offset 0.
+/// * `end_ns < start_ns` (skew anomaly) folds to `(0, 0)` —
+///   nothing to render is correct.
+/// * Right-edge overflow (`end_ns > t1`) is clamped to
+///   `bar_width`.
+pub(crate) fn bar_extent(
+    start_ns: i64,
+    end_ns: i64,
+    t0: i64,
+    t1: i64,
+    bar_width: u16,
+) -> (u16, u16) {
+    if bar_width == 0 || end_ns < start_ns {
+        return (0, 0);
+    }
+    let total = (t1.saturating_sub(t0)).max(0);
+    if total == 0 {
+        // Degenerate trace duration — render a tick mark at 0.
+        return (0, 1);
+    }
+    let bw = bar_width as f64;
+    let s_rel = (start_ns.saturating_sub(t0)).max(0) as f64;
+    let e_rel = (end_ns.saturating_sub(t0)).max(0) as f64;
+    let total_f = total as f64;
+    let off = (s_rel / total_f * bw).floor() as i64;
+    let end = (e_rel / total_f * bw).ceil() as i64;
+    let off = off.clamp(0, bar_width as i64) as u16;
+    let end_c = end.clamp(0, bar_width as i64) as u16;
+    let mut w = end_c.saturating_sub(off);
+    if w == 0 && off < bar_width {
+        // Sub-cell width — give the row a 1-cell tick.
+        w = 1;
+    }
+    (off, w)
+}
+
+/// Materialise the bar cells. We use the half-block characters to
+/// hint at sub-cell precision without going full braille (which
+/// renders poorly on many terminal fonts).
+fn render_bar(offset: u16, width: u16, total: u16) -> String {
+    let mut out = String::with_capacity(total as usize);
+    for i in 0..total {
+        if i >= offset && i < offset + width {
+            out.push('█');
+        } else {
+            out.push(' ');
+        }
+    }
+    out
+}
+
+/// Stable colour from `service.name` over a curated palette
+/// (red excluded — reserved for errors). Empty service falls to a
+/// muted grey so unlabelled spans don't visually compete with
+/// real services.
+pub(crate) fn service_colour(service: &str) -> Color {
+    if service.is_empty() {
+        return Color::DarkGray;
+    }
+    // FNV-1a hash — small, deterministic, no extra deps.
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in service.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x00000100000001B3);
+    }
+    SERVICE_PALETTE[(h as usize) % SERVICE_PALETTE.len()]
+}
+
+/// Curated palette: avoids red (errors) and pure white / black
+/// (used by selection / unfocused chrome). Twelve hues give
+/// reasonable spread across typical service-counts in a trace
+/// (most are <8).
+const SERVICE_PALETTE: &[Color] = &[
+    Color::Cyan,
+    Color::LightCyan,
+    Color::Blue,
+    Color::LightBlue,
+    Color::Magenta,
+    Color::LightMagenta,
+    Color::Green,
+    Color::LightGreen,
+    Color::Yellow,
+    Color::LightYellow,
+    Color::Gray,
+    Color::Rgb(180, 120, 60), // amber
+];
+
+// ============================================================
+//                       Detail pane
+// ============================================================
+
+/// Plan a detail-pane row without materialising its text. The
+/// `Section`-by-row planner lets the renderer compute the total
+/// height in O(spans/attrs) and then only build strings for the
+/// visible window — important for spans with hundreds of
+/// attributes. Owned strings so the plan can outlive the borrow
+/// on `App.trace_view`.
+#[derive(Debug)]
+enum DetailRow {
+    SectionHeader(&'static str),
+    /// Plain key/value row. Long values are truncated to viewport
+    /// width minus key column.
+    KV(String, String),
+    /// One event: timestamp + name on the row, attributes follow
+    /// as KV rows.
+    EventHeader(String),
+    /// Blank line between sections.
+    Blank,
+}
+
+fn draw_detail(f: &mut Frame, app: &mut App, area: Rect) {
+    let focused = app.focus == Pane::TraceDetail;
+    let border_style = if focused {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .title(Span::styled(" detail ", Style::default().fg(Color::Gray)));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    // Read the currently-selected span.
+    let (rows, scroll_request) = {
+        let Some(view) = app.trace_view.as_ref() else {
+            return;
+        };
+        let model = &view.model;
+        let cursor = view.cursor.min(model.tree.len().saturating_sub(1));
+        let span_idx = model.tree[cursor].span_idx;
+        let span = &model.spans[span_idx];
+        let rows = plan_detail_rows(model, span);
+        (rows, view.detail_scroll)
+    };
+    let total_lines = rows.len();
+    let visible_h = inner.height as usize;
+    let max_scroll = total_lines.saturating_sub(visible_h) as u16;
+    let scroll = scroll_request.min(max_scroll);
+    if let Some(v) = app.trace_view.as_mut() {
+        v.detail_scroll = scroll;
+    }
+
+    // Materialise only the visible slice.
+    let from = scroll as usize;
+    let to = (from + visible_h).min(total_lines);
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(to - from);
+    for row in &rows[from..to] {
+        lines.push(render_detail_row(row, inner.width as usize));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Build the section descriptors for one span. Returned as a
+/// `Vec<DetailRow>` so the renderer can index by row and skip the
+/// off-screen slice.
+fn plan_detail_rows(model: &crate::trace::TraceModel, span: &TraceSpan) -> Vec<DetailRow> {
+    let mut rows: Vec<DetailRow> = Vec::with_capacity(32);
+
+    // ---- identity ----
+    rows.push(DetailRow::SectionHeader("identity"));
+    rows.push(DetailRow::KV(
+        "trace_id".to_string(),
+        model.trace_id.clone(),
+    ));
+    rows.push(DetailRow::KV("span_id".to_string(), span.span_id.clone()));
+    if let Some(p) = span.parent_span_id.as_deref() {
+        // Look the parent up by id so the row can show its
+        // name alongside the raw span_id — huge UX win for
+        // traces with opaque hex ids. Orphans (parent not in
+        // the loaded trace) fall through to the bare id with
+        // an `(orphan)` marker.
+        let parent_label = match model.by_id.get(p) {
+            Some(&idx) => {
+                let parent_span = &model.spans[idx];
+                format!("{p}  ({})", display_name(&parent_span.name))
+            }
+            None => format!("{p}  (orphan)"),
+        };
+        rows.push(DetailRow::KV("parent".to_string(), parent_label));
+    }
+    rows.push(DetailRow::KV("name".to_string(), display_name(&span.name)));
+    rows.push(DetailRow::KV(
+        "kind".to_string(),
+        span.kind.as_str().to_string(),
+    ));
+    rows.push(DetailRow::Blank);
+
+    // ---- timing ----
+    rows.push(DetailRow::SectionHeader("timing"));
+    let start_rel = span.start_ns.saturating_sub(model.t0_ns);
+    let trace_dur = model.duration_ns().max(1);
+    let pct = (span.duration_ns as f64 / trace_dur as f64 * 100.0).clamp(0.0, 999.9);
+    rows.push(DetailRow::KV(
+        "start".to_string(),
+        format!("+{}", humanize_duration_ns(start_rel)),
+    ));
+    rows.push(DetailRow::KV(
+        "duration".to_string(),
+        format!("{} ({:.1}%)", humanize_duration_ns(span.duration_ns), pct),
+    ));
+    rows.push(DetailRow::Blank);
+
+    // ---- status ----
+    rows.push(DetailRow::SectionHeader("status"));
+    let status_text = match span.status_code.as_deref() {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => {
+            if span.is_error {
+                "ERROR".to_string()
+            } else {
+                "OK".to_string()
+            }
+        }
+    };
+    rows.push(DetailRow::KV("code".to_string(), status_text));
+    if span.is_error {
+        rows.push(DetailRow::KV("error".to_string(), "true".to_string()));
+    }
+    rows.push(DetailRow::Blank);
+
+    // ---- service / resource ----
+    rows.push(DetailRow::SectionHeader("service"));
+    rows.push(DetailRow::KV(
+        "service.name".to_string(),
+        display_service(&span.service),
+    ));
+    for (k, v) in span.resource.iter() {
+        if k == "service.name" {
+            continue;
+        }
+        rows.push(DetailRow::KV(k.clone(), render_json(v)));
+    }
+    rows.push(DetailRow::Blank);
+
+    // ---- attributes ----
+    if !span.attributes.is_empty() {
+        rows.push(DetailRow::SectionHeader("attributes"));
+        for (k, v) in span.attributes.iter() {
+            rows.push(DetailRow::KV(k.clone(), render_json(v)));
+        }
+        rows.push(DetailRow::Blank);
+    }
+
+    // ---- events ----
+    if !span.events.is_empty() {
+        rows.push(DetailRow::SectionHeader("events"));
+        for ev in &span.events {
+            rows.push(DetailRow::EventHeader(format_event_header(ev, model.t0_ns)));
+            for (k, v) in &ev.attributes {
+                rows.push(DetailRow::KV(k.clone(), render_json(v)));
+            }
+        }
+    }
+    rows
+}
+
+fn render_detail_row(row: &DetailRow, width: usize) -> Line<'static> {
+    match row {
+        DetailRow::SectionHeader(name) => Line::from(Span::styled(
+            (*name).to_string(),
+            Style::default()
+                .fg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        DetailRow::KV(k, v) => {
+            // Key column: 14 chars, right-padded; value truncated
+            // to remaining width.
+            let key_w = 14usize;
+            let key = truncate_for_display(k, key_w);
+            let key_pad = key_w.saturating_sub(visual_width(&key));
+            let value_budget = width.saturating_sub(key_w + 1);
+            let value = truncate_for_display(v, value_budget);
+            Line::from(vec![
+                Span::styled(
+                    format!("{key}{} ", " ".repeat(key_pad)),
+                    Style::default().fg(Color::Gray),
+                ),
+                Span::raw(value),
+            ])
+        }
+        DetailRow::EventHeader(text) => Line::from(Span::styled(
+            truncate_for_display(text, width),
+            Style::default().fg(Color::LightYellow),
+        )),
+        DetailRow::Blank => Line::from(Span::raw("")),
+    }
+}
+
+fn format_event_header(ev: &SpanEvent, t0_ns: i64) -> String {
+    let rel = ev.time_ns.saturating_sub(t0_ns);
+    format!("• +{}  {}", humanize_duration_ns(rel), ev.name)
+}
+
+/// Render a `serde_json::Value` for inline display. Strings are
+/// shown unquoted (they're the common case); numbers, booleans,
+/// nulls round-trip via `Display`; arrays / objects compact via
+/// `serde_json::to_string`.
+fn render_json(v: &Json) -> String {
+    match v {
+        Json::String(s) => s.clone(),
+        Json::Null => "null".to_string(),
+        Json::Bool(b) => b.to_string(),
+        Json::Number(n) => n.to_string(),
+        Json::Array(_) | Json::Object(_) => serde_json::to_string(v).unwrap_or_default(),
+    }
+}
+
+// ============================================================
+//                         Helpers
+// ============================================================
+
+fn display_name(n: &str) -> String {
+    if n.is_empty() {
+        "(unnamed)".to_string()
+    } else {
+        n.to_string()
+    }
+}
+
+fn display_service(s: &str) -> String {
+    if s.is_empty() {
+        "?".to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+fn visual_width(s: &str) -> usize {
+    s.chars().count()
+}
+
+fn truncate_for_display(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let cut = max.saturating_sub(1);
+    let mut out: String = s.chars().take(cut).collect();
+    out.push('…');
+    out
+}
+
+/// Format a nanosecond duration in the largest unit ≥1.0. Returns
+/// `0ns` for zero / negative input.
+pub(crate) fn humanize_duration_ns(ns: i64) -> String {
+    if ns <= 0 {
+        return "0ns".to_string();
+    }
+    let ns = ns as f64;
+    if ns >= 1e9 {
+        format!("{:.2}s", ns / 1e9)
+    } else if ns >= 1e6 {
+        format!("{:.2}ms", ns / 1e6)
+    } else if ns >= 1e3 {
+        format!("{:.2}µs", ns / 1e3)
+    } else {
+        format!("{ns:.0}ns")
+    }
+}
+
+fn short_id(id: &str) -> String {
+    if id.len() <= 16 {
+        id.to_string()
+    } else {
+        format!("{}…", &id[..12])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn humanize_picks_largest_unit() {
+        assert_eq!(humanize_duration_ns(0), "0ns");
+        assert_eq!(humanize_duration_ns(-5), "0ns");
+        assert_eq!(humanize_duration_ns(500), "500ns");
+        assert_eq!(humanize_duration_ns(1_500), "1.50µs");
+        assert_eq!(humanize_duration_ns(2_300_000), "2.30ms");
+        assert_eq!(humanize_duration_ns(3_500_000_000), "3.50s");
+    }
+
+    #[test]
+    fn bar_extent_full_span_covers_column() {
+        let (o, w) = bar_extent(0, 100, 0, 100, 20);
+        assert_eq!(o, 0);
+        assert_eq!(w, 20);
+    }
+
+    #[test]
+    fn bar_extent_mid_half() {
+        let (o, w) = bar_extent(25, 75, 0, 100, 20);
+        // 25/100 * 20 = 5; 75/100 * 20 = 15 → width 10.
+        assert_eq!(o, 5);
+        assert_eq!(w, 10);
+    }
+
+    #[test]
+    fn bar_extent_at_t0() {
+        let (o, w) = bar_extent(0, 10, 0, 100, 20);
+        assert_eq!(o, 0);
+        assert!(w >= 1, "non-zero span must produce a visible cell");
+    }
+
+    #[test]
+    fn bar_extent_at_t1() {
+        let (o, w) = bar_extent(90, 100, 0, 100, 20);
+        assert_eq!(o + w, 20, "right edge clamps to bar width");
+    }
+
+    #[test]
+    fn bar_extent_zero_duration_span() {
+        let (o, w) = bar_extent(50, 50, 0, 100, 20);
+        // start == end, but it lies inside the bar → 1-cell tick.
+        assert_eq!(w, 1);
+        assert_eq!(o, 10);
+    }
+
+    #[test]
+    fn bar_extent_sub_cell_width() {
+        // 1ns out of 1e9: pixel width < 1, should round up to 1.
+        let (_, w) = bar_extent(100, 101, 0, 1_000_000_000, 20);
+        assert_eq!(w, 1);
+    }
+
+    #[test]
+    fn bar_extent_degenerate_total() {
+        // t0 == t1 (degenerate trace duration) — single tick.
+        let (o, w) = bar_extent(0, 0, 100, 100, 20);
+        assert_eq!((o, w), (0, 1));
+    }
+
+    #[test]
+    fn bar_extent_zero_bar_width() {
+        // Tiny terminal: no bar column at all.
+        let (o, w) = bar_extent(0, 100, 0, 100, 0);
+        assert_eq!((o, w), (0, 0));
+    }
+
+    #[test]
+    fn bar_extent_inverted_bounds_collapse() {
+        // end_ns < start_ns is anomalous; expect (0, 0).
+        let (o, w) = bar_extent(100, 50, 0, 200, 20);
+        assert_eq!((o, w), (0, 0));
+    }
+
+    #[test]
+    fn bar_extent_overflow_t1_clamps() {
+        // Caller may pass end_ns > t1 from clock skew; helper
+        // trusts t1 as the right edge.
+        let (o, w) = bar_extent(0, 200, 0, 100, 20);
+        assert_eq!(o + w, 20);
+    }
+
+    #[test]
+    fn service_colour_is_deterministic() {
+        let a1 = service_colour("checkout");
+        let a2 = service_colour("checkout");
+        let b1 = service_colour("payments");
+        assert_eq!(a1, a2, "same input must produce same colour");
+        // Probabilistic: different services may collide, but
+        // checkout vs payments must hash to different cells with
+        // a 12-colour palette. If this ever flakes the palette
+        // grew or shrank and the assertion needs to change.
+        assert_ne!(a1, b1);
+    }
+
+    #[test]
+    fn service_colour_never_red() {
+        // Sweep 1000 ASCII names; none should hash to red.
+        for i in 0..1000 {
+            let name = format!("svc-{i}");
+            let c = service_colour(&name);
+            assert_ne!(c, Color::Red, "palette must exclude red ({name})");
+        }
+        // Empty service falls to a muted grey.
+        assert_eq!(service_colour(""), Color::DarkGray);
+    }
+
+    #[test]
+    fn render_bar_only_paints_inside_window() {
+        let s = render_bar(2, 3, 8);
+        assert_eq!(s, "  ███   ");
+    }
+
+    #[test]
+    fn truncate_for_display_handles_short_input() {
+        assert_eq!(truncate_for_display("hi", 10), "hi");
+        assert_eq!(truncate_for_display("", 5), "");
+        assert_eq!(truncate_for_display("hello", 0), "");
+    }
+
+    #[test]
+    fn truncate_for_display_uses_ellipsis_at_max() {
+        let out = truncate_for_display("hello world", 6);
+        assert_eq!(out.chars().count(), 6);
+        assert!(out.ends_with('…'));
+    }
+}

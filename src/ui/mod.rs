@@ -39,6 +39,7 @@ mod popups;
 mod status;
 mod time_picker;
 mod topbar;
+mod trace;
 
 // Re-exported so unit tests in `app::tests` can assert the resolver
 // without rendering a frame.
@@ -165,6 +166,23 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         .split(f.area());
 
     topbar::draw_topbar(f, app, root[0]);
+
+    // Trace view takes over the entire body — no editor / params
+    // / legend chrome. The status bar + topbar still render via
+    // the shared paths below; overlay handling is also unchanged
+    // except that none of the dashboard overlays apply (their
+    // visibility flags don't get set in this view).
+    if app.view_mode == crate::app::ViewMode::Trace {
+        trace::draw_trace(f, app, root[1]);
+        status::draw_status(f, app, root[2]);
+        if let Some(err) = app.last_error.as_deref() {
+            overlays::draw_error_overlay(f, err, root[1]);
+        }
+        if app.help.visible {
+            help::draw_help_modal(f, app.help.scroll, root[1]);
+        }
+        return;
+    }
 
     let bottom_h = capped(
         root[1].height,

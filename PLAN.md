@@ -23,6 +23,13 @@ application fully functional on its own: buildable, runnable, and improved over 
 16. [Step 16 — Monitor list + Note + Spacer](plan/16-monitor-list-note-spacer.md)
 17. [Step 17 — Dashboard file format + load/save](plan/17-dashboard-file-format-and-crud.md)
 18. [Step 18 — Dashboard grid view + tile editing](plan/18-dashboard-grid-layout-and-editing.md)
+19. [Step 19 — Tile auto-shove + vim clipboard](plan/19-tile-shove-and-vim-clipboard.md)
+20. [Step 20 — App-private settings + `:trace` config](plan/20-trace-settings.md)
+21. [Step 21 — Trace data model + APL decoder](plan/21-trace-data-model.md)
+22. [Step 22 — `:trace <id>` fetch + `ViewMode::Trace` skeleton](plan/22-trace-view-skeleton.md)
+23. [Step 23 — Waterfall bars + detail pane + virtualization](plan/23-trace-waterfall-and-detail.md)
+24. [Step 24 — Folds + `/` filter + service jump + yank/inspect](plan/24-trace-interaction-polish.md)
+25. [Step 25 — `:traces ls` picker + per-dataset cache](plan/25-traces-picker.md)
 
 Steps 11–16 add the remaining Axiom dashboard element types (bar / area /
 scatter / statistic / top list / pie / heatmap / table / log stream /
@@ -30,6 +37,16 @@ monitor list / note / spacer) on top of the existing line chart.
 Step 11 also introduces the canonical `Dashboard { tiles }` internal
 model that steps 17 and 18 reuse to load, edit, and save real
 multi-tile Axiom dashboards.
+
+Steps 20–25 add a dedicated trace exploration view (waterfall tree + span
+detail pane) for OTel-style trace datasets. Step 20 lands a new
+app-private settings file (separate from `~/.axiom.toml`) holding
+the default trace dataset + deployment. Steps 21–22 land the data
+model and the `ViewMode::Trace` shell driven by `:trace <id>`. Steps
+23–24 fill in the waterfall renderer, virtualization, folds, and the
+tree-aware `/` filter. Step 25 closes out the v1 with the `:traces
+ls` picker. Sample data the steps target lives at `traces-research/`
+(gitignored; see findings in `findings.md`).
 
 ## Workflow
 

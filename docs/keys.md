@@ -116,6 +116,44 @@ g / G	jump to top / bottom of grid
 :	open the ex-command line (returns to grid on Enter/Esc)
 Esc	back to editor
 
+## Trace view (`:trace <id>`)
+Left pane (tree+waterfall) bindings:
+j / Down	move cursor to next visible span
+k / Up		move cursor to previous visible span
+gg		jump to first visible span
+G		jump to last visible span
+Ctrl-d / Ctrl-u	half-page step down / up
+h / Left	collapse subtree under cursor (▾ marker)
+l / Right	expand subtree under cursor (▸ marker)
+zM		collapse every parent (cursor snaps up to a visible ancestor)
+zR		expand everything
+zv		reveal cursor: uncollapse every ancestor of the selected row
+/		filter prompt (substring, case-insensitive; matches name, service, attributes, resource, events)
+gt / gT		jump to next / previous span on a different service (wraps)
+y		yank selected span as pretty-printed JSON to the editor register
+Tab / Ctrl-w w	swap focus to the detail pane
+Esc / :q	close trace, return to previous view
+:		open the ex-command line
+?		show this help
+
+Filter prompt (after `/`):
+<chars>		append to filter; live-updates the visible tree
+Backspace	shorten by one char
+Enter		commit (filter stays; cursor jumps to first match)
+Esc		cancel and clear the filter
+
+Right pane (span detail) bindings:
+j / Down	scroll one row down
+k / Up		scroll one row up
+gg		top of the detail list
+G		bottom of the detail list
+Ctrl-d / Ctrl-u	half-page scroll down / up
+Tab / Ctrl-w w	swap focus back to the tree
+Esc / :q	close trace, return to previous view
+
+Trace-only ex-commands:
+:span json	open the JSON inspect overlay for the selected span
+
 ## App-wide
 r / Enter	run query
 g a	open quick-fix picker for diagnostic under cursor
@@ -146,6 +184,9 @@ Esc	close popup / return to Normal
 :viz <kind>	switch viz kind for the focused tile
 :ax / :axiom	open the current query in the Axiom web UI
 :trace	report the trace id of the focused panel
+:trace get	echo the persisted trace defaults (dataset/deployment)
+:trace set KEY=VAL	persist a trace default (`dataset`, `deployment`)
+:trace unset KEY	clear a persisted trace default
 :time	open the time-range picker (presets + Custom calendar)
 :time reset	restore the default time range (now-1h → now)
 :time <start> [end]	set start (and end) directly — relative or RFC3339

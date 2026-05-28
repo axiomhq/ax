@@ -7,7 +7,7 @@
 //! method surfaces. Keeping them here lets `mod.rs` shrink to the
 //! parts that *do* depend on `App`'s ~45 fields.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::axiom::{
     AplQueryResult, DashboardSummary, DashboardSummaryExt, DatasetSummary, MetricInfo,
@@ -17,6 +17,7 @@ use crate::chart::Series;
 use crate::completions;
 use crate::dashboard::TimeRange;
 use crate::mpl;
+use crate::trace::TraceModel;
 
 pub enum AppEvent {
     DatasetsFetched(anyhow::Result<Vec<DatasetSummary>>),
@@ -47,6 +48,19 @@ pub enum AppEvent {
     /// reshaped into chart series (e.g. no time column).
     AplQueryFinished {
         id: u64,
+        result: anyhow::Result<AplQueryResult>,
+    },
+    /// Result of a `:trace <id>` fetch (the ladder dispatch in
+    /// `src/app/fetch/trace.rs`). Carries its own monotonically
+    /// increasing `query_id` from `App.trace_query_counter` —
+    /// **independent** of the editor's `last_query_id` so an
+    /// in-flight editor `:r` can't accidentally cancel a trace
+    /// fetch and vice versa. The handler checks
+    /// `pending_trace_fetch.query_id == query_id` to drop
+    /// superseded results (user ran a second `:trace` while the
+    /// first was still searching).
+    TraceFetchFinished {
+        query_id: u64,
         result: anyhow::Result<AplQueryResult>,
     },
     DashboardsFetched(anyhow::Result<Vec<DashboardSummary>>),
@@ -399,18 +413,227 @@ pub enum Pane {
     /// `j/k/g/G/Ctrl-D/Ctrl-U/PgDn/PgUp` move the selection,
     /// `Esc/h/Left` returns to the editor.
     Table,
+    /// Trace span tree pane: focused while `App.view_mode ==
+    /// ViewMode::Trace`. Only enterable when `App.trace_view`
+    /// is `Some` — [`super::App::set_focus`] refuses otherwise.
+    /// Pairs with [`Pane::TraceDetail`] (the right-side detail
+    /// pane); `Tab` swaps between the two.
+    TraceTree,
+    /// Trace detail pane: right-hand column of the trace view
+    /// rendering the selected span's identity / timing / status /
+    /// attributes / events. Same gating as [`Pane::TraceTree`]
+    /// (only enterable when `trace_view.is_some()`). Owns its
+    /// own scroll offset (`TraceView.detail_scroll`).
+    TraceDetail,
 }
 
 /// Where the main visualisation area focuses. `Solo` is the
 /// long-standing single-tile renderer; `Grid` shows all of a loaded
-/// dashboard's charts at once. Solo is the default for fresh sessions
-/// and `.mpl` buffers; loading a multi-chart dashboard auto-switches
-/// to Grid (overridable with `:solo`).
+/// dashboard's charts at once. `Trace` is the indented span-tree
+/// view opened by `:trace <id>` (step 22); the entire body region
+/// is handed to the trace renderer, and editor / params / legend
+/// chrome is hidden.
+///
+/// Solo is the default for fresh sessions and `.mpl` buffers;
+/// loading a multi-chart dashboard auto-switches to Grid
+/// (overridable with `:solo`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ViewMode {
     #[default]
     Solo,
     Grid,
+    /// `:trace <id>` is active. `App.trace_view` carries the
+    /// fetched model; the trace renderer in `src/ui/trace.rs`
+    /// owns the body. Exit via `Esc` or `:q` restores
+    /// `App.trace_view.return_mode` (the [`ViewMode`] active
+    /// when `:trace` was invoked).
+    Trace,
+}
+
+/// Ladder windows walked by the trace fetcher when an earlier,
+/// narrower window came up empty. Ordered narrowest → widest;
+/// [`Self::next`] returns the next wider window or `None` once we
+/// hit `Month`, at which point the fetch surfaces a clean "not
+/// found" error rather than walking further.
+///
+/// The choice of windows (1h / 24h / 7d / 30d) matches both the
+/// `:traces ls` default (step 25) and Axiom's typical trace
+/// retention bracket. 30d is the practical ceiling — most edges
+/// don't keep traces longer than that, and a stale id past 30d is
+/// almost certainly a typo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraceFetchWindow {
+    Hour,
+    Day,
+    Week,
+    Month,
+}
+
+impl TraceFetchWindow {
+    /// Axiom-relative start expression for [`crate::axiom::Client::query_apl`].
+    pub fn as_relative_start(self) -> &'static str {
+        match self {
+            Self::Hour => "now-1h",
+            Self::Day => "now-24h",
+            Self::Week => "now-7d",
+            Self::Month => "now-30d",
+        }
+    }
+
+    /// Short human-readable label used in status-bar messages
+    /// (`searching now-7d…`).
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Hour => "now-1h",
+            Self::Day => "now-24h",
+            Self::Week => "now-7d",
+            Self::Month => "now-30d",
+        }
+    }
+
+    /// Next wider window in the ladder, or `None` when we've
+    /// exhausted the search. Critical that `Month.next()` returns
+    /// `None` — returning `Some(Month)` would loop forever.
+    pub fn next(self) -> Option<Self> {
+        match self {
+            Self::Hour => Some(Self::Day),
+            Self::Day => Some(Self::Week),
+            Self::Week => Some(Self::Month),
+            Self::Month => None,
+        }
+    }
+}
+
+/// In-flight `:trace <id>` ladder state. Set when the dispatch
+/// fires; updated in place each time an empty result bumps the
+/// window; cleared when a non-empty result lands (transition into
+/// [`ViewMode::Trace`]), when the ladder exhausts, or when the
+/// user cancels with `Esc`.
+///
+/// `query_id` is **independent** of `App.last_query_id` — see
+/// [`AppEvent::TraceFetchFinished`] for the rationale.
+#[derive(Debug, Clone)]
+pub struct PendingTraceFetch {
+    pub query_id: u64,
+    pub trace_id: String,
+    pub dataset: String,
+    pub deployment_override: Option<String>,
+    pub window: TraceFetchWindow,
+}
+
+/// Materialised trace view. Built by the
+/// [`AppEvent::TraceFetchFinished`] handler on a non-empty
+/// result, owned by `App.trace_view`, and torn down on `Esc` /
+/// `:q` exit.
+///
+/// `return_mode` is captured at construction time so the user
+/// returns to exactly where they came from — a trace opened
+/// from Grid view returns to Grid; one opened from Solo
+/// returns to Solo.
+#[derive(Debug, Clone)]
+pub struct TraceView {
+    pub model: TraceModel,
+    pub cursor: usize,
+    pub scroll: u16,
+    /// Scroll offset for the right-hand detail pane (in rows
+    /// from the top of the materialised section list). Lives
+    /// on the view (not on `App`) because it's state of *this*
+    /// trace — swapping to a different trace resets it.
+    pub detail_scroll: u16,
+    pub return_mode: ViewMode,
+    /// `span_idx` (into `model.spans`) of every parent the user
+    /// has folded shut with `h` / `zM`. Keyed by span_idx (not
+    /// row index) so a future re-flatten of `model.tree` doesn't
+    /// silently drop the fold state. Empty by default; `zR`
+    /// clears it.
+    pub collapsed: HashSet<usize>,
+    /// Substring query for the `/` filter. Empty string means
+    /// "filter inactive" — the renderer shows the full tree.
+    /// Lowercased at the keymap layer so the per-frame match
+    /// scan is case-insensitive without re-allocating.
+    pub filter: String,
+    /// Modal input state for the trace tree pane. `Normal` runs
+    /// the j/k/h/l keymap; `Filter` routes every printable char
+    /// into `filter`. Toggled by `/` (enter), `Esc` (cancel), and
+    /// `Enter` (commit).
+    pub input_mode: TraceInputMode,
+    /// `z` two-step latch for `zM` / `zR` / `zv`. Same shape as
+    /// `App.table_pending_g` — set true on a bare `z`, consumed
+    /// (or cleared) by the very next keypress.
+    pub pending_z: bool,
+    /// Lazy per-span lowercased "search blob" — one string per
+    /// span (indexed by span_idx) covering name, service, every
+    /// attribute / resource value, and event names + attribute
+    /// values. Built once on first `/` use; reused for every
+    /// subsequent keystroke so the hot loop never re-traverses
+    /// the typed structs.
+    pub search_blobs: Option<Vec<String>>,
+    /// Indices into `model.spans` of every span whose blob
+    /// matched the *current* `filter`. Used by the renderer's
+    /// `visible_rows` builder (ancestors are added on the fly).
+    /// The keymap maintains this incrementally: appending a
+    /// character narrows the prior match set; any other edit
+    /// (Backspace / Esc / paste) triggers a full rescan.
+    pub filter_matches: Option<Vec<usize>>,
+}
+
+impl TraceView {
+    /// Cheap constructor used by the fetch handler. Initialises
+    /// every step-24 field to its inactive default so the rest of
+    /// the code can treat a fresh trace identically to a never-
+    /// touched trace.
+    pub fn new(model: TraceModel, return_mode: ViewMode) -> Self {
+        Self {
+            model,
+            cursor: 0,
+            scroll: 0,
+            detail_scroll: 0,
+            return_mode,
+            collapsed: HashSet::new(),
+            filter: String::new(),
+            input_mode: TraceInputMode::Normal,
+            pending_z: false,
+            search_blobs: None,
+            filter_matches: None,
+        }
+    }
+
+    /// Set of `span_idx` that must remain visible under the
+    /// current filter — the matches plus every ancestor. Returns
+    /// `None` when the filter is inactive (empty string), which
+    /// the visible-rows builder treats as "everything passes".
+    ///
+    /// Cheap when no filter is active (one branch). When active,
+    /// allocates a `HashSet` sized to `matches.len() * 2`; the
+    /// 1.5k-span fixture stays comfortably inside the per-frame
+    /// budget.
+    pub fn filter_set(&self) -> Option<HashSet<usize>> {
+        if self.filter.is_empty() {
+            return None;
+        }
+        let matches = self.filter_matches.as_deref().unwrap_or(&[]);
+        Some(crate::trace::ancestor_closure(&self.model, matches))
+    }
+
+    /// Row indices into `model.tree` that should appear in the
+    /// viewport given the current fold + filter state. Recomputed
+    /// each call; the renderer + keymap both call it and the
+    /// O(tree.len()) cost is well below the 1ms/frame budget.
+    pub fn visible_rows(&self) -> Vec<usize> {
+        let set = self.filter_set();
+        crate::trace::visible_rows(&self.model.tree, &self.collapsed, set.as_ref())
+    }
+}
+
+/// Input mode for the trace tree pane. `Normal` runs the
+/// motion / fold / yank keymap; `Filter` accumulates characters
+/// into [`TraceView::filter`] until the user commits with `Enter`
+/// or cancels with `Esc`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TraceInputMode {
+    #[default]
+    Normal,
+    Filter,
 }
 
 /// Tile editing sub-mode while focus is on `Pane::Dashboard`.

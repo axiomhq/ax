@@ -16,6 +16,7 @@ mod dashboard;
 mod editor;
 mod overlays;
 mod panes;
+mod trace;
 
 impl App {
     pub fn on_key(&mut self, key: KeyEvent) {
@@ -72,6 +73,8 @@ impl App {
             Pane::Params => return self.handle_params_key(key),
             Pane::Dashboard => return self.handle_dashboard_key(key),
             Pane::Table => return self.handle_table_key(key),
+            Pane::TraceTree => return self.handle_trace_key(key),
+            Pane::TraceDetail => return self.handle_trace_detail_key(key),
             Pane::Editor => {}
         }
         match self.mode {

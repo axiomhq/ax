@@ -44,7 +44,9 @@ pub(super) fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     // When a non-editor pane has focus, the mode badge switches to a
     // dedicated label so the user can see which surface consumes keys.
     let pane_focus = app.focus;
-    let (mode_label, mode_fg, mode_bg) = if pane_focus == crate::app::Pane::Legend {
+    let (mode_label, mode_fg, mode_bg) = if pane_focus == crate::app::Pane::TraceTree {
+        ("TRACE".to_string(), Color::Black, Color::Rgb(255, 165, 0))
+    } else if pane_focus == crate::app::Pane::Legend {
         ("LEGEND".to_string(), Color::Black, Color::Cyan)
     } else if pane_focus == crate::app::Pane::Params {
         ("PARAMS".to_string(), Color::Black, Color::LightBlue)
@@ -130,6 +132,12 @@ pub(super) fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     }
     if let Some(t) = status_trace_id(app) {
         right_parts.push(format!("trace: {t}"));
+    }
+    // While the trace view is active, surface the dataset so
+    // the user can see which deployment / dataset their trace
+    // came from without opening `:trace get`.
+    if let Some(view) = app.trace_view.as_ref() {
+        right_parts.push(format!("ds: {}", view.model.dataset));
     }
     let right_text = right_parts.join("  ");
     let right = Line::from(Span::styled(

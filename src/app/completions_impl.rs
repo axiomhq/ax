@@ -16,8 +16,21 @@ impl App {
             // Popup already visible: cycle.
             return self.move_cmdline_completion(if backward { -1 } else { 1 });
         }
+        // Snapshot the discovery cache's dataset names and the
+        // config file's deployment names so the completer can
+        // populate the `:trace set dataset=` / `deployment=`
+        // value slots. `Config::load` is cheap (single small
+        // TOML read) and matches the same fresh-load pattern
+        // already used by the fetch path; a load failure simply
+        // collapses the deployment suggestion list to empty.
+        let datasets = self.cache.read().dataset_names();
+        let deployments: Vec<String> = crate::config::Config::load()
+            .map(|cfg| cfg.deployments.keys().cloned().collect())
+            .unwrap_or_default();
         let ctx = crate::cmdline_complete::Context {
             dashboards: &self.dashboards.items,
+            datasets: &datasets,
+            deployments: &deployments,
         };
         let req = match crate::cmdline_complete::completions_for(
             &self.cmdline.buf,

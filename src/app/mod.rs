@@ -23,6 +23,7 @@ use crate::hover;
 use crate::motion::{self, Range};
 use crate::mpl;
 use crate::params;
+use crate::settings::SettingsStore;
 use crate::share;
 use crate::viz;
 
@@ -85,6 +86,12 @@ pub struct App {
     pub busy: bool,
     /// Shared discovery cache; persisted to disk by background tasks.
     pub cache: Arc<RwLock<Cache>>,
+    /// App-private settings (trace defaults today; future UI/picker
+    /// knobs land here). Persisted at
+    /// `$XDG_CONFIG_HOME/mcu/settings.toml`; reads are cheap so
+    /// `RwLock` lets future background tasks consult it without
+    /// blocking the UI thread the way a plain `&mut self` would.
+    pub settings: Arc<RwLock<SettingsStore>>,
     pub completions: CompletionState,
     pub quickfix: QuickFixPicker,
     pub cmdline: CmdLine,
@@ -264,6 +271,41 @@ pub struct App {
     // `time_range` moved to `time.range` (TimeState); see field above.
     /// Counter incremented on each query start; only matching responses are accepted.
     last_query_id: u64,
+    /// Monotonic counter for `:trace <id>` dispatches. **Independent**
+    /// of [`Self::last_query_id`] so editor `:r` runs and trace
+    /// fetches can't accidentally cancel each other. The fetcher
+    /// in `src/app/fetch/trace.rs` bumps this once per
+    /// [`PendingTraceFetch`]; the
+    /// [`AppEvent::TraceFetchFinished`] handler drops results
+    /// whose `query_id` doesn't match `pending_trace_fetch.query_id`.
+    pub(crate) trace_query_counter: u64,
+    /// Materialised trace view — set by the
+    /// [`AppEvent::TraceFetchFinished`] handler when a non-empty
+    /// result lands, cleared on `Esc` / `:q` exit. The renderer
+    /// reads this directly when `view_mode == Trace`; nothing
+    /// else may write it.
+    pub trace_view: Option<TraceView>,
+    /// In-flight `:trace <id>` ladder state. `Some` while a fetch
+    /// is searching, `None` otherwise. The fetcher walks it
+    /// through wider windows on empty results; a non-empty
+    /// result transitions the app into [`ViewMode::Trace`] and
+    /// clears this slot.
+    pub pending_trace_fetch: Option<PendingTraceFetch>,
+    /// Most-recent dataset name used by `:trace <id>`. Sticky
+    /// across calls so a second `:trace <id>` without an
+    /// explicit `dataset=…` arg re-uses the previous one
+    /// instead of falling through to `Settings.trace.dataset`
+    /// each time. Seeded from settings on first use.
+    pub last_trace_dataset: Option<String>,
+    /// Last-rendered trace tree body height (rows). Stashed by
+    /// the renderer at the tail of every `draw_trace` so the
+    /// keymap's `Ctrl-D`/`Ctrl-U` half-page math is exact
+    /// instead of using a fixed-16 heuristic. Reset to `16` on
+    /// first construction so the first keypress before any
+    /// draw still does something sensible.
+    pub(crate) last_trace_body_height: u16,
+    /// Same for the detail pane.
+    pub(crate) last_trace_detail_height: u16,
     runtime: Handle,
     events_tx: mpsc::Sender<AppEvent>,
     events_rx: mpsc::Receiver<AppEvent>,
@@ -284,21 +326,33 @@ pub struct App {
 
 impl App {
     pub fn new(runtime: Handle) -> Self {
-        Self::with_cache_and_history(runtime, default_cache(), crate::history::History::load())
+        Self::with_cache_and_history(
+            runtime,
+            default_cache(),
+            crate::history::History::load(),
+            SettingsStore::load(),
+        )
     }
 
-    /// Test-only entry point: in-memory cache, in-memory history.
-    /// Used by `test_app()` so the suite never touches the user's
-    /// real `~/.local/share/mcu/` or `~/.cache/mcu/` directories.
+    /// Test-only entry point: in-memory cache, in-memory history,
+    /// in-memory settings. Used by `test_app()` so the suite never
+    /// touches the user's real `~/.local/share/mcu/`,
+    /// `~/.cache/mcu/`, or `~/.config/mcu/` directories.
     #[cfg(test)]
     pub fn with_cache(runtime: Handle, cache: Cache) -> Self {
-        Self::with_cache_and_history(runtime, cache, crate::history::History::default())
+        Self::with_cache_and_history(
+            runtime,
+            cache,
+            crate::history::History::default(),
+            SettingsStore::in_memory(),
+        )
     }
 
     pub fn with_cache_and_history(
         runtime: Handle,
         cache: Cache,
         history: crate::history::History,
+        settings: SettingsStore,
     ) -> Self {
         let (events_tx, events_rx) = mpsc::channel();
         let cached_count = cache.dataset_count();
@@ -389,6 +443,7 @@ impl App {
             should_quit: false,
             busy: false,
             cache,
+            settings: Arc::new(RwLock::new(settings)),
             completions: CompletionState::default(),
             quickfix: QuickFixPicker::default(),
             diagnostics: Vec::new(),
@@ -407,6 +462,12 @@ impl App {
             last_query_context: None,
             pending_ctrl_w: false,
             last_query_id: 0,
+            trace_query_counter: 0,
+            last_trace_body_height: 16,
+            last_trace_detail_height: 16,
+            trace_view: None,
+            pending_trace_fetch: None,
+            last_trace_dataset: None,
             tile_fetch_semaphore: Arc::new(tokio::sync::Semaphore::new(TILE_FETCH_CONCURRENCY)),
             runtime,
             events_tx,

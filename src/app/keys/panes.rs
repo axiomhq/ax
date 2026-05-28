@@ -30,6 +30,21 @@ impl App {
                 .is_some_and(|t| !t.rows.is_empty());
         let secondary = if has_table { Table } else { Legend };
         // `w` cycles Editor → secondary → Params → (Dashboard if Grid) → Editor.
+        // In `Trace` view-mode `Ctrl-w w` swaps between the two
+        // trace panes; other `Ctrl-w` motions are ignored. `Tab`
+        // is the primary toggle — `Ctrl-w w` exists so users who
+        // think in vim splits get the same result.
+        if self.view_mode == ViewMode::Trace {
+            if matches!(key.code, Char('w')) && self.trace_view.is_some() {
+                let next = if self.focus == TraceDetail {
+                    TraceTree
+                } else {
+                    TraceDetail
+                };
+                self.set_focus(next);
+            }
+            return;
+        }
         let cycle = || match self.focus {
             Editor => secondary,
             Legend | Table => Params,
@@ -41,6 +56,10 @@ impl App {
                 }
             }
             Dashboard => Editor,
+            // `Trace` panes are filtered out earlier by the
+            // view-mode short-circuit; arms here exist only for
+            // exhaustiveness.
+            TraceTree | TraceDetail => Editor,
         };
         let next = match (key.code, key.modifiers) {
             (Char('w'), _) => cycle(),
@@ -85,6 +104,15 @@ impl App {
         }
         if pane == Pane::Table && self.table_result.as_ref().is_none_or(|t| t.rows.is_empty()) {
             self.status = "no table rows to focus".to_string();
+            return;
+        }
+        if matches!(pane, Pane::TraceTree | Pane::TraceDetail) && self.trace_view.is_none() {
+            // The trace panes have no model to focus into; this
+            // is a hard reject — entering would render an empty
+            // pane with no exit. Callers usually transition into
+            // `Trace` via the `AplQueryFinished` handler which
+            // installs the view + flips focus atomically.
+            self.status = "no trace loaded; try `:trace <id>`".to_string();
             return;
         }
         self.focus = pane;

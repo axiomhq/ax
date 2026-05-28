@@ -46,10 +46,31 @@ impl App {
             Command::FetchDatasets => self.fetch_datasets(),
             Command::FetchMetrics => self.fetch_metrics_for_current_query(),
             // Esc in Editor Normal mode: dismiss the error overlay if
-            // present; else, if we arrived in Solo by zooming a tile,
-            // return to the grid (vim's "back out" intuition for Esc).
+            // present; else, if a `:trace` fetch is in flight, cancel
+            // it (we're showing the spinner status; Esc is the natural
+            // "never mind" gesture); else, if we arrived in Solo by
+            // zooming a tile, return to the grid (vim's "back out"
+            // intuition for Esc).
             Command::DismissError if self.dismiss_error() => {
                 self.status = "error dismissed".to_string()
+            }
+            Command::DismissError if self.pending_trace_fetch.is_some() => {
+                let label = self
+                    .pending_trace_fetch
+                    .as_ref()
+                    .map(|p| p.trace_id.clone())
+                    .unwrap_or_default();
+                self.pending_trace_fetch = None;
+                // Bump the counter so a late response from the
+                // cancelled task fails the `query_id == pending`
+                // check and gets dropped instead of accidentally
+                // entering Trace mode after the user moved on.
+                self.trace_query_counter = self.trace_query_counter.wrapping_add(1);
+                self.status = if label.is_empty() {
+                    "trace fetch cancelled".to_string()
+                } else {
+                    format!("trace fetch cancelled ({label})")
+                };
             }
             Command::DismissError
                 if self.view_mode == ViewMode::Solo && self.loaded_dashboard.is_some() =>

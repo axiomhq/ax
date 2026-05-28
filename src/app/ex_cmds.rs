@@ -5,6 +5,7 @@
 //! to be public.
 
 use crate::dashboard::VizKind;
+use crate::settings::SettingsStore;
 
 use super::*;
 
@@ -18,6 +19,45 @@ pub(crate) const DASH_SUBS: &[&str] = &["ls", "new", "rm"];
 pub(crate) const TILE_SUBS: &[&str] = &[
     "add", "cut", "inspect", "json", "mv", "open", "paste", "rm", "size", "title", "undo", "yank",
 ];
+
+/// Sub-commands for `:trace`, in display order. Shared with
+/// `cmdline_complete` for the same reason as `DASH_SUBS` /
+/// `TILE_SUBS`. Bare `:trace` (no sub) is intentionally absent —
+/// the completer never has to suggest "" — but the dispatcher
+/// still handles it as the legacy trace-id reporter.
+pub(crate) const TRACE_SUBS: &[&str] = &["get", "set", "unset"];
+
+/// Known keys accepted by `:trace set` / `:trace unset`. Defined
+/// once next to the dispatch so the completer's value-slot menu
+/// (`dataset=` / `deployment=`) can't drift out of sync with the
+/// strings the dispatcher actually accepts.
+pub(crate) const TRACE_KEYS: &[&str] = &["dataset", "deployment"];
+
+/// Single source of truth for which settings field each `:trace`
+/// key maps to. Keeps `cmd_trace_set` / `cmd_trace_unset` free of
+/// stringly-typed `match` arms scattered across two call sites.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum TraceKey {
+    Dataset,
+    Deployment,
+}
+
+impl TraceKey {
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "dataset" => Some(Self::Dataset),
+            "deployment" => Some(Self::Deployment),
+            _ => None,
+        }
+    }
+
+    fn set(self, store: &mut SettingsStore, value: Option<String>) {
+        match self {
+            Self::Dataset => store.set_trace_dataset(value),
+            Self::Deployment => store.set_trace_deployment(value),
+        }
+    }
+}
 
 /// Parse `args[1]` / `args[2]` as `u32`. Used by `:tile mv` and `:tile size`.
 /// `nonzero=true` rejects zero values (size needs ≥1). Returns the
@@ -90,7 +130,8 @@ impl App {
             "apl" => self.cmd_lang(crate::dashboard::Lang::Apl),
             "mpl" => self.cmd_lang(crate::dashboard::Lang::Mpl),
             "open" => self.cmd_open(args.first().copied()),
-            "trace" => self.cmd_trace(),
+            "trace" => self.cmd_trace(&args),
+            "span" => self.cmd_span(&args),
             "time" => self.cmd_time(&args),
             "dashinfo" | "di" => self.cmd_dashinfo(),
             "history" | "his" => self.cmd_history(),
@@ -321,6 +362,18 @@ impl App {
     /// argument, retries the last-picked dashboard. The fetch is async;
     /// the result lands via `AppEvent::DashboardOpened`.
     fn cmd_open(&mut self, uid_arg: Option<&str>) {
+        // `:open` from inside the trace view tears down the
+        // trace before kicking off the dashboard fetch — the
+        // dashboard adopt path flips `view_mode` to Grid/Solo
+        // which would clobber the trace context anyway.
+        if self.view_mode == ViewMode::Trace {
+            self.trace_view = None;
+            self.pending_trace_fetch = None;
+            self.view_mode = ViewMode::Solo;
+            if matches!(self.focus, Pane::TraceTree) {
+                self.focus = Pane::Editor;
+            }
+        }
         let uid = match uid_arg {
             Some(s) => s.trim_matches('"').to_string(),
             None => match self.last_picked_dashboard.as_deref() {
@@ -390,17 +443,146 @@ impl App {
         self.set_time_range(new_start, new_end);
     }
 
-    /// `:trace` — report the trace id of the focused panel so the user
-    /// can hand it off to support or paste it into Axiom's trace search.
+    /// `:span json` — open the inspect overlay on the currently
+    /// selected trace span. Re-uses the existing `tile_inspect_json`
+    /// overlay slot (the global key dispatcher dismisses it on any
+    /// key) so we don't need a second overlay widget.
     ///
-    /// Resolution order:
-    ///   1. In Grid view with a dashboard loaded, the focused tile's
-    ///      per-fetch trace id (`tile_results[chart_id].trace_id`).
-    ///   2. Otherwise the editor's last query trace (`last_trace_id`).
+    /// Only legal while a trace is loaded; otherwise reports a
+    /// clean error. The JSON shape matches the `y` keymap exactly
+    /// — typed core + attribute/resource maps + events list, via
+    /// the [`crate::trace::SpanJson`] projection.
+    fn cmd_span(&mut self, args: &[&str]) {
+        let Some(sub) = args.first().copied() else {
+            self.set_error(":span needs a sub-command (json)".to_string());
+            return;
+        };
+        match sub {
+            "json" | "inspect" => {
+                let Some(view) = self.trace_view.as_ref() else {
+                    self.set_error(":span json: no trace loaded".to_string());
+                    return;
+                };
+                if view.model.tree.is_empty() {
+                    self.set_error(":span json: empty trace".to_string());
+                    return;
+                }
+                let cursor = view.cursor.min(view.model.tree.len() - 1);
+                let span_idx = view.model.tree[cursor].span_idx;
+                let span = &view.model.spans[span_idx];
+                let trace_id = view.model.trace_id.clone();
+                match serde_json::to_string_pretty(&crate::trace::SpanJson::from_span(
+                    &trace_id, span,
+                )) {
+                    Ok(s) => {
+                        let label: String = span.span_id.chars().take(8).collect();
+                        self.tile_inspect_json = Some(s);
+                        self.status = format!("inspecting span {label}");
+                    }
+                    Err(e) => self.set_error(format!(":span json: serialise failed: {e}")),
+                }
+            }
+            other => self.set_error(format!(":span {other}: unknown sub-command (json)")),
+        }
+    }
+
+    /// `:trace` dispatcher.
     ///
-    /// The id ends up in `self.status`, which the status bar shows in
-    /// full so it's easy to select with the mouse.
-    fn cmd_trace(&mut self) {
+    /// Three independent surfaces share the command name:
+    ///
+    /// - **Bare `:trace`** — report the trace id of the focused
+    ///   panel (or editor's last query) on the status bar. This is
+    ///   the historical behavior, preserved verbatim so support
+    ///   workflows that rely on it don't regress.
+    /// - **`:trace set KEY=VALUE…`** / **`:trace get`** /
+    ///   **`:trace unset KEY…`** — read/write the app-private
+    ///   trace defaults (`dataset`, `deployment`) that the
+    ///   upcoming trace view (step 22+) will consult when no
+    ///   explicit values are given.
+    /// - **`:trace <id>`** — placeholder until step 22 wires the
+    ///   real waterfall view; today it just reports the gap so the
+    ///   user knows the id was understood.
+    ///
+    /// The sub-command match short-circuits *before* the legacy
+    /// reporter, so unknown sub-commands fall through to the
+    /// `<id>` arm rather than silently behaving like bare
+    /// `:trace`. That keeps the user-facing error one of
+    /// "placeholder" vs. "unknown key" instead of two distinct
+    /// success messages that look identical.
+    fn cmd_trace(&mut self, args: &[&str]) {
+        match args.split_first() {
+            None => self.cmd_trace_report_id(),
+            Some((&"set", rest)) => self.cmd_trace_set(rest),
+            Some((&"get", rest)) => self.cmd_trace_get(rest),
+            Some((&"unset", rest)) => self.cmd_trace_unset(rest),
+            Some(_) => self.cmd_trace_open(args),
+        }
+    }
+
+    /// `:trace <id> [dataset=NAME] [deployment=NAME]` — fetch +
+    /// open the trace view. Parses the first non-`key=value`
+    /// token as the trace id; the remaining `key=value` pairs
+    /// override the dataset / deployment fallback chain.
+    ///
+    /// Validation is strict: unknown keys, missing trace id, or
+    /// an empty value rejects with a clear error rather than
+    /// silently picking up the previous trace's settings. The
+    /// fetch itself runs through
+    /// [`Self::start_trace_fetch`] which surfaces dataset /
+    /// deployment fallback errors as `set_error`.
+    fn cmd_trace_open(&mut self, args: &[&str]) {
+        let mut trace_id: Option<String> = None;
+        let mut dataset_arg: Option<String> = None;
+        let mut deployment_arg: Option<String> = None;
+        for raw in args {
+            match raw.split_once('=') {
+                Some((k, v)) => match k.trim() {
+                    "dataset" => dataset_arg = Some(v.trim().to_string()),
+                    "deployment" => deployment_arg = Some(v.trim().to_string()),
+                    other => {
+                        self.set_error(format!(
+                            ":trace: unknown key `{other}` (expected: dataset, deployment)"
+                        ));
+                        return;
+                    }
+                },
+                None => {
+                    // First bare token = trace id. Additional
+                    // bare tokens are a user mistake (the id is
+                    // a single hex blob); reject so we don't
+                    // silently drop or concat them.
+                    if trace_id.is_none() {
+                        trace_id = Some(raw.trim().to_string());
+                    } else {
+                        self.set_error(format!(
+                            ":trace: unexpected extra arg `{raw}` (one id at a time)"
+                        ));
+                        return;
+                    }
+                }
+            }
+        }
+        let Some(id) = trace_id else {
+            self.set_error(":trace <id> [dataset=NAME] [deployment=NAME]".to_string());
+            return;
+        };
+        if let Err(e) = self.start_trace_fetch(id, dataset_arg, deployment_arg) {
+            self.set_error(format!(":trace: {e}"));
+        }
+    }
+
+    /// Bare `:trace` — legacy trace-id reporter. Resolution order:
+    ///   1. While in the trace view, the loaded trace's id.
+    ///   2. In Grid view, the focused tile's per-fetch trace id.
+    ///   3. Otherwise the editor's last query trace id.
+    fn cmd_trace_report_id(&mut self) {
+        // (1) Inside the trace view, the displayed trace is the
+        // obvious thing the user wants reported — not whatever
+        // editor/tile query last ran.
+        if let Some(view) = self.trace_view.as_ref() {
+            self.status = format!("trace: {}", view.model.trace_id);
+            return;
+        }
         // Prefer the focused tile's trace when we're actually looking
         // at a panel; this is the whole point of the command.
         // `Chart::Unknown` has no `ChartBase` (and so no id to key
@@ -431,6 +613,107 @@ impl App {
             Some(id) => self.status = format!("trace: {id}"),
             None => self.status = "no trace id available (run a query first)".to_string(),
         }
+    }
+
+    /// `:trace set KEY=VALUE [KEY=VALUE…]` — accept any combination
+    /// of `dataset=…` / `deployment=…`. Persists atomically on
+    /// success. Unknown keys reject the whole batch (no
+    /// partial-write) so a typo in one pair can't quietly skip
+    /// past while another succeeds.
+    fn cmd_trace_set(&mut self, args: &[&str]) {
+        if args.is_empty() {
+            self.set_error(":trace set KEY=VALUE [KEY=VALUE…]".to_string());
+            return;
+        }
+        // First pass: validate every pair, build the staged
+        // updates. Second pass applies + saves. Two-phase keeps
+        // the in-memory store untouched if any pair is bad.
+        let mut staged: Vec<(TraceKey, String)> = Vec::with_capacity(args.len());
+        for raw in args {
+            let (k, v) = match raw.split_once('=') {
+                Some(parts) => parts,
+                None => {
+                    self.set_error(format!(":trace set: expected KEY=VALUE, got `{raw}`"));
+                    return;
+                }
+            };
+            let key = match TraceKey::parse(k.trim()) {
+                Some(key) => key,
+                None => {
+                    self.set_error(format!(
+                        ":trace set: unknown key `{}` (expected: dataset, deployment)",
+                        k.trim()
+                    ));
+                    return;
+                }
+            };
+            staged.push((key, v.trim().to_string()));
+        }
+        // Apply staged updates in order; later pairs win on dup keys.
+        // Stage the save result before re-borrowing `self` for
+        // `set_error` / `cmd_trace_get` — the write guard must drop first.
+        let save_result = {
+            let mut store = self.settings.write();
+            for (key, value) in &staged {
+                key.set(&mut store, Some(value.clone()));
+            }
+            store.save()
+        };
+        if let Err(e) = save_result {
+            // In-memory store now reflects the user's intent; if
+            // disk write failed they should retry. Surface the error.
+            self.set_error(format!(":trace set: save failed: {e}"));
+            return;
+        }
+        self.cmd_trace_get(&[]);
+    }
+
+    /// `:trace get` — echo the current `(dataset, deployment)`
+    /// pair to the status bar. Unset keys read as `(unset)` so
+    /// the line is always two clearly-named columns.
+    fn cmd_trace_get(&mut self, args: &[&str]) {
+        if !args.is_empty() {
+            self.set_error(":trace get takes no arguments".to_string());
+            return;
+        }
+        let store = self.settings.read();
+        let ds = store.trace().dataset.as_deref().unwrap_or("(unset)");
+        let dep = store.trace().deployment.as_deref().unwrap_or("(unset)");
+        self.status = format!("trace: dataset={ds} deployment={dep}");
+    }
+
+    /// `:trace unset KEY [KEY…]` — clear one or more keys. Like
+    /// `set`, unknown keys reject the whole batch.
+    fn cmd_trace_unset(&mut self, args: &[&str]) {
+        if args.is_empty() {
+            self.set_error(":trace unset KEY [KEY…]".to_string());
+            return;
+        }
+        let mut staged: Vec<TraceKey> = Vec::with_capacity(args.len());
+        for raw in args {
+            match TraceKey::parse(raw.trim()) {
+                Some(key) => staged.push(key),
+                None => {
+                    self.set_error(format!(
+                        ":trace unset: unknown key `{}` (expected: dataset, deployment)",
+                        raw.trim()
+                    ));
+                    return;
+                }
+            }
+        }
+        let save_result = {
+            let mut store = self.settings.write();
+            for key in &staged {
+                key.set(&mut store, None);
+            }
+            store.save()
+        };
+        if let Err(e) = save_result {
+            self.set_error(format!(":trace unset: save failed: {e}"));
+            return;
+        }
+        self.cmd_trace_get(&[]);
     }
 
     /// `:history` / `:his` — toggle the read-only overlay listing
@@ -709,6 +992,16 @@ impl App {
             self.status = ":grid: no dashboard loaded".to_string();
             return;
         }
+        // From the trace view, `:grid` is a hard switch — drop
+        // the loaded trace before falling into the dashboard
+        // grid layout. Otherwise the user would be in Grid
+        // view with `trace_view: Some(…)` quietly held alive,
+        // which would re-surface on the next `Esc` in any
+        // unexpected place.
+        if self.view_mode == ViewMode::Trace {
+            self.trace_view = None;
+            self.pending_trace_fetch = None;
+        }
         // Switching away from Solo: write the editor buffer back to
         // the focused tile so we don't lose unsaved edits made while
         // zoomed in.
@@ -732,12 +1025,20 @@ impl App {
     /// `:solo` — return to single-tile view. Focus drops back to the
     /// editor so the user can type immediately.
     pub fn cmd_solo(&mut self) {
+        // Mirror `cmd_grid`: explicit `:solo` from the trace
+        // view tears down the trace before falling through to
+        // the Solo layout.
+        if self.view_mode == ViewMode::Trace {
+            self.trace_view = None;
+            self.pending_trace_fetch = None;
+        }
         self.view_mode = ViewMode::Solo;
         // Dashboard tile grid isn't rendered in Solo — redirect
         // focus to the Editor so the user isn't stranded on an
         // invisible pane. Legend stays addressable because the
-        // side column is still drawn.
-        if self.focus == Pane::Dashboard {
+        // side column is still drawn. Same applies to TraceTree
+        // when the user runs `:solo` out of Trace view.
+        if matches!(self.focus, Pane::Dashboard | Pane::TraceTree) {
             self.focus = Pane::Editor;
         }
         // Switch back to the editor's cached tags so the legend
@@ -935,6 +1236,14 @@ impl App {
             None => match self.view_mode {
                 ViewMode::Grid => self.run_focused_tile_query(),
                 ViewMode::Solo => self.run_query(),
+                // No query to re-run inside the trace view —
+                // `:trace <id>` is the only way to refresh the
+                // displayed trace, and that path goes through
+                // `cmd_trace`, not `:r`.
+                ViewMode::Trace => {
+                    self.status =
+                        "no query in trace view (use `:trace <id>` to switch traces)".to_string();
+                }
             },
             Some("tile") => self.run_focused_tile_query(),
             Some("dashboard") => {
@@ -948,6 +1257,14 @@ impl App {
     }
 
     pub(super) fn cmd_quit(&mut self, force: bool) {
+        // In the trace view `:q` is a window-style close (vim's
+        // `:q` from a help split): exit the trace and restore
+        // the previous view-mode rather than quitting the
+        // entire app.
+        if self.view_mode == ViewMode::Trace {
+            self.exit_trace_view();
+            return;
+        }
         if !force && self.is_dirty() {
             return self
                 .set_error("E37: No write since last change (add ! to override)".to_string());

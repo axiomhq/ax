@@ -386,6 +386,178 @@ fn trace_command_in_grid_reports_pending_when_tile_has_no_result() {
     );
 }
 
+// ---- :trace set / get / unset dispatcher -----------------------------
+//
+// Disposition A: bare `:trace` (no args) is preserved as the
+// legacy trace-id reporter (covered by the three tests above);
+// these tests cover the sub-command surface added in step 20.
+
+#[test]
+fn trace_set_get_round_trip_persists_through_settings_store() {
+    let mut app = test_app();
+    app.execute_command("trace set dataset=axiom-traces-dev deployment=staging");
+    // `set` echoes the new state through `get`, so status
+    // already reflects what's persisted.
+    assert!(
+        app.status
+            .contains("dataset=axiom-traces-dev deployment=staging"),
+        "status was {:?}",
+        app.status
+    );
+    let store = app.settings.read();
+    assert_eq!(store.trace().dataset.as_deref(), Some("axiom-traces-dev"));
+    assert_eq!(store.trace().deployment.as_deref(), Some("staging"));
+}
+
+#[test]
+fn trace_get_with_no_pairs_reports_unset() {
+    let mut app = test_app();
+    app.execute_command("trace get");
+    assert_eq!(app.status, "trace: dataset=(unset) deployment=(unset)");
+}
+
+#[test]
+fn trace_set_partial_pair_updates_only_that_key() {
+    let mut app = test_app();
+    app.execute_command("trace set dataset=ds-one");
+    app.execute_command("trace set deployment=eu");
+    let store = app.settings.read();
+    assert_eq!(store.trace().dataset.as_deref(), Some("ds-one"));
+    assert_eq!(store.trace().deployment.as_deref(), Some("eu"));
+}
+
+#[test]
+fn trace_unset_clears_single_key() {
+    let mut app = test_app();
+    app.execute_command("trace set dataset=ds-one deployment=eu");
+    app.execute_command("trace unset dataset");
+    let store = app.settings.read();
+    assert!(store.trace().dataset.is_none());
+    assert_eq!(store.trace().deployment.as_deref(), Some("eu"));
+}
+
+#[test]
+fn trace_set_unknown_key_rejects_whole_batch() {
+    let mut app = test_app();
+    // Seed a known pair so we can prove the partial-good pair
+    // doesn't sneak through alongside the bad one.
+    app.execute_command("trace set deployment=eu");
+    app.last_error = None;
+    app.execute_command("trace set dataset=ds foo=bar");
+    assert!(
+        app.last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("unknown key `foo`")),
+        "expected unknown-key error, got: {:?}",
+        app.last_error
+    );
+    // Neither half of the bad batch persisted.
+    let store = app.settings.read();
+    assert!(store.trace().dataset.is_none());
+    // The earlier good `deployment=eu` is unchanged.
+    assert_eq!(store.trace().deployment.as_deref(), Some("eu"));
+}
+
+#[test]
+fn trace_set_missing_equals_rejects() {
+    let mut app = test_app();
+    app.execute_command("trace set dataset");
+    assert!(
+        app.last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("expected KEY=VALUE")),
+        "got: {:?}",
+        app.last_error
+    );
+    assert!(app.settings.read().trace().dataset.is_none());
+}
+
+#[test]
+fn trace_set_with_no_pairs_reports_usage() {
+    let mut app = test_app();
+    app.execute_command("trace set");
+    assert!(
+        app.last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("KEY=VALUE")),
+        "got: {:?}",
+        app.last_error
+    );
+}
+
+#[test]
+fn trace_unset_unknown_key_rejects() {
+    let mut app = test_app();
+    app.execute_command("trace set dataset=ds");
+    app.last_error = None;
+    app.execute_command("trace unset foo");
+    assert!(
+        app.last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("unknown key `foo`")),
+        "got: {:?}",
+        app.last_error
+    );
+    assert_eq!(app.settings.read().trace().dataset.as_deref(), Some("ds"));
+}
+
+#[test]
+fn trace_unset_with_no_args_reports_usage() {
+    let mut app = test_app();
+    app.execute_command("trace unset");
+    assert!(
+        app.last_error.as_deref().is_some_and(|e| e.contains("KEY")),
+        "got: {:?}",
+        app.last_error
+    );
+}
+
+#[test]
+fn trace_get_rejects_extra_args() {
+    // `:trace get` is read-only; any positional arg is almost
+    // certainly a typo for `:trace <id>`. We surface that as an
+    // error rather than silently dropping the arg.
+    let mut app = test_app();
+    app.execute_command("trace get dataset");
+    assert!(
+        app.last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("no arguments")),
+        "got: {:?}",
+        app.last_error
+    );
+}
+
+#[test]
+fn trace_with_no_dataset_configured_surfaces_clear_error() {
+    // Step 22 replaced the placeholder. With no dataset on
+    // `last_trace_dataset` and an empty settings store, the
+    // dispatch must surface the configuration error rather than
+    // silently picking an arbitrary dataset.
+    let mut app = test_app();
+    app.execute_command("trace abc123def");
+    let err = app
+        .last_error
+        .as_deref()
+        .expect("missing-dataset must surface as an error overlay");
+    assert!(
+        err.contains("no trace dataset"),
+        "error was {err:?} (status: {:?})",
+        app.status
+    );
+}
+
+#[test]
+fn bare_trace_still_reports_focused_trace_id_after_dispatcher_added() {
+    // Disposition-A regression guard: even though `:trace`
+    // gained sub-commands, the no-args form must keep its
+    // historical "report the trace id" behavior.
+    let mut app = test_app();
+    app.last_trace_id = Some("reg-9000".into());
+    app.execute_command("trace");
+    assert_eq!(app.status, "trace: reg-9000");
+}
+
 // ---- Status-bar trace id resolver ------------------------------------
 //
 // The status bar must mirror `:trace` semantics: in Grid view the

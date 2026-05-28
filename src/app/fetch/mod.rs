@@ -12,6 +12,7 @@ use super::*;
 mod dashboard;
 mod discovery;
 mod query;
+mod trace;
 
 impl App {
     /// Drain background events and apply them to app state.
@@ -365,6 +366,9 @@ impl App {
                 };
             }
             AppEvent::TagValuesFetched { .. } => {}
+            AppEvent::TraceFetchFinished { query_id, result } => {
+                self.handle_trace_fetch_finished(query_id, result);
+            }
             AppEvent::AplQueryFinished { id, result } => {
                 if id != self.last_query_id {
                     return;

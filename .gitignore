@@ -2,3 +2,10 @@
 # Scratch MPL buffers kept at the repo root (`current.mpl`, etc.).
 # Anchored so nested fixtures under `tests/` are still tracked.
 /*.mpl
+
+# Trace samples fetched for the traces feature research/plan.
+# Not committed.
+/traces-research/
+
+# pi coding-agent session state.
+/.pi/

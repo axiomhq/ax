@@ -25,6 +25,14 @@ use nucleo_matcher::{Config, Matcher, Utf32Str};
 /// caller doesn't have to clone.
 pub struct Context<'a> {
     pub dashboards: &'a [DashboardSummary],
+    /// Cached dataset names, used by `:trace set dataset=<Tab>` to
+    /// suggest existing datasets without a network round-trip.
+    pub datasets: &'a [String],
+    /// Deployment names resolved from `~/.axiom.toml`, used by
+    /// `:trace set deployment=<Tab>`. Empty when the config
+    /// is missing or unreadable — the suggestion list collapses
+    /// gracefully (the user can still type a name by hand).
+    pub deployments: &'a [String],
 }
 
 /// Result of completing the current cmdline.
@@ -47,10 +55,11 @@ const HEAD_COMMANDS: &[&str] = &[
     "trace", "viz", "w", "wq", "write", "x",
 ];
 
-// The canonical `:dash` and `:tile` sub-command lists live next to the
-// dispatch tables in `src/app/ex_cmds.rs`; importing them here keeps the
-// completion menu in lock-step with the actual command surface.
-use crate::app::ex_cmds::{DASH_SUBS, TILE_SUBS};
+// The canonical `:dash`, `:tile`, and `:trace` sub-command lists
+// live next to the dispatch tables in `src/app/ex_cmds.rs`;
+// importing them here keeps the completion menu in lock-step with
+// the actual command surface.
+use crate::app::ex_cmds::{DASH_SUBS, TILE_SUBS, TRACE_KEYS, TRACE_SUBS};
 
 /// Compute completions for the cmdline at the given char-cursor
 /// (mirrors `CmdLine.cursor` which counts chars, not bytes). Returns
@@ -87,6 +96,8 @@ pub fn completions_for(
     match (head, prefix_args) {
         ("dash", 1) => Some(filter_candidates(DASH_SUBS.iter().copied(), token, range)),
         ("tile", 1) => Some(filter_candidates(TILE_SUBS.iter().copied(), token, range)),
+        ("trace", 1) => Some(filter_candidates(TRACE_SUBS.iter().copied(), token, range)),
+        ("trace", _) => trace_arg_completions(buf, token, range, ctx),
         ("tile", 2) => {
             // `:tile add <viz>` is the only second-arg slot with a
             // closed vocabulary.
@@ -127,6 +138,70 @@ pub fn completions_for(
 
 fn viz_kind_names() -> Vec<&'static str> {
     VizKind::ALL.iter().map(|k| k.as_str()).collect()
+}
+
+/// Argument completions for `:trace set` / `:trace unset`. Split
+/// out of the main match so the two sub-commands share their
+/// key-list (`dataset` / `deployment`) but diverge on whether to
+/// suggest values after the `=`.
+///
+/// Behavior by sub-command + token shape:
+///
+/// * `:trace set <empty-or-key>`     — suggest `dataset=` /
+///   `deployment=` so the user can land on the right key and
+///   start typing the value in one Tab.
+/// * `:trace set dataset=<token>`    — suggest cached dataset
+///   names (no `dataset=` prefix; the candidate is just the value
+///   the user is typing after the `=`).
+/// * `:trace set deployment=<token>` — same as above but against
+///   the loaded `Config.deployments` list.
+/// * `:trace unset <token>`          — suggest bare key names
+///   (no `=`), since unset takes keys not pairs.
+fn trace_arg_completions(
+    buf: &str,
+    token: &str,
+    range: (usize, usize),
+    ctx: &Context<'_>,
+) -> Option<CompletionRequest> {
+    let sub = nth_arg(buf, 1)?;
+    match sub {
+        "set" => {
+            // `:trace set KEY=<value>` — inspect the token for an
+            // `=` and switch to value-completion when present.
+            if let Some((key_part, value_part)) = token.split_once('=') {
+                // The candidate replaces only the value portion;
+                // the `KEY=` prefix stays put. Slide `range.0`
+                // forward past `KEY=` so splice math is right.
+                let value_start = range.0 + key_part.len() + 1;
+                let value_range = (value_start, range.1);
+                let candidates: &[String] = match key_part {
+                    "dataset" => ctx.datasets,
+                    "deployment" => ctx.deployments,
+                    // Unknown key + `=` — nothing meaningful to
+                    // suggest. Return an empty candidate list so
+                    // the popup doesn't open with stale items.
+                    _ => return None,
+                };
+                return Some(filter_candidates(
+                    candidates.iter().map(String::as_str),
+                    value_part,
+                    value_range,
+                ));
+            }
+            // No `=` yet — the user is still picking the key.
+            // Suggest `dataset=` / `deployment=` (with the `=`)
+            // so accept-then-Tab lands them straight in the value
+            // slot.
+            let key_eq: Vec<String> = TRACE_KEYS.iter().map(|k| format!("{k}=")).collect();
+            Some(filter_candidates(
+                key_eq.iter().map(String::as_str),
+                token,
+                range,
+            ))
+        }
+        "unset" => Some(filter_candidates(TRACE_KEYS.iter().copied(), token, range)),
+        _ => None,
+    }
 }
 
 /// Filter `candidates` by `token` using nucleo's fuzzy scorer. Empty
