@@ -38,6 +38,7 @@ mod params;
 mod popups;
 mod status;
 mod time_picker;
+mod topbar;
 
 // Soft caps for the secondary panes so they don't eat huge chunks of
 // big terminals just to display a handful of lines/items. The
@@ -145,13 +146,23 @@ pub(super) fn wrap_message(msg: &str, width: usize) -> Vec<String> {
 }
 
 pub fn draw(f: &mut Frame, app: &mut App) {
+    // Root layout: 1-row topbar (query/dashboard menu strip), main
+    // content, 1-row status bar. The topbar is purely informational
+    // chrome — see [`topbar`] — but anchoring it here keeps the rest
+    // of `draw` ignorant of it.
     let root = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
         .split(f.area());
 
+    topbar::draw_topbar(f, app, root[0]);
+
     let bottom_h = capped(
-        root[0].height,
+        root[1].height,
         BOTTOM_ROW_PCT,
         BOTTOM_ROW_MIN,
         BOTTOM_ROW_MAX,
@@ -159,7 +170,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let body = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(bottom_h)])
-        .split(root[0]);
+        .split(root[1]);
 
     let right_w = capped(body[0].width, RIGHT_COL_PCT, RIGHT_COL_MIN, RIGHT_COL_MAX);
     let top = Layout::default()
@@ -299,7 +310,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let params_focused = app.focus == crate::app::Pane::Params;
     params::draw_params(f, app, params_area, params_focused);
 
-    status::draw_status(f, app, root[1]);
+    status::draw_status(f, app, root[2]);
 
     if app.completions.visible {
         popups::draw_completion_popup(f, app, editor_area);

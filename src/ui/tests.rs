@@ -3,6 +3,8 @@ use super::grid::{
     format_elapsed,
 };
 use super::help::{KEYS_HELP_SOURCE, render_keys_help};
+use super::topbar::tab_spans;
+use crate::app::BufferMode;
 use crate::axiom::{Chart, ChartBase, KnownChart, LayoutItem};
 
 fn note(id: &str) -> Chart {
@@ -250,4 +252,63 @@ fn format_elapsed_width_budget_holds_for_all_buckets() {
             "format_elapsed({d:?}) = {s:?} exceeds 6-char budget"
         );
     }
+}
+
+// --- topbar -----------------------------------------------------------
+//
+// The topbar's job is to make the buffer's scope unambiguous, so the
+// only invariant worth pinning is "exactly one tab carries the active
+// badge style, and it matches `BufferMode`". The spans are pure, so
+// no terminal backend is needed.
+
+fn span_label(span: &ratatui::text::Span<'_>) -> String {
+    span.content.trim().to_string()
+}
+
+fn is_active_badge(span: &ratatui::text::Span<'_>) -> bool {
+    use ratatui::style::{Color, Modifier};
+    span.style.bg == Some(Color::Yellow)
+        && span.style.fg == Some(Color::Black)
+        && span.style.add_modifier.contains(Modifier::BOLD)
+}
+
+#[test]
+fn topbar_query_mode_highlights_query_tab() {
+    let spans = tab_spans(BufferMode::Mpl);
+    // Expect: QUERY (active) · separator · DASHBOARD (inactive).
+    assert_eq!(spans.len(), 3, "tab strip is QUERY · sep · DASHBOARD");
+    assert_eq!(span_label(&spans[0]), "QUERY");
+    assert_eq!(span_label(&spans[2]), "DASHBOARD");
+    assert!(is_active_badge(&spans[0]), "QUERY badge active in Mpl mode");
+    assert!(
+        !is_active_badge(&spans[2]),
+        "DASHBOARD badge must not be active in Mpl mode"
+    );
+}
+
+#[test]
+fn topbar_dashboard_mode_highlights_dashboard_tab() {
+    let spans = tab_spans(BufferMode::Dashboard);
+    assert_eq!(spans.len(), 3);
+    assert!(
+        !is_active_badge(&spans[0]),
+        "QUERY badge must not be active in Dashboard mode"
+    );
+    assert!(
+        is_active_badge(&spans[2]),
+        "DASHBOARD badge active in Dashboard mode"
+    );
+}
+
+#[test]
+fn topbar_mpl_label_uses_file_name_only() {
+    use super::topbar::mpl_label_for_path;
+    use std::path::Path;
+    // Strip directory components so the strip stays narrow.
+    assert_eq!(mpl_label_for_path(Path::new("/tmp/foo.mpl")), "foo.mpl");
+    assert_eq!(mpl_label_for_path(Path::new("foo.mpl")), "foo.mpl");
+    // Edge case: a path with no terminal component falls back to the
+    // full repr so the indicator is never empty for a Some(path).
+    let root = mpl_label_for_path(Path::new("/"));
+    assert!(!root.is_empty(), "root path should not produce empty label");
 }
