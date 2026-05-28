@@ -324,14 +324,39 @@ fn trace_command_with_no_query_reports_unavailable() {
     );
 }
 #[test]
-fn trace_command_returns_global_last_trace_id_outside_grid() {
+fn bare_trace_opens_last_trace_id_outside_grid() {
+    // Bare `:trace` now OPENS the bottom-right trace rather than just
+    // reporting it. Outside Grid that's `last_trace_id`.
+    let mut app = test_app();
+    app.settings.write().set_trace_dataset(Some("ds".into()));
+    app.last_trace_id = Some("abc123".into());
+    app.execute_command("trace");
+    assert_eq!(
+        app.pending_trace_fetch
+            .as_ref()
+            .map(|p| p.trace_id.as_str()),
+        Some("abc123"),
+        "bare :trace must open the displayed trace id"
+    );
+}
+#[test]
+fn bare_trace_without_dataset_errors() {
+    // No trace dataset configured → the open attempt surfaces the
+    // step-20 config error rather than silently doing nothing.
     let mut app = test_app();
     app.last_trace_id = Some("abc123".into());
     app.execute_command("trace");
-    assert_eq!(app.status, "trace: abc123");
+    assert!(app.pending_trace_fetch.is_none());
+    assert!(
+        app.last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("trace dataset")),
+        "got: {:?}",
+        app.last_error
+    );
 }
 #[test]
-fn trace_command_in_grid_uses_focused_tile_trace_id() {
+fn bare_trace_in_grid_opens_focused_tile_trace() {
     let mut app = test_app();
     // Load a multi-tile dashboard so view_mode flips to Grid and
     // selected_chart_idx points at the first chart.
@@ -354,19 +379,18 @@ fn trace_command_in_grid_uses_focused_tile_trace_id() {
         epoch: app.tile_query_epoch,
         result: Ok(resp),
     });
-    // Global last_trace_id is a red herring — grid view must
-    // prefer the focused tile's trace.
+    // A trace dataset must be configured for the open to dispatch.
+    app.settings.write().set_trace_dataset(Some("ds".into()));
+    // Global last_trace_id is a red herring — grid view must open the
+    // focused tile's trace, not the editor's.
     app.last_trace_id = Some("editor-trace".into());
     app.execute_command("trace");
-    assert!(
-        app.status.contains("tile-trace-9"),
-        "status was {:?}",
-        app.status
-    );
-    assert!(
-        !app.status.contains("editor-trace"),
-        "status leaked editor trace: {:?}",
-        app.status
+    assert_eq!(
+        app.pending_trace_fetch
+            .as_ref()
+            .map(|p| p.trace_id.as_str()),
+        Some("tile-trace-9"),
+        "bare :trace in grid must open the focused tile's trace"
     );
 }
 #[test]
@@ -545,17 +569,6 @@ fn trace_with_no_dataset_configured_surfaces_clear_error() {
         "error was {err:?} (status: {:?})",
         app.status
     );
-}
-
-#[test]
-fn bare_trace_still_reports_focused_trace_id_after_dispatcher_added() {
-    // Disposition-A regression guard: even though `:trace`
-    // gained sub-commands, the no-args form must keep its
-    // historical "report the trace id" behavior.
-    let mut app = test_app();
-    app.last_trace_id = Some("reg-9000".into());
-    app.execute_command("trace");
-    assert_eq!(app.status, "trace: reg-9000");
 }
 
 // ---- Status-bar trace id resolver ------------------------------------

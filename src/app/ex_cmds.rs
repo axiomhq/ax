@@ -511,7 +511,7 @@ impl App {
     /// success messages that look identical.
     fn cmd_trace(&mut self, args: &[&str]) {
         match args.split_first() {
-            None => self.cmd_trace_report_id(),
+            None => self.cmd_trace_current(),
             Some((&"set", rest)) => self.cmd_trace_set(rest),
             Some((&"get", rest)) => self.cmd_trace_get(rest),
             Some((&"unset", rest)) => self.cmd_trace_unset(rest),
@@ -571,47 +571,30 @@ impl App {
         }
     }
 
-    /// Bare `:trace` — legacy trace-id reporter. Resolution order:
-    ///   1. While in the trace view, the loaded trace's id.
-    ///   2. In Grid view, the focused tile's per-fetch trace id.
-    ///   3. Otherwise the editor's last query trace id.
-    fn cmd_trace_report_id(&mut self) {
-        // (1) Inside the trace view, the displayed trace is the
-        // obvious thing the user wants reported — not whatever
-        // editor/tile query last ran.
+    /// Bare `:trace` — open the trace currently shown bottom-right
+    /// in the status bar (the focused tile's trace in Grid view,
+    /// else the editor's last-query trace). "What you see is what
+    /// opens": it reuses [`crate::ui::status_trace_id`], the exact
+    /// resolver the status bar renders, so there's no second source
+    /// of truth to drift.
+    ///
+    /// While already inside the trace view there's nothing to open,
+    /// so it just reports the loaded id (the historical bare-`:trace`
+    /// behavior in that context).
+    fn cmd_trace_current(&mut self) {
         if let Some(view) = self.trace_view.as_ref() {
             self.status = format!("trace: {}", view.model.trace_id);
             return;
         }
-        // Prefer the focused tile's trace when we're actually looking
-        // at a panel; this is the whole point of the command.
-        // `Chart::Unknown` has no `ChartBase` (and so no id to key
-        // `tile_results` on, nor name to label), so trace-lookup on a
-        // focused Unknown tile silently falls through to the editor's
-        // last query trace below — same UX as a focused tile that
-        // hasn't returned yet.
-        if self.view_mode == ViewMode::Grid
-            && let Some(resource) = self.loaded_dashboard.as_ref()
-            && let Some(chart) = resource.dashboard.charts.get(self.selected_chart_idx)
-            && let Some(base) = chart.base()
-        {
-            let chart_id = base.id.clone();
-            let label = base.name.clone().unwrap_or_else(|| chart_id.clone());
-            match self
-                .tile_results
-                .get(&chart_id)
-                .and_then(|t| t.trace_id.clone())
-            {
-                Some(id) => self.status = format!("trace `{label}`: {id}"),
-                None => {
-                    self.status = format!("no trace id for `{label}` yet (tile hasn't returned)")
-                }
-            }
+        let Some(id) = crate::ui::status_trace_id(self) else {
+            self.set_error("no trace id to open (run a query first)".to_string());
             return;
-        }
-        match self.last_trace_id.as_deref() {
-            Some(id) => self.status = format!("trace: {id}"),
-            None => self.status = "no trace id available (run a query first)".to_string(),
+        };
+        // Dataset / deployment come from the saved `:trace` defaults
+        // (the trace lives in the trace dataset, not the metric
+        // dataset the id was observed in).
+        if let Err(e) = self.start_trace_fetch(id, None, None) {
+            self.set_error(format!(":trace: {e}"));
         }
     }
 

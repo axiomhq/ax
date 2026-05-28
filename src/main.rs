@@ -29,7 +29,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use crossterm::{
     event::{self, Event},
     execute,
@@ -91,13 +91,23 @@ fn install_panic_hook() {
 }
 
 /// Parsed command-line arguments.
+///
+/// With no subcommand, `mcu [FILE.mpl]` opens an editor (the
+/// historical default). The `trace` / `dashboard` subcommands open a
+/// resource directly on startup. `infer_subcommands` lets them be
+/// abbreviated to any unambiguous prefix (`mcu tr <id>`,
+/// `mcu da <uid>`).
 #[derive(Debug, Default, Parser)]
 #[command(
     name = "mcu",
     version,
     about = "Vim-style TUI editor and dashboard for the Axiom metrics service.",
-    long_about = "FILE.mpl is opened on startup. It will be created on `:w` if missing.\n\
-                  Use -d/--dashboard to load a dashboard by uid on startup."
+    long_about = "With no subcommand, FILE.mpl is opened on startup (created on `:w` if missing).\n\
+                  Subcommands open a resource directly:\n  \
+                  mcu trace <id>       open a trace\n  \
+                  mcu dashboard <uid>  open a dashboard\n\
+                  Subcommand names may be abbreviated when unambiguous (e.g. `mcu tr <id>`).",
+    infer_subcommands = true
 )]
 pub struct CliArgs {
     /// MPL file to open on startup. Created on `:w` if missing.
@@ -110,30 +120,55 @@ pub struct CliArgs {
         short = 'p', long = "param",
         value_name = "NAME=VALUE",
         value_parser = parse_param,
+        global = true,
     )]
     pub params_kv: Vec<(String, String)>,
 
-    /// Fetch and load a dashboard by uid on startup (equivalent to `:open <uid>`).
-    #[arg(
-        short = 'd', long = "dashboard",
-        value_name = "UID",
-        value_parser = parse_dashboard_uid,
-    )]
-    pub dashboard: Option<String>,
-
     /// Use a specific `[deployments.NAME]` entry from `~/.axiom.toml`.
     /// Overrides the `active_deployments` field for this launch only.
+    /// Also supplies the deployment for the `trace` / `dashboard`
+    /// subcommands. `global` so it can appear before or after the
+    /// subcommand.
     #[arg(
         short = 'D', long = "deployment",
         value_name = "NAME",
         value_parser = parse_deployment_name,
+        global = true,
     )]
     pub deployment: Option<String>,
+
+    /// Subcommand to open a resource on startup. `None` runs the
+    /// default editor flow over [`Self::file`].
+    #[command(subcommand)]
+    pub command: Option<Command>,
 
     /// Holds the assembled `params_kv` as a `BTreeMap` for the rest of
     /// the codebase. Populated by [`CliArgs::params`].
     #[arg(skip)]
     pub params: BTreeMap<String, String>,
+}
+
+/// Startup subcommands. Each opens a resource directly instead of the
+/// default editor flow. Deployment is taken from the global
+/// `-D/--deployment` flag.
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Open a trace by id on startup (like `:trace <id>`).
+    Trace {
+        /// Trace id (hex).
+        #[arg(value_name = "ID", value_parser = parse_nonempty_id)]
+        id: String,
+        /// Trace dataset to search. Defaults to the saved
+        /// `:trace set dataset=…` value when omitted.
+        #[arg(long, value_name = "NAME", value_parser = parse_nonempty_id)]
+        dataset: Option<String>,
+    },
+    /// Open a dashboard by uid on startup (like `:open <uid>`).
+    Dashboard {
+        /// Dashboard uid.
+        #[arg(value_name = "UID", value_parser = parse_nonempty_id)]
+        id: String,
+    },
 }
 
 impl CliArgs {
@@ -160,11 +195,11 @@ fn parse_param(raw: &str) -> std::result::Result<(String, String), String> {
     Ok((name, v.to_string()))
 }
 
-/// Validate a dashboard uid — must be non-empty after trimming.
-fn parse_dashboard_uid(raw: &str) -> std::result::Result<String, String> {
+/// Validate an id/uid argument — must be non-empty after trimming.
+fn parse_nonempty_id(raw: &str) -> std::result::Result<String, String> {
     let trimmed = raw.trim().to_string();
     if trimmed.is_empty() {
-        return Err("empty dashboard uid".to_string());
+        return Err("empty id".to_string());
     }
     Ok(trimmed)
 }
@@ -187,31 +222,43 @@ fn run(
 ) -> Result<()> {
     let mut app = App::new(runtime);
     app.params.cli = cli.params;
-    app.deployment_override = cli.deployment;
-    // CLI file argument takes precedence over the session cache. When the file
-    // does not exist yet, we still set it as the current file so `:w` creates it.
-    if let Some(path) = cli.file {
-        if path.exists() {
-            if let Err(e) = app.open_file(path.clone()) {
-                app.set_error(format!("open failed: {e}"));
+    app.deployment_override = cli.deployment.clone();
+
+    // Subcommands open a resource directly; `None` runs the default
+    // editor flow. The resource fetches kick off *before* bootstrap
+    // so a cache-hit can seed state before any auto-run, and they
+    // suppress the saved-query auto-run (the async response drives
+    // the view instead).
+    match cli.command {
+        Some(Command::Trace { id, dataset }) => {
+            // Deployment comes from the global `-D` flag; dataset from
+            // `--dataset` or the saved `:trace` default.
+            if let Err(e) = app.start_trace_fetch(id, dataset, cli.deployment.clone()) {
+                app.set_error(format!("trace: {e}"));
             }
-        } else {
-            app.current_file = Some(path.clone());
-            app.saved_buffer = String::new();
-            app.status = format!("new file: {}", path.display());
+            app.bootstrap_skip_initial_query();
         }
-    }
-    // Order matters: kick off the dashboard fetch *before* bootstrap so
-    // the cache-hit path can seed the editor with the dashboard's MPL
-    // before bootstrap's auto-run reads `query_text()`. On a cold
-    // dashboard cache the fetch is async — we suppress the saved-query
-    // auto-run so we don't push results for the wrong MPL into
-    // `self.series` while waiting for `DashboardOpened`.
-    if let Some(uid) = cli.dashboard {
-        app.fetch_dashboard_by_uid(uid);
-        app.bootstrap_skip_initial_query();
-    } else {
-        app.bootstrap();
+        Some(Command::Dashboard { id }) => {
+            app.fetch_dashboard_by_uid(id);
+            app.bootstrap_skip_initial_query();
+        }
+        None => {
+            // CLI file argument takes precedence over the session
+            // cache. When the file doesn't exist yet, we still set it
+            // as the current file so `:w` creates it.
+            if let Some(path) = cli.file {
+                if path.exists() {
+                    if let Err(e) = app.open_file(path.clone()) {
+                        app.set_error(format!("open failed: {e}"));
+                    }
+                } else {
+                    app.current_file = Some(path.clone());
+                    app.saved_buffer = String::new();
+                    app.status = format!("new file: {}", path.display());
+                }
+            }
+            app.bootstrap();
+        }
     }
 
     while !app.should_quit {
@@ -323,48 +370,97 @@ mod tests {
 
     #[test]
     fn second_positional_errors() {
+        // The first token is the file positional; a second bare token
+        // is rejected — clap now routes it through the subcommand
+        // matcher, so the wording is "unrecognized subcommand".
         let err = parse(&["a.mpl", "b.mpl"]).unwrap_err().to_lowercase();
         assert!(
-            err.contains("unexpected") || err.contains("argument"),
+            err.contains("unexpected")
+                || err.contains("argument")
+                || err.contains("unrecognized subcommand"),
             "got {err}"
         );
     }
 
-    #[test]
-    fn dashboard_flag_short_and_long() {
-        let cli = parse(&["-d", "abc123"]).unwrap();
-        assert_eq!(cli.dashboard.as_deref(), Some("abc123"));
-        let cli = parse(&["--dashboard=xyz"]).unwrap();
-        assert_eq!(cli.dashboard.as_deref(), Some("xyz"));
+    /// Helper: extract the parsed subcommand.
+    fn cmd(args: &[&str]) -> Command {
+        parse(args).unwrap().command.expect("subcommand parsed")
     }
 
     #[test]
-    fn dashboard_flag_missing_value_errors() {
-        let err = parse(&["-d"]).unwrap_err().to_lowercase();
+    fn trace_subcommand_basic() {
+        match cmd(&["trace", "abc123"]) {
+            Command::Trace { id, dataset } => {
+                assert_eq!(id, "abc123");
+                assert_eq!(dataset, None);
+            }
+            other => panic!("expected Trace, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn trace_subcommand_with_dataset() {
+        match cmd(&["trace", "abc123", "--dataset", "axiom-traces-staging"]) {
+            Command::Trace { id, dataset } => {
+                assert_eq!(id, "abc123");
+                assert_eq!(dataset.as_deref(), Some("axiom-traces-staging"));
+            }
+            other => panic!("expected Trace, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dashboard_subcommand_basic() {
+        match cmd(&["dashboard", "xyz"]) {
+            Command::Dashboard { id } => assert_eq!(id, "xyz"),
+            other => panic!("expected Dashboard, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subcommands_match_unambiguous_prefixes() {
+        // `infer_subcommands`: any unambiguous prefix resolves.
+        assert!(matches!(cmd(&["tr", "id"]), Command::Trace { .. }));
+        assert!(matches!(cmd(&["t", "id"]), Command::Trace { .. }));
+        assert!(matches!(cmd(&["da", "id"]), Command::Dashboard { .. }));
+        assert!(matches!(cmd(&["d", "id"]), Command::Dashboard { .. }));
+    }
+
+    #[test]
+    fn deployment_flag_is_global_across_subcommands() {
+        // `-D` works before or after the subcommand.
+        let cli = parse(&["-D", "prod", "trace", "abc"]).unwrap();
+        assert_eq!(cli.deployment.as_deref(), Some("prod"));
+        assert!(matches!(cli.command, Some(Command::Trace { .. })));
+        let cli = parse(&["trace", "abc", "-D", "prod"]).unwrap();
+        assert_eq!(cli.deployment.as_deref(), Some("prod"));
+    }
+
+    #[test]
+    fn trace_subcommand_missing_id_errors() {
+        let err = parse(&["trace"]).unwrap_err().to_lowercase();
         assert!(
-            err.contains("requires") || err.contains("missing") || err.contains("value"),
+            err.contains("required") || err.contains("<id>") || err.contains("id"),
             "got {err}"
         );
     }
 
     #[test]
-    fn dashboard_flag_empty_value_errors() {
-        let err = parse(&["-d", "   "]).unwrap_err();
-        assert!(err.contains("empty dashboard uid"), "got {err}");
+    fn trace_subcommand_empty_id_errors() {
+        let err = parse(&["trace", "   "]).unwrap_err();
+        assert!(err.contains("empty id"), "got {err}");
     }
 
     #[test]
-    fn dashboard_flag_duplicated_errors() {
-        // clap rejects a second occurrence of a single-value option;
-        // the exact wording is its `the argument ... cannot be used
-        // multiple times` text.
-        let err = parse(&["-d", "one", "--dashboard", "two"])
-            .unwrap_err()
-            .to_lowercase();
-        assert!(
-            err.contains("multiple times") || err.contains("more than once"),
-            "got {err}"
+    fn file_positional_still_works_with_subcommands_present() {
+        // A non-subcommand first token is the file positional, not an
+        // "unrecognized subcommand" error.
+        let cli = parse(&["q.mpl"]).unwrap();
+        assert_eq!(
+            cli.file.as_deref().map(|p| p.to_str().unwrap()),
+            Some("q.mpl")
         );
+        assert!(cli.command.is_none());
     }
 
     #[test]

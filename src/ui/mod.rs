@@ -41,9 +41,9 @@ mod time_picker;
 mod topbar;
 mod trace;
 
-// Re-exported so unit tests in `app::tests` can assert the resolver
+// Re-exported so `:trace` (bare form) can open the same trace the
+// status bar shows, and so unit tests can assert the resolver
 // without rendering a frame.
-#[cfg(test)]
 pub(crate) use status::status_trace_id;
 
 // Soft caps for the secondary panes so they don't eat huge chunks of

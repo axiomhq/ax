@@ -48,11 +48,17 @@ the cache. To open a file:
 mcu my-query.mpl
 ```
 
-To jump straight into a dashboard:
+To jump straight into a resource, use a subcommand (names may be
+abbreviated to any unambiguous prefix, e.g. `mcu tr` / `mcu da`):
 
 ```sh
-mcu -d <dashboard-uid>
+mcu dashboard <dashboard-uid>
+mcu trace <trace-id> [--dataset <name>]
 ```
+
+The trace dataset defaults to your saved `:trace set dataset=…`; the
+global `-D/--deployment` flag selects the deployment for either
+subcommand.
 
 If your MPL declares parameters (`param $host: string;`) you can
 supply values from the command line:

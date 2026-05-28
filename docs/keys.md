@@ -185,7 +185,8 @@ Esc	close popup / return to Normal
 :p / :param	set/clear params (`:p NAME=VAL` set, `:p NAME=` clear, `:p!` clear all)
 :viz <kind>	switch viz kind for the focused tile
 :ax / :axiom	open the current query in the Axiom web UI
-:trace	report the trace id of the focused panel
+:trace	open the trace shown bottom-right (focused panel / last query)
+:trace <id>	open a specific trace (`dataset=` / `deployment=` optional)
 :trace get	echo the persisted trace defaults (dataset/deployment)
 :trace set KEY=VAL	persist a trace default (`dataset`, `deployment`)
 :trace unset KEY	clear a persisted trace default
