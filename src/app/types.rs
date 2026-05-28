@@ -39,6 +39,16 @@ pub enum AppEvent {
         id: u64,
         result: anyhow::Result<MetricsQueryResponse>,
     },
+    /// Standalone-buffer APL query result. Same id-based
+    /// stale-result protection as [`AppEvent::QueryFinished`];
+    /// the handler decodes via
+    /// [`crate::viz::apl_decode::to_series`] and surfaces a
+    /// decoder error in `status` if the response shape can't be
+    /// reshaped into chart series (e.g. no time column).
+    AplQueryFinished {
+        id: u64,
+        result: anyhow::Result<AplQueryResult>,
+    },
     DashboardsFetched(anyhow::Result<Vec<DashboardSummary>>),
     /// Single dashboard fetched via `GET /v2/dashboards/uid/{uid}`,
     /// triggered by selecting an entry in the picker or running
@@ -383,6 +393,12 @@ pub enum Pane {
     /// chrome blocks. Arrow keys cycle selection; `Enter`/`v` zooms
     /// back into Solo on the selected tile.
     Dashboard,
+    /// Solo Table viz pane: focused when the user wants to navigate
+    /// the rows of an APL table result. Only enterable while
+    /// `App.table_result.is_some()` — `set_focus` refuses otherwise.
+    /// `j/k/g/G/Ctrl-D/Ctrl-U/PgDn/PgUp` move the selection,
+    /// `Esc/h/Left` returns to the editor.
+    Table,
 }
 
 /// Where the main visualisation area focuses. `Solo` is the

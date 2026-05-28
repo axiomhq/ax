@@ -56,6 +56,22 @@ pub struct App {
     pub mode: Mode,
     pub editor: TextArea<'static>,
     pub series: Vec<Series>,
+    /// Table-shaped result from the most recent APL query in
+    /// standalone-buffer mode. Set by the `AplQueryFinished`
+    /// handler when the active viz kind is Table or LogStream;
+    /// otherwise the handler clears it so a stale APL table can't
+    /// bleed into a fresh MPL result. `None` in MPL mode.
+    pub table_result: Option<crate::viz::TableResult>,
+    /// Row index for the solo Table viz selection. Reset to 0
+    /// whenever a new `table_result` lands; clamped to
+    /// `len()-1` on render so a smaller follow-up response
+    /// doesn't render off the end. Only meaningful while
+    /// `table_result.is_some()`.
+    pub table_selected: usize,
+    /// `gg` two-step latch for the table pane (mirrors
+    /// `LegendState::pending_g`). Reset on any non-`g` key so the
+    /// modal feel matches vim.
+    pub table_pending_g: bool,
     /// OTEL/UCUM unit resolved for the editor's current query, set
     /// when `QueryFinished` lands. Drives axis scaling in the solo
     /// chart pane the same way `TileQueryResult.unit` drives grid
@@ -269,16 +285,33 @@ impl App {
         let (events_tx, events_rx) = mpsc::channel();
         let cached_count = cache.dataset_count();
         let saved_query = cache.load_query();
+        // Restore the saved language sidecar (":apl" / ":mpl" state)
+        // so re-opening doesn't silently drop the user back to MPL
+        // after they were editing APL last session. Missing sidecar
+        // defaults to the language enum's `Default` (MPL).
+        let saved_lang = cache.load_query_lang().and_then(|s| match s.as_str() {
+            "apl" => Some(crate::dashboard::Lang::Apl),
+            "mpl" => Some(crate::dashboard::Lang::Mpl),
+            _ => None,
+        });
         let editor = match &saved_query {
             Some(text) => editor::editor_with_text(text),
             None => editor::new_editor(),
         };
         let cache = Arc::new(RwLock::new(cache));
+        // Annotate the restore message with the language so the
+        // user sees at startup which mode the restored buffer is
+        // in (status bar shows it too, but the boot message is
+        // the first feedback).
+        let restored_tag = match saved_lang {
+            Some(crate::dashboard::Lang::Apl) => " (APL)",
+            _ => "",
+        };
         let status = match (cached_count, saved_query.is_some()) {
             (0, false) => "ready".to_string(),
-            (0, true) => "restored previous query".to_string(),
+            (0, true) => format!("restored previous query{restored_tag}"),
             (n, false) => format!("loaded {n} dataset(s) from cache"),
-            (n, true) => format!("loaded {n} dataset(s); restored previous query"),
+            (n, true) => format!("loaded {n} dataset(s); restored previous query{restored_tag}"),
         };
         let initial_text = saved_query
             .clone()
@@ -312,7 +345,7 @@ impl App {
             loaded_dashboard: None,
             dashinfo_visible: false,
             buffer_mode: BufferMode::Mpl,
-            buffer_lang: crate::dashboard::Lang::default(),
+            buffer_lang: saved_lang.unwrap_or_default(),
             tile_inspect_json: None,
             view_mode: ViewMode::Solo,
             selected_chart_idx: 0,
@@ -328,6 +361,9 @@ impl App {
             last_adopted_seed: None,
             last_error: None,
             series: demo_series(),
+            table_result: None,
+            table_selected: 0,
+            table_pending_g: false,
             unit: None,
             status,
             should_quit: false,
@@ -645,8 +681,15 @@ impl App {
             return;
         }
         let text = self.query_text();
-        if let Err(e) = self.cache.read().save_query(&text) {
+        let cache = self.cache.read();
+        if let Err(e) = cache.save_query(&text) {
             eprintln!("mcu: query cache save failed: {e}");
+        }
+        // Persist the buffer language sidecar so the next launch
+        // restores `:apl` / `:mpl` state alongside the query text.
+        // Best-effort like the text save.
+        if let Err(e) = cache.save_query_lang(self.buffer_lang.as_sidecar()) {
+            eprintln!("mcu: query lang sidecar save failed: {e}");
         }
     }
 

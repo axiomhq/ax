@@ -8,7 +8,7 @@ use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Rect},
     style::{Color, Modifier, Style},
-    widgets::{Block, Cell as TCell, Paragraph, Row, Table},
+    widgets::{Block, Cell as TCell, Paragraph, Row, Table, TableState},
 };
 
 use super::agg::{Agg, format_value};
@@ -121,7 +121,8 @@ pub(super) fn draw_table(
         .and_then(|s| Agg::parse(s))
         .unwrap_or(Agg::Last);
     let t = series_to_table(series, hidden, agg);
-    draw_table_result(f, &t, block, area);
+    // Dashboard / non-stateful tile path: no selection state.
+    draw_table_result(f, &t, None, false, block, area);
 }
 
 /// Render a pre-built [`TableResult`] (the APL path). Same chrome as
@@ -129,7 +130,20 @@ pub(super) fn draw_table(
 /// decoder already produced the table-shaped result, so feeding it
 /// back through `series_to_table` would lose column types and force
 /// every cell through the `Agg::Last` aggregation.
-pub fn draw_table_result(f: &mut Frame, t: &TableResult, block: Block<'_>, area: Rect) {
+///
+/// When `selected_row` is `Some`, the widget is rendered statefully:
+/// the row is highlighted, ratatui auto-scrolls to keep it visible.
+/// `focused` controls highlight intensity — a brighter cyan for the
+/// active pane, a dim gray fallback so a non-focused table still
+/// shows the user where the cursor sits.
+pub fn draw_table_result(
+    f: &mut Frame,
+    t: &TableResult,
+    selected_row: Option<usize>,
+    focused: bool,
+    block: Block<'_>,
+    area: Rect,
+) {
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
@@ -186,8 +200,28 @@ pub fn draw_table_result(f: &mut Frame, t: &TableResult, block: Block<'_>, area:
         })
         .collect();
 
-    let table = Table::new(rows, constraints)
+    let mut table = Table::new(rows, constraints)
         .header(header)
         .column_spacing(1);
-    f.render_widget(table, inner);
+    if let Some(idx) = selected_row {
+        // Clamp here so a caller racing a smaller follow-up
+        // response can't aim past the end.
+        let idx = idx.min(t.rows.len().saturating_sub(1));
+        let highlight_style = if focused {
+            Style::default()
+                .bg(Color::Cyan)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().add_modifier(Modifier::REVERSED)
+        };
+        table = table
+            .row_highlight_style(highlight_style)
+            .highlight_symbol("▶ ");
+        let mut state = TableState::default();
+        state.select(Some(idx));
+        f.render_stateful_widget(table, inner, &mut state);
+    } else {
+        f.render_widget(table, inner);
+    }
 }

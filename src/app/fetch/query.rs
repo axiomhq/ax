@@ -93,16 +93,56 @@ impl App {
         self.status = format!("refetching tile {id}…");
     }
 
+    /// Standalone-buffer APL execution path. Mirrors
+    /// [`Self::run_query`]'s busy / id / status bookkeeping but
+    /// skips MPL-only steps: there's no local dataset extraction
+    /// (APL queries embed the dataset in their text), no MPL
+    /// analyzer (already gated upstream), and no tag prefetch
+    /// (the prefetcher only understands MPL `metric:agg` shape).
+    fn run_apl_query(&mut self, apl: String) {
+        // No `last_query_context` snapshot: the APL endpoint
+        // doesn't share the `dataset / metric` identity that the
+        // post-result toggle bookkeeping in `QueryContext` keys
+        // off, so leaving the slot at its prior value is correct
+        // (clearing it would invalidate unrelated cached state).
+        let client = match self.ensure_client() {
+            Ok(c) => c.clone(),
+            Err(e) => {
+                self.status = format!("config error: {e}");
+                return;
+            }
+        };
+        self.last_query_id = self.last_query_id.wrapping_add(1);
+        let id = self.last_query_id;
+        self.busy = true;
+        self.status = "running APL query…".to_string();
+        self.persist_query();
+        let tx = self.events_tx.clone();
+        let (start, end) = self.active_time_range();
+        self.runtime.spawn(async move {
+            let result = run_apl_query_task(&client, &apl, &start, &end).await;
+            let _ = tx.send(AppEvent::AplQueryFinished { id, result });
+        });
+    }
+
     pub(in crate::app) fn run_query(&mut self) {
         if self.busy {
             self.status = "already busy".to_string();
             return;
         }
-        let mpl = self.query_text();
-        if mpl.trim().is_empty() {
+        let text = self.query_text();
+        if text.trim().is_empty() {
             self.status = "empty query".to_string();
             return;
         }
+        // Language-aware dispatch. The MPL path needs dataset / tag
+        // resolution and the local analyzer; the APL path bypasses
+        // all of that and hands the buffer straight to the server.
+        if self.active_lang() == crate::dashboard::Lang::Apl {
+            self.run_apl_query(text);
+            return;
+        }
+        let mpl = text;
         // The MetricsDB server resolves `$__interval` and friends from the
         // request's time window, so we send the buffer verbatim.
         let (dataset, metric) = match mpl::extract_dataset_metric(&mpl) {

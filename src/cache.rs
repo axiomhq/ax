@@ -143,6 +143,20 @@ impl Cache {
         }
     }
 
+    /// Test-only constructor that points the cache at a real path
+    /// so persistence round-trips (`save_query` / `load_query`,
+    /// `save_query_lang` / `load_query_lang`) hit the filesystem
+    /// like the production `load`.
+    #[cfg(test)]
+    pub fn with_path(fallback_base_url: String, path: PathBuf) -> Self {
+        let data = read_data_from_disk(&path).unwrap_or_default();
+        Self {
+            path: Some(path),
+            data,
+            fallback_base_url,
+        }
+    }
+
     pub fn dataset_count(&self) -> usize {
         self.data.datasets.len()
     }
@@ -421,6 +435,19 @@ impl Cache {
         if text.is_empty() { None } else { Some(text) }
     }
 
+    /// Load the saved query buffer's language marker (`"apl"` or
+    /// `"mpl"`), if a sidecar exists. Missing / malformed yields
+    /// `None` and the caller defaults. Decoupled from
+    /// [`Self::load_query`] so persistence can be staged: an
+    /// `mcu` build without this sidecar still reads the same
+    /// `query.mpl`.
+    pub fn load_query_lang(&self) -> Option<String> {
+        let path = self.query_meta_path()?;
+        let text = fs::read_to_string(&path).ok()?;
+        let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+        v.get("lang")?.as_str().map(|s| s.to_string())
+    }
+
     /// Persist the current query text. No-op when path is unset (tests).
     pub fn save_query(&self, query: &str) -> Result<()> {
         let Some(path) = self.query_path() else {
@@ -429,9 +456,29 @@ impl Cache {
         atomic_write_text(&path, query)
     }
 
+    /// Persist the buffer's language marker beside the query text.
+    /// `lang` is a free-form string the caller controls ("apl" /
+    /// "mpl"); the cache layer doesn't validate it so it stays
+    /// decoupled from the `Lang` enum's actual location. No-op
+    /// when path is unset (tests).
+    pub fn save_query_lang(&self, lang: &str) -> Result<()> {
+        let Some(path) = self.query_meta_path() else {
+            return Ok(());
+        };
+        let json = serde_json::json!({ "lang": lang }).to_string();
+        atomic_write_text(&path, &json)
+    }
+
     /// Path used for the persisted query buffer.
     fn query_path(&self) -> Option<PathBuf> {
         self.path.as_ref().map(|p| p.with_file_name("query.mpl"))
+    }
+
+    /// Sidecar JSON path for query metadata (currently: language).
+    fn query_meta_path(&self) -> Option<PathBuf> {
+        self.path
+            .as_ref()
+            .map(|p| p.with_file_name("query.meta.json"))
     }
 
     #[cfg(test)]

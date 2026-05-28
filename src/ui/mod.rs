@@ -183,18 +183,50 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         // as markdown; metrics tiles ignore it (they consume `series`
         // instead).
         let viz_body = app.query_text();
-        viz::draw(
-            f,
+        // APL Table / LogStream short-circuit: when the buffer
+        // language produced a `table_result` (typed columns from
+        // the APL decoder), render it directly. The default
+        // `viz::draw` path for Table would otherwise go through
+        // `series_to_table`, which forces every row through
+        // `Agg::Last` — collapsing N typed rows into a single
+        // row of last-values.
+        let wants_table = matches!(
             viz_kind,
-            &app.series,
-            &app.legend.hidden,
-            selected_for_graph,
-            &viz_opts,
-            &viz_body,
-            app.unit.as_ref(),
-            pane_block(&format!("graph · {}", viz_kind.as_str()), false),
-            top[0],
+            crate::dashboard::VizKind::Table | crate::dashboard::VizKind::LogStream
         );
+        if wants_table && let Some(t) = app.table_result.as_ref() {
+            // Always show a selection cursor so the user can see
+            // scroll position; only paint it actively while the
+            // Table pane is focused so an unfocused table doesn't
+            // grab visual weight from the editor.
+            let selected = if t.rows.is_empty() {
+                None
+            } else {
+                Some(app.table_selected.min(t.rows.len() - 1))
+            };
+            let table_focused = app.focus == crate::app::Pane::Table;
+            viz::draw_table_result(
+                f,
+                t,
+                selected,
+                table_focused,
+                pane_block(&format!("graph · {}", viz_kind.as_str()), table_focused),
+                top[0],
+            );
+        } else {
+            viz::draw(
+                f,
+                viz_kind,
+                &app.series,
+                &app.legend.hidden,
+                selected_for_graph,
+                &viz_opts,
+                &viz_body,
+                app.unit.as_ref(),
+                pane_block(&format!("graph · {}", viz_kind.as_str()), false),
+                top[0],
+            );
+        }
     }
     // Side legend source switches in Grid view: instead of the
     // editor's query result, mirror the focused dashboard tile's

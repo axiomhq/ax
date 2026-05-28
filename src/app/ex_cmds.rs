@@ -253,6 +253,12 @@ impl App {
         }
         if self.buffer_mode != BufferMode::Dashboard {
             self.buffer_lang = lang;
+            // Re-run the language-gated diagnostics pass so any
+            // stale errors from the previous dialect (e.g. an
+            // unsolicited "MPL syntax error" left over on what is
+            // now an APL buffer) clear immediately instead of
+            // lingering until the next buffer-mutating keystroke.
+            self.recompute_diagnostics();
             self.status = format!("lang: {} (buffer)", lang.label());
             return;
         }
@@ -262,6 +268,7 @@ impl App {
         self.sync_buffer_to_focused_tile();
         let Some(resource) = self.loaded_dashboard.as_mut() else {
             self.buffer_lang = lang;
+            self.recompute_diagnostics();
             self.status = format!("lang: {} (buffer)", lang.label());
             return;
         };

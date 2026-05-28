@@ -523,6 +523,221 @@ const APL_TWO_COLUMN_FIXTURE: &str = r#"{
 /// raw APL text. Two bugs were fixed at once: (a) the kind-fallback
 /// mis-classified bracketed APL as MPL, (b) `recompute_diagnostics`
 /// ran the MPL analyzer regardless of language.
+/// Regression: in standalone-buffer mode (no dashboard loaded), the
+/// `RunQuery` command must dispatch through the APL endpoint when
+/// `buffer_lang == Apl`. Before this fix the buffer flowed through
+/// `mpl::extract_dataset_metric`, which rejected APL syntax with
+/// `MPL error: …` and never sent the request.
+/// Regression: typing MPL, then running `:apl`, must clear the
+/// stale MPL diagnostics. Before this fix the status bar still
+/// showed "1 error - 2:1: MPL syntax error" after the flip because
+/// `cmd_lang` only updated `buffer_lang`; the lang-gated
+/// `recompute_diagnostics` then only fired on the next buffer
+/// keystroke.
+/// Regression: in solo mode with `// @viz table`, an APL response
+/// must populate `app.table_result` (raw decoder output) instead
+/// of going through `to_series` → `series_to_table`. The old path
+/// aggregated each series down to a single row, so an N-row APL
+/// response displayed as one row.
+/// j/k/g/G/Esc bindings on the solo Table pane behave like the
+/// legend pane: clamp at edges, `gg` is two-step, `Esc` returns to
+/// the editor. Driven through `handle_table_key` so the dispatch
+/// in `keys/mod.rs` is exercised too.
+/// Regression: persisting an APL buffer and re-opening must restore
+/// `:apl` state (not silently drop the user back to MPL).
+/// Drives the full `persist_query` → `load_query{,_lang}` →
+/// `with_cache` round-trip through a real on-disk path.
+#[test]
+fn persist_query_round_trips_buffer_lang_through_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache_path = dir.path().join("discovery.json");
+    // Build an app pointed at the temp cache, flip to APL, type
+    // an APL query, persist.
+    let handle = tokio::runtime::Runtime::new().unwrap().handle().clone();
+    let cache = crate::cache::Cache::with_path(String::new(), cache_path.clone());
+    let mut app = crate::app::App::with_cache(handle.clone(), cache);
+    app.cmd_lang(Lang::Apl);
+    set_buffer(&mut app, "['logs'] | count");
+    app.persist_query();
+    // New app from a fresh cache pointed at the same path —
+    // mimics the next process launch.
+    let cache2 = crate::cache::Cache::with_path(String::new(), cache_path);
+    let app2 = crate::app::App::with_cache(handle, cache2);
+    assert_eq!(app2.buffer_lang, Lang::Apl, "buffer_lang must round-trip");
+    assert_eq!(
+        app2.query_text(),
+        "['logs'] | count",
+        "query text must round-trip"
+    );
+    assert!(
+        app2.status.contains("APL"),
+        "status should advertise restored APL: {:?}",
+        app2.status
+    );
+}
+
+#[test]
+fn table_pane_keys_navigate_rows_and_clamp_at_edges() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let mut app = test_app();
+    app.viz_kind = crate::dashboard::VizKind::Table;
+    // Seed a 4-row table_result directly so we don't have to fake
+    // a network response.
+    app.table_result = Some(crate::viz::TableResult {
+        columns: vec!["level".into(), "n".into()],
+        rows: (0..4)
+            .map(|i| {
+                vec![
+                    crate::viz::table::TableCell::Str(format!("row{i}")),
+                    crate::viz::table::TableCell::Int(i as i64),
+                ]
+            })
+            .collect(),
+    });
+    app.set_focus(crate::app::Pane::Table);
+    assert_eq!(app.focus, crate::app::Pane::Table);
+    // Drive through the public dispatcher so the `Pane::Table` arm
+    // in `keys::mod` is exercised end-to-end.
+    let press = |app: &mut crate::app::App, code: KeyCode, m: KeyModifiers| {
+        app.on_key(KeyEvent::new(code, m));
+    };
+    // `j` advances; clamps at the last row.
+    press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+    assert_eq!(app.table_selected, 1);
+    for _ in 0..10 {
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+    }
+    assert_eq!(app.table_selected, 3, "j must clamp at last row");
+    // `k` decrements; clamps at 0.
+    press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+    assert_eq!(app.table_selected, 2);
+    for _ in 0..10 {
+        press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+    }
+    assert_eq!(app.table_selected, 0, "k must clamp at row 0");
+    // `G` jumps to last.
+    press(&mut app, KeyCode::Char('G'), KeyModifiers::SHIFT);
+    assert_eq!(app.table_selected, 3);
+    // `gg` two-step jumps to first.
+    press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE);
+    assert!(app.table_pending_g, "first g must arm pending");
+    press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE);
+    assert_eq!(app.table_selected, 0);
+    assert!(!app.table_pending_g);
+    // `Esc` returns focus to the editor.
+    press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+    assert_eq!(app.focus, crate::app::Pane::Editor);
+}
+
+/// `set_focus(Pane::Table)` refuses to enter the table pane when
+/// there's nothing to select — prevents the user getting trapped
+/// in an empty pane that can't render a cursor.
+#[test]
+fn set_focus_refuses_table_pane_with_no_rows() {
+    let mut app = test_app();
+    // No table_result at all.
+    app.set_focus(crate::app::Pane::Table);
+    assert_eq!(app.focus, crate::app::Pane::Editor);
+    assert!(app.status.contains("no table"), "status: {:?}", app.status);
+    // Empty rows is also refused.
+    app.table_result = Some(crate::viz::TableResult {
+        columns: vec!["x".into()],
+        rows: vec![],
+    });
+    app.set_focus(crate::app::Pane::Table);
+    assert_eq!(app.focus, crate::app::Pane::Editor);
+}
+
+#[test]
+fn apl_query_finished_with_table_viz_populates_table_result() {
+    let mut app = test_app();
+    app.buffer_lang = Lang::Apl;
+    app.viz_kind = crate::dashboard::VizKind::Table;
+    app.last_query_id = 7;
+    // Two-column response with multiple rows. The series
+    // → table adapter would collapse this to one row per group.
+    let raw = serde_json::json!({
+        "status": {
+            "elapsedTime": 0, "blocksExamined": 0, "rowsExamined": 0,
+            "rowsMatched": 0, "numGroups": 0, "isPartial": false,
+            "continuationToken": null, "cacheStatus": 0,
+            "minBlockTime": "2024-01-01T00:00:00Z",
+            "maxBlockTime": "2024-01-01T00:00:00Z"
+        },
+        "tables": [{
+            "name": "0", "sources": [{"name": "logs"}],
+            "fields": [
+                {"name": "level", "type": "string"},
+                {"name": "n", "type": "long"}
+            ],
+            "order": [], "groups": [{"name": "level"}],
+            "range": null, "buckets": null,
+            "columns": [["error", "warn", "info"], [3, 12, 75]]
+        }]
+    });
+    let resp: crate::axiom::AplQueryResult = serde_json::from_value(raw).unwrap();
+    app.handle_event(AppEvent::AplQueryFinished {
+        id: 7,
+        result: Ok(resp),
+    });
+    let table = app
+        .table_result
+        .as_ref()
+        .expect("table_result must be populated for Table viz");
+    assert_eq!(table.columns, vec!["level", "n"]);
+    assert_eq!(
+        table.rows.len(),
+        3,
+        "all rows must survive the decode (the old path collapsed to 1)"
+    );
+    // Series must be cleared so the renderer has an unambiguous
+    // data source.
+    assert!(app.series.is_empty());
+    assert_eq!(app.status, "3 rows");
+}
+
+#[test]
+fn cmd_apl_in_solo_mode_clears_stale_mpl_diagnostics() {
+    let mut app = test_app();
+    // Put some text that the MPL analyzer flags as an error.
+    set_buffer(&mut app, "// header\nthis is definitely not MPL");
+    app.recompute_diagnostics();
+    assert!(
+        !app.diagnostics.is_empty(),
+        "precondition: MPL analyzer should flag the buffer"
+    );
+    // Flip to APL. Diagnostics must clear immediately.
+    app.cmd_lang(Lang::Apl);
+    assert_eq!(app.buffer_lang, Lang::Apl);
+    assert!(
+        app.diagnostics.is_empty(),
+        "`:apl` left stale diagnostics: {:?}",
+        app.diagnostics
+    );
+}
+
+#[test]
+fn run_query_in_solo_mode_dispatches_apl_when_buffer_is_apl() {
+    let mut app = test_app();
+    app.buffer_lang = Lang::Apl;
+    set_buffer(&mut app, "['logs'] | summarize count() by bin(_time, 1h)");
+    let before = app.last_query_id;
+    app.run_query();
+    // The MPL guard rail used to set `MPL error: …` here; APL
+    // dispatch must instead bump the query id and flip busy.
+    assert!(app.busy, "APL dispatch should have set busy=true");
+    assert_eq!(
+        app.last_query_id,
+        before.wrapping_add(1),
+        "APL dispatch must claim a query id like MPL does"
+    );
+    assert!(
+        app.status.contains("APL"),
+        "status should hint at APL dispatch, got: {:?}",
+        app.status
+    );
+}
+
 #[test]
 fn loading_apl_dashboard_does_not_report_mpl_errors() {
     use crate::axiom::{Chart, ChartBase, DashboardDocument, KnownChart};

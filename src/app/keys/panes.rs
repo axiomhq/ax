@@ -19,10 +19,20 @@ impl App {
         use Pane::*;
         let grid = self.view_mode == ViewMode::Grid;
         let has_dash = grid && self.loaded_dashboard.is_some();
-        // `w` cycles Editor → Legend → Params → (Dashboard if Grid) → Editor.
+        // When the solo view is rendering an APL Table result, the
+        // right-hand graph slot holds the table (series is empty),
+        // so substitute Table for Legend in the cycle. Otherwise
+        // keep the historical rotation intact.
+        let has_table = !grid
+            && self
+                .table_result
+                .as_ref()
+                .is_some_and(|t| !t.rows.is_empty());
+        let secondary = if has_table { Table } else { Legend };
+        // `w` cycles Editor → secondary → Params → (Dashboard if Grid) → Editor.
         let cycle = || match self.focus {
-            Editor => Legend,
-            Legend => Params,
+            Editor => secondary,
+            Legend | Table => Params,
             Params => {
                 if grid {
                     Dashboard
@@ -44,7 +54,7 @@ impl App {
             // otherwise Editor. Dashboard's right is Legend.
             (Char('h'), M::NONE) | (Left, _) => match self.focus {
                 Legend if has_dash => Dashboard,
-                Legend | Params => Editor,
+                Legend | Table | Params => Editor,
                 p => p,
             },
             (Char('l'), M::NONE) | (Right, _) => match self.focus {
@@ -53,14 +63,14 @@ impl App {
                 p => p,
             },
             (Char('j'), M::NONE) | (Down, _) => match self.focus {
-                Legend => Params,
+                Legend | Table => Params,
                 Dashboard => Editor,
                 p => p,
             },
             (Char('k'), M::NONE) | (Up, _) => match self.focus {
-                Params => Legend,
+                Params => secondary,
                 Editor if grid => Dashboard,
-                Editor => Legend,
+                Editor => secondary,
                 p => p,
             },
             _ => return,
@@ -73,9 +83,23 @@ impl App {
             self.status = "no series to focus".to_string();
             return;
         }
+        if pane == Pane::Table && self.table_result.as_ref().is_none_or(|t| t.rows.is_empty()) {
+            self.status = "no table rows to focus".to_string();
+            return;
+        }
         self.focus = pane;
         if pane != Pane::Legend {
             self.legend.details_visible = false;
+        }
+        if pane == Pane::Table {
+            // Clamp on entry so a stale index from a previous table
+            // doesn't render off the end.
+            if let Some(t) = self.table_result.as_ref()
+                && !t.rows.is_empty()
+                && self.table_selected >= t.rows.len()
+            {
+                self.table_selected = t.rows.len() - 1;
+            }
         }
         if pane == Pane::Params {
             // Clamp on entry so a stale index from a previous buffer
@@ -132,6 +156,65 @@ impl App {
         let cur = self.params.selected as i32;
         let next = (cur + delta).rem_euclid(n);
         self.params.selected = next as usize;
+    }
+
+    /// Bindings while the solo Table-viz pane has focus. Mirrors
+    /// the legend / params vim feel: `j`/`k` per-row, `gg`/`G`
+    /// jump to first/last, `Ctrl-D`/`Ctrl-U` half-page jumps,
+    /// `Esc` or `h`/`Left` returns to the editor.
+    pub(super) fn handle_table_key(&mut self, key: KeyEvent) {
+        use KeyCode::*;
+        use KeyModifiers as M;
+        // `gg` two-step, same as legend pane.
+        let was_pending_g = self.table_pending_g;
+        self.table_pending_g = false;
+        let row_count = self.table_result.as_ref().map_or(0, |t| t.rows.len());
+        if row_count == 0 {
+            // Nothing to navigate — fall back to the editor on any
+            // key so the user isn't trapped in an empty pane.
+            self.set_focus(Pane::Editor);
+            return;
+        }
+        match (key.code, key.modifiers) {
+            (Esc, _) | (Char('h'), M::NONE) | (Left, _) => self.set_focus(Pane::Editor),
+            (Char('j'), M::NONE) | (Down, _) => self.move_table_selection(1, row_count),
+            (Char('k'), M::NONE) | (Up, _) => self.move_table_selection(-1, row_count),
+            (Char('g'), M::NONE) => {
+                if was_pending_g {
+                    self.table_selected = 0;
+                } else {
+                    self.table_pending_g = true;
+                }
+            }
+            (Char('G'), _) => self.table_selected = row_count - 1,
+            // Half-page jumps. Page size is approximate — we don't
+            // know the rendered viewport height here. 10 lines is a
+            // common terminal-height heuristic; the auto-scroll in
+            // the renderer keeps the selection visible regardless.
+            (Char('d'), M::CONTROL) | (PageDown, _) => {
+                self.move_table_selection(10, row_count);
+            }
+            (Char('u'), M::CONTROL) | (PageUp, _) => {
+                self.move_table_selection(-10, row_count);
+            }
+            (Char('?'), _) => self.open_help(),
+            _ => {}
+        }
+    }
+
+    /// Move the table selection by `delta`, clamping at the edges
+    /// (no wrap; matches vim's default `j`/`k` behaviour). `len`
+    /// is the live row count so the caller can pass a fresh value
+    /// each call without re-reading `self.table_result`.
+    pub(super) fn move_table_selection(&mut self, delta: i32, len: usize) {
+        if len == 0 {
+            self.table_selected = 0;
+            return;
+        }
+        let last = (len - 1) as i32;
+        let cur = self.table_selected as i32;
+        let next = (cur + delta).clamp(0, last);
+        self.table_selected = next as usize;
     }
 
     pub(super) fn handle_legend_key(&mut self, key: KeyEvent) {

@@ -30,7 +30,9 @@ mod note;
 mod pie;
 mod pragma;
 mod statistic;
-mod table;
+// `pub` so tests can construct `TableCell` variants directly. The
+// production API surface is the re-exports below.
+pub mod table;
 mod top_list;
 
 pub use pragma::{PragmaError, VizSpec, parse_pragma, upsert_pragma};

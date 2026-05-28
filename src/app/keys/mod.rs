@@ -60,11 +60,13 @@ impl App {
             return;
         }
 
-        // Legend / params / dashboard own their own bindings when focused.
+        // Legend / params / dashboard / table own their own bindings
+        // when focused.
         match self.focus {
             Pane::Legend => return self.handle_legend_key(key),
             Pane::Params => return self.handle_params_key(key),
             Pane::Dashboard => return self.handle_dashboard_key(key),
+            Pane::Table => return self.handle_table_key(key),
             Pane::Editor => {}
         }
         match self.mode {

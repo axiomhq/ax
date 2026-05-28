@@ -365,6 +365,79 @@ impl App {
                 };
             }
             AppEvent::TagValuesFetched { .. } => {}
+            AppEvent::AplQueryFinished { id, result } => {
+                if id != self.last_query_id {
+                    return;
+                }
+                self.busy = false;
+                match result {
+                    Ok(resp) => {
+                        self.last_trace_id = resp.trace_id.clone();
+                        // Route by the buffer's viz kind: Table /
+                        // LogStream render the raw tabular response
+                        // (typed columns survive); everything else
+                        // reshapes into chart series via the same
+                        // decoder the dashboard path uses.
+                        let wants_table = matches!(
+                            self.viz_kind,
+                            crate::dashboard::VizKind::Table | crate::dashboard::VizKind::LogStream
+                        );
+                        if wants_table {
+                            let t = crate::viz::apl_decode::to_table_result(&resp);
+                            let rows = t.rows.len();
+                            self.table_result = Some(t);
+                            // Fresh data: park the cursor at the top.
+                            // Otherwise a previous query's selection
+                            // could point past the new row count.
+                            self.table_selected = 0;
+                            // Drop any stale chart series from a
+                            // prior MPL run so the table is the
+                            // unambiguous data source.
+                            self.series.clear();
+                            self.legend.hidden.clear();
+                            self.legend.selected = 0;
+                            self.status = if rows == 0 {
+                                "APL query returned no rows".to_string()
+                            } else {
+                                format!("{rows} rows")
+                            };
+                        } else {
+                            match crate::viz::apl_decode::to_series(
+                                &resp,
+                                &std::collections::BTreeMap::new(),
+                            ) {
+                                Ok(new_series) => {
+                                    // Switching to a chart viz drops any
+                                    // table_result from a prior APL run.
+                                    self.table_result = None;
+                                    let count = new_series.len();
+                                    if count == 0 {
+                                        self.status = "APL query returned no series".to_string();
+                                    } else {
+                                        self.series = new_series;
+                                        self.legend.hidden = vec![false; count];
+                                        if self.legend.selected >= count {
+                                            self.legend.selected = 0;
+                                        }
+                                        self.legend.details_cursor = 0;
+                                        self.legend.pending_g = false;
+                                        self.reload_legend_label_tags();
+                                        self.status = format!("{count} series");
+                                    }
+                                }
+                                Err(e) => {
+                                    self.set_error(format!(
+                                        "APL: {e} (hint: add `// @viz table` to render the raw rows)"
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        self.set_error(format!("query error: {e}"));
+                    }
+                }
+            }
             AppEvent::QueryFinished { id, result } => {
                 if id != self.last_query_id {
                     // Stale response from a superseded query; ignore.
@@ -380,6 +453,11 @@ impl App {
                         self.unit = self.resolve_editor_unit(&resp.series);
                         let new_series = response_to_series(&resp);
                         let count = new_series.len();
+                        // MPL never produces a table_result; clear
+                        // any leftover from a prior APL run so the
+                        // Table viz doesn't display the wrong data
+                        // source.
+                        self.table_result = None;
                         if count == 0 {
                             self.status = "query returned no series".to_string();
                         } else {

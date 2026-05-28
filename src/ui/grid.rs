@@ -523,7 +523,8 @@ fn draw_grid_tile(f: &mut Frame, app: &App, chart: &Chart, area: Rect, highlight
             // Routed through the dedicated table renderer so column
             // types survive (the series-adapter path would force every
             // cell through `Agg::Last`).
-            viz::draw_table_result(f, t, block, area);
+            // Grid tiles are non-selectable; no selection state.
+            viz::draw_table_result(f, t, None, false, block, area);
         }
         Body::Empty => {
             let inner = block.inner(area);
