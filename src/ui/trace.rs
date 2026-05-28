@@ -46,8 +46,8 @@ const DUR_COL_WIDTH: u16 = 9;
 // column, so the timeline is as wide as the pane allows. The label
 // column is capped so a wide terminal grows the *bar*, not the name
 // column, and floored so names stay readable on narrow ones.
-const LABEL_MAX_COLS: usize = 48;
-const LABEL_MIN_COLS: usize = 12;
+const LABEL_MAX_COLS: usize = 60;
+const LABEL_MIN_COLS: usize = 16;
 
 /// Entry point — called by `src/ui/mod.rs` when
 /// `app.view_mode == ViewMode::Trace`.
@@ -294,6 +294,12 @@ fn draw_tree(f: &mut Frame, app: &mut App, area: Rect) {
     let t0 = model.t0_ns;
     let t1 = model.t1_ns;
 
+    // Tree guide prefixes over the *visible* sequence, so folds and
+    // filters are reflected (a collapsed subtree's children simply
+    // aren't in the list). Computed once per frame in O(visible).
+    let depths: Vec<u16> = visible.iter().map(|&r| model.tree[r].depth).collect();
+    let guides = tree_guides(&depths);
+
     let visible_end = (scroll + body_h).min(visible.len());
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(body_h);
     for (vis_idx, &row_idx) in visible.iter().enumerate().take(visible_end).skip(scroll) {
@@ -301,10 +307,23 @@ fn draw_tree(f: &mut Frame, app: &mut App, area: Rect) {
         let span = &model.spans[row.span_idx];
         let selected = vis_idx == cursor_vis;
         let collapsed = view.collapsed.contains(&row.span_idx) && row.has_children;
+        // Show the service tag only at a service boundary (the span's
+        // service differs from its parent's). Roots and orphans count
+        // as boundaries. Within one service the tag is redundant — the
+        // bar colour already encodes it — so we drop it and give the
+        // operation name the whole column.
+        let parent_service = span
+            .parent_span_id
+            .as_deref()
+            .and_then(|p| model.by_id.get(p))
+            .map(|&pi| model.spans[pi].service.as_str());
+        let show_service = parent_service != Some(span.service.as_str());
         lines.push(build_tree_row(
             span,
             row,
             collapsed,
+            &guides[vis_idx],
+            show_service,
             t0,
             t1,
             body_area.width as usize,
@@ -347,8 +366,71 @@ fn draw_filter_prompt(f: &mut Frame, area: Rect, view: &TraceView) {
     f.render_widget(Paragraph::new(line), area);
 }
 
+/// Build box-drawing tree-guide prefixes for a flat DFS row
+/// sequence given each row's `depth`. Operates on whatever sequence
+/// it's handed — pass the *visible* rows so folds/filters are
+/// reflected automatically.
+///
+/// Each returned prefix is the indentation + connector for that
+/// row, e.g.
+///
+/// ```text
+/// (root)
+/// ├╴ child
+/// │ └╴ last grandchild
+/// └╴ last child
+/// ```
+///
+/// Ancestors with a later sibling get a `│ ` rail; exhausted
+/// branches get blank space. The node's own connector is `├╴`
+/// (has a following sibling) or `└╴` (last child). Roots (depth 0)
+/// get no connector. Pure + O(n) (the inner clear loop is bounded
+/// by max depth), so it's cheap to call every frame.
+fn tree_guides(depths: &[u16]) -> Vec<String> {
+    let n = depths.len();
+    // `last_child[k]`: is row k the last among its siblings?
+    let mut last_child = vec![true; n];
+    let max_depth = depths.iter().copied().max().unwrap_or(0) as usize;
+    // `prev_at_depth[d]` = most recent row index seen at depth d that
+    // hasn't yet been proven non-last.
+    let mut prev_at_depth: Vec<Option<usize>> = vec![None; max_depth + 1];
+    for (k, &d) in depths.iter().enumerate() {
+        let d = d as usize;
+        // Descending to depth d closes every deeper open branch.
+        for slot in prev_at_depth.iter_mut().skip(d + 1) {
+            *slot = None;
+        }
+        if let Some(p) = prev_at_depth[d] {
+            // A sibling now follows `p`, so `p` wasn't the last child.
+            last_child[p] = false;
+        }
+        prev_at_depth[d] = Some(k);
+    }
+
+    let mut out = Vec::with_capacity(n);
+    // Stack of ancestor `last_child` flags, indexed by depth.
+    let mut rail: Vec<bool> = Vec::with_capacity(max_depth + 1);
+    for (k, &d) in depths.iter().enumerate() {
+        let d = d as usize;
+        rail.truncate(d);
+        let mut s = String::with_capacity(d * 2 + 2);
+        // Skip the depth-0 root's column: top-level roots are
+        // independent trees, so their children's connectors sit at
+        // column 0 (matching the `tree` command).
+        for &ancestor_last in rail.iter().skip(1) {
+            s.push_str(if ancestor_last { "  " } else { "│ " });
+        }
+        if d > 0 {
+            s.push_str(if last_child[k] { "└╴" } else { "├╴" });
+        }
+        out.push(s);
+        rail.push(last_child[k]);
+    }
+    out
+}
+
 /// Compose one span row:
-/// `<indent>▸ [<svc>] <name>  <bar>  <duration>`
+/// `<guides>▸ <name>  <bar>  <duration>`
 ///
 /// Layout (left-to-right): a capped label column, a single space,
 /// the waterfall bar (claims the remaining width), a single space,
@@ -358,13 +440,14 @@ fn build_tree_row(
     span: &TraceSpan,
     row: TreeRow,
     collapsed: bool,
+    guides: &str,
+    show_service: bool,
     t0: i64,
     t1: i64,
     width: usize,
     selected: bool,
     focused: bool,
 ) -> Line<'static> {
-    let indent = "  ".repeat(row.depth as usize);
     // Marker semantics:
     //   ⚠   orphan (takes precedence — most important signal)
     //   ▾   collapsed parent (fold closed)
@@ -377,10 +460,18 @@ fn build_tree_row(
     } else {
         "· "
     };
-    let service = display_service(&span.service);
     let name = display_name(&span.name);
 
-    let label_text = format!("{indent}{marker}[{service}] {name}");
+    // Service tag only at boundaries; elsewhere the name gets the
+    // whole column (the bar colour still encodes the service).
+    let label_text = if show_service {
+        format!(
+            "{guides}{marker}[{}] {name}",
+            display_service(&span.service)
+        )
+    } else {
+        format!("{guides}{marker}{name}")
+    };
     let dur_text = humanize_duration_ns(span.duration_ns);
 
     // Column budget: `<label> <bar> <dur>` with a single space
@@ -388,9 +479,9 @@ fn build_tree_row(
     // bar, not the name) and floored (so it stays legible); the bar
     // takes everything left over.
     let avail = width.saturating_sub(DUR_COL_WIDTH as usize + 2);
-    let label_budget = (avail * 2 / 5).clamp(LABEL_MIN_COLS.min(avail), LABEL_MAX_COLS);
+    let label_budget = (avail / 2).clamp(LABEL_MIN_COLS.min(avail), LABEL_MAX_COLS);
     let bar_cells = avail.saturating_sub(label_budget).min(u16::MAX as usize) as u16;
-    let label_display = truncate_for_display(&label_text, label_budget);
+    let label_display = truncate_for_display(&sanitize_inline(&label_text), label_budget);
     let label_pad = label_budget.saturating_sub(visual_width(&label_display));
 
     // Bar geometry: project the span onto `bar_cells` cells at
@@ -747,13 +838,13 @@ fn render_detail_row(row: &DetailRow, width: usize) -> Line<'static> {
                 .add_modifier(Modifier::BOLD),
         )),
         DetailRow::KV(k, v) => {
-            // Key column: 14 chars, right-padded; value truncated
-            // to remaining width.
+            // Key column: 14 chars, right-padded; value collapsed to
+            // a single line then truncated to the remaining width.
             let key_w = 14usize;
-            let key = truncate_for_display(k, key_w);
+            let key = truncate_for_display(&sanitize_inline(k), key_w);
             let key_pad = key_w.saturating_sub(visual_width(&key));
             let value_budget = width.saturating_sub(key_w + 1);
-            let value = truncate_for_display(v, value_budget);
+            let value = truncate_for_display(&sanitize_inline(v), value_budget);
             Line::from(vec![
                 Span::styled(
                     format!("{key}{} ", " ".repeat(key_pad)),
@@ -763,7 +854,7 @@ fn render_detail_row(row: &DetailRow, width: usize) -> Line<'static> {
             ])
         }
         DetailRow::EventHeader(text) => Line::from(Span::styled(
-            truncate_for_display(text, width),
+            truncate_for_display(&sanitize_inline(text), width),
             Style::default().fg(Color::LightYellow),
         )),
         DetailRow::Blank => Line::from(Span::raw("")),
@@ -811,6 +902,18 @@ fn display_service(s: &str) -> String {
 
 fn visual_width(s: &str) -> usize {
     s.chars().count()
+}
+
+/// Collapse a value to a single display line: newlines, carriage
+/// returns, tabs, and other control characters become spaces. A
+/// multi-line attribute value (SQL, a stack trace, a JSON blob with
+/// embedded `\n`) would otherwise render across several buffer rows
+/// and shove the rest of the detail pane out of place. Truncation
+/// (by [`truncate_for_display`]) then caps the width.
+fn sanitize_inline(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
 }
 
 fn truncate_for_display(s: &str, max: usize) -> String {
@@ -962,6 +1065,47 @@ mod tests {
     }
 
     #[test]
+    fn tree_guides_linear_chain() {
+        // 0→1→2→3 each the only child → all last-child. Depth-1
+        // connector sits at column 0 (root contributes no rail).
+        let g = tree_guides(&[0, 1, 2, 3]);
+        assert_eq!(g[0], "");
+        assert_eq!(g[1], "└╴");
+        assert_eq!(g[2], "  └╴");
+        assert_eq!(g[3], "    └╴");
+    }
+
+    #[test]
+    fn tree_guides_siblings_get_rail() {
+        // root(0) with children a(1), b(1); a has child(2).
+        //   (root)
+        //   ├╴ a       (has sibling b → ├)
+        //   │ └╴ a.c    (rail under a because b follows)
+        //   └╴ b       (last)
+        let g = tree_guides(&[0, 1, 2, 1]);
+        assert_eq!(g[0], "");
+        assert_eq!(g[1], "├╴");
+        assert_eq!(g[2], "│ └╴");
+        assert_eq!(g[3], "└╴");
+    }
+
+    #[test]
+    fn tree_guides_two_roots_are_independent() {
+        // Top-level roots are independent trees — no rail spans
+        // between them, so each root's children connect at column 0.
+        let g = tree_guides(&[0, 1, 0, 1]);
+        assert_eq!(g[0], ""); // root 0
+        assert_eq!(g[1], "└╴"); // child of root0
+        assert_eq!(g[2], ""); // root 1
+        assert_eq!(g[3], "└╴"); // child of root1
+    }
+
+    #[test]
+    fn tree_guides_empty() {
+        assert!(tree_guides(&[]).is_empty());
+    }
+
+    #[test]
     fn render_bar_string_full_run() {
         assert_eq!(render_bar_string(0, 24, 3), "███");
     }
@@ -985,6 +1129,38 @@ mod tests {
     #[test]
     fn render_bar_string_empty_when_no_fill() {
         assert_eq!(render_bar_string(0, 0, 3), "   ");
+    }
+
+    #[test]
+    fn sanitize_inline_replaces_control_chars() {
+        assert_eq!(sanitize_inline("a\nb\tc\rd"), "a b c d");
+        assert_eq!(sanitize_inline("plain"), "plain");
+        // A multi-line JSON-ish blob collapses to one row.
+        assert_eq!(sanitize_inline("{\n  \"k\": 1\n}"), "{   \"k\": 1 }");
+    }
+
+    #[test]
+    fn detail_kv_value_with_newlines_renders_single_line() {
+        // Regression: a long multi-line attribute value must not
+        // bleed across rows / into the tree pane.
+        let row = DetailRow::KV(
+            "db.statement".to_string(),
+            "SELECT *\nFROM t\nWHERE x = 1".to_string(),
+        );
+        let line = render_detail_row(&row, 60);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            !text.contains('\n') && !text.contains('\t') && !text.contains('\r'),
+            "rendered detail row leaked a control char: {text:?}"
+        );
+    }
+
+    #[test]
+    fn detail_kv_value_truncates_to_width() {
+        let row = DetailRow::KV("k".to_string(), "x".repeat(500));
+        let line = render_detail_row(&row, 40);
+        let width: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+        assert!(width <= 40, "detail row {width} cols exceeds 40");
     }
 
     #[test]

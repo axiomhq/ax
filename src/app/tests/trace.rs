@@ -493,6 +493,21 @@ fn quit_from_trace_mode_exits_trace_not_app() {
 }
 
 #[test]
+fn force_quit_from_trace_mode_quits_the_app() {
+    // `:q!` keeps its force-quit meaning even in the trace view —
+    // otherwise there's no way to exit the app from there.
+    let mut app = test_app();
+    app.trace_view = Some(build_synthetic_view(
+        vec![synthetic_span("a", "root", 0, 1_000_000)],
+        ViewMode::Solo,
+    ));
+    app.view_mode = ViewMode::Trace;
+    app.focus = Pane::TraceTree;
+    app.execute_command("q!");
+    assert!(app.should_quit, ":q! in Trace must quit the app");
+}
+
+#[test]
 fn quit_from_trace_mode_returns_to_grid_when_that_was_the_origin() {
     let mut app = test_app();
     app.trace_view = Some(build_synthetic_view(

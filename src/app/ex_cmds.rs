@@ -1265,12 +1265,18 @@ impl App {
     }
 
     pub(super) fn cmd_quit(&mut self, force: bool) {
-        // In the trace view `:q` is a window-style close (vim's
-        // `:q` from a help split): exit the trace and restore
-        // the previous view-mode rather than quitting the
-        // entire app.
+        // In the trace view plain `:q` is a window-style close
+        // (vim's `:q` from a help split): exit the trace and
+        // restore the previous view-mode. But `:q!` keeps its
+        // "force-quit the whole app" meaning — otherwise there's
+        // no way to bail out of the app from the trace view.
         if self.view_mode == ViewMode::Trace {
-            self.exit_trace_view();
+            if force {
+                self.persist_query();
+                self.should_quit = true;
+            } else {
+                self.exit_trace_view();
+            }
             return;
         }
         if !force && self.is_dirty() {
