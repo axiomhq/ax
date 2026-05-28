@@ -40,6 +40,10 @@ impl App {
             self.current_file = Some(path.clone());
             self.saved_buffer = text;
             self.last_error = None;
+            // A freshly-loaded dashboard is clean; clear any dirty
+            // flag left over from a previous dashboard session so
+            // `is_dirty()` doesn't report stale unsaved state.
+            self.dashboard_dirty = false;
             return Ok(path);
         }
         self.buffer_mode = BufferMode::Mpl;
@@ -63,7 +67,10 @@ impl App {
         // Magic-key sniff: a `DashboardResource` envelope always has a
         // nested `"dashboard"` object. Bound the probe to the first 1k
         // bytes so we don't scan megabytes of unrelated JSON.
-        let head = &body[..body.len().min(1024)];
+        // Char-safe truncation: `body.get(..1024)` returns `None`
+        // (→ fall back to the whole body) instead of panicking when
+        // byte 1024 lands inside a multi-byte UTF-8 character.
+        let head = body.get(..1024).unwrap_or(body);
         head.contains("\"dashboard\"") && head.contains("\"uid\"")
     }
 

@@ -289,6 +289,12 @@ impl App {
                                     entry.error = None;
                                 }
                                 Err(e) => {
+                                    // Clear any previously-decoded data
+                                    // so the tile doesn't show stale
+                                    // series/table underneath the fresh
+                                    // decode error.
+                                    entry.series.clear();
+                                    entry.table = None;
                                     entry.error = Some(format!("APL: {e}"));
                                 }
                             }

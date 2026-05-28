@@ -31,32 +31,38 @@ impl App {
         };
         let (start, end) = rfc3339_now_window(DISCOVERY_WINDOW_HOURS);
         self.runtime.spawn(async move {
-            let mut route = match resolve_route(&cache, &client, &dataset).await {
-                Ok(r) => r,
-                Err(e) => {
-                    let _ = tx.send(AppEvent::MetricsFetched {
-                        dataset,
-                        result: Err(e),
-                    });
-                    return;
-                }
-            };
-            let mut refreshed = false;
-            let result = loop {
-                let r = client
-                    .list_metrics(&route.url, &dataset, &start, &end)
-                    .await;
-                match r {
-                    Err(e) if !refreshed && is_axiom_404(&e) => {
-                        refreshed = true;
-                        match refresh_dataset_route(&cache, &client, &dataset).await {
-                            Ok(r) => route = r,
-                            Err(_) => break Err(e),
+            // Same route-resolve + 404-retry loop as the MPL query
+            // path, but wrapped in `QUERY_TIMEOUT` so a hung edge
+            // (proxy stall, half-open connection — the SDK's own
+            // reqwest timeout we don't control) can't leave
+            // `App.busy = true` forever with no cancel path.
+            let attempt = async {
+                let mut route = resolve_route(&cache, &client, &dataset).await?;
+                let mut refreshed = false;
+                loop {
+                    let r = client
+                        .list_metrics(&route.url, &dataset, &start, &end)
+                        .await;
+                    match r {
+                        Err(e) if !refreshed && is_axiom_404(&e) => {
+                            refreshed = true;
+                            match refresh_dataset_route(&cache, &client, &dataset).await {
+                                Ok(r) => route = r,
+                                Err(_) => return Err(e),
+                            }
                         }
+                        other => return other,
                     }
-                    other => break other,
                 }
             };
+            let result =
+                match tokio::time::timeout(crate::app::helpers::QUERY_TIMEOUT, attempt).await {
+                    Ok(r) => r,
+                    Err(_) => Err(anyhow::anyhow!(
+                        "metrics fetch timed out after {}s",
+                        crate::app::helpers::QUERY_TIMEOUT.as_secs()
+                    )),
+                };
             if let Ok(metrics) = &result {
                 cache_save_with(&cache, |c| c.replace_metrics(&dataset, metrics.clone()));
             }

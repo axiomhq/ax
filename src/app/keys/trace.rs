@@ -668,9 +668,9 @@ impl App {
 /// the trace-header `short_id` in `src/ui/trace.rs` (kept
 /// separate to avoid pulling a UI helper into the keymap).
 fn short_id(id: &str) -> String {
-    if id.len() <= 8 {
+    if id.chars().count() <= 8 {
         id.to_string()
     } else {
-        format!("{}\u{2026}", &id[..8])
+        format!("{}\u{2026}", crate::util::take_chars(id, 8))
     }
 }

@@ -101,13 +101,22 @@ pub(super) fn draw_dashboard_grid(f: &mut Frame, app: &mut App, area: Rect) {
     // The wire layout uses a 12-column virtual grid (server spec).
     let col_w_f = viewport.width as f32 / 12.0;
 
-    // Total virtual-grid rows = max(y + h) across layout, or fall
-    // back to ceil(charts.len() / 2) when entries are missing.
-    let virt_rows = layout
+    // Total virtual-grid rows = max(y + h) over the *resolved* slot of
+    // every chart. Resolving through `resolve_slot` (rather than just
+    // the `layout` entries) is what keeps `row_tops` big enough for
+    // auto-stacked charts: a chart with no matching `LayoutItem` gets
+    // an auto-stack slot at `gy = (idx/2)*6`, which can sit below the
+    // last `layout` row. Indexing `row_tops` with that slot used to
+    // panic when `layout` was non-empty but didn't cover every chart.
+    let virt_rows = charts
         .iter()
-        .map(|l| l.y.unwrap_or(0) + l.h)
+        .enumerate()
+        .map(|(i, c)| {
+            let (_, gy, _, gh) = resolve_slot(&layout, c, i);
+            gy + gh
+        })
         .max()
-        .unwrap_or_else(|| ((charts.len() as u32).div_ceil(2)) * 6)
+        .unwrap_or(6)
         .max(1);
 
     // Per-virt-row variable heights: a row that hosts only Note
@@ -143,10 +152,13 @@ pub(super) fn draw_dashboard_grid(f: &mut Frame, app: &mut App, area: Rect) {
     // Auto-scroll: bring the selected tile fully into view. Uses
     // the variable row-heights so a tile under a shrunken Note row
     // still maps to the right terminal coordinates.
+    let last_row_top = row_tops.len() - 1;
     if let Some(chart) = charts.get(app.selected_chart_idx) {
         let (_, gy, _, gh) = resolve_slot(&layout, chart, app.selected_chart_idx);
-        let top = row_tops[gy as usize] as u16;
-        let bot = row_tops[(gy + gh) as usize] as u16;
+        // Defensive clamp: `virt_rows` already covers every chart's
+        // resolved slot, so these never saturate in practice.
+        let top = row_tops[(gy as usize).min(last_row_top)] as u16;
+        let bot = row_tops[((gy + gh) as usize).min(last_row_top)] as u16;
         if top < app.dashboard_scroll {
             app.dashboard_scroll = top;
         } else if bot > app.dashboard_scroll.saturating_add(viewport.height) {
@@ -162,8 +174,8 @@ pub(super) fn draw_dashboard_grid(f: &mut Frame, app: &mut App, area: Rect) {
     // truncated, which is the conventional scroll behaviour).
     for (i, chart) in charts.iter().enumerate() {
         let (gx, gy, gw, gh) = resolve_slot(&layout, chart, i);
-        let content_top = row_tops[gy as usize];
-        let content_bot = row_tops[(gy + gh) as usize];
+        let content_top = row_tops[(gy as usize).min(last_row_top)];
+        let content_bot = row_tops[((gy + gh) as usize).min(last_row_top)];
         let viewport_top = scroll;
         let viewport_bot = scroll.saturating_add(viewport.height as u32);
         if content_bot <= viewport_top || content_top >= viewport_bot {

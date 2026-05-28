@@ -115,7 +115,14 @@ impl App {
         // the user's intent.
         self.last_trace_dataset = Some(dataset);
         self.pending_trace_fetch = Some(pending);
-        self.dispatch_trace_window()?;
+        // If the very first dispatch fails (e.g. no `~/.axiom.toml`,
+        // bad deployment), clear the pending fetch we just stashed —
+        // no background task was spawned, so leaving it set would make
+        // a later `Esc` falsely report "trace fetch cancelled".
+        if let Err(e) = self.dispatch_trace_window() {
+            self.pending_trace_fetch = None;
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -309,9 +316,9 @@ fn build_trace_client(deployment: Option<&str>) -> anyhow::Result<AxiomClient> {
 /// hex chars; we keep the first 12 (matches what `:traces ls` will
 /// show in step 25 for column alignment).
 fn short_trace_label(id: &str) -> String {
-    if id.len() <= 16 {
+    if id.chars().count() <= 16 {
         id.to_string()
     } else {
-        format!("{}…", &id[..12])
+        format!("{}…", crate::util::take_chars(id, 12))
     }
 }

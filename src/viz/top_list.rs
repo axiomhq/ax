@@ -88,8 +88,10 @@ pub(super) fn draw_top_list(
         .map(|(i, _)| series[*i].name.chars().count() as u16)
         .max()
         .unwrap_or(8)
-        .clamp(4, inner.width / 3)
-        .max(4);
+        // `(inner.width / 3).max(4)` keeps the clamp bounds ordered:
+        // for narrow tiles (width 1..=11) `inner.width / 3 < 4`, and a
+        // bare `.clamp(4, <4)` would panic (`min > max`).
+        .clamp(4, (inner.width / 3).max(4));
     let value_w: u16 = 10;
     let bar_w = inner.width.saturating_sub(label_w + value_w + 4);
 

@@ -373,6 +373,9 @@ fn parse_range(
     let now = chrono::Utc::now();
     let s = parse_time_expr(start, now).with_context(|| format!("parsing start time {start:?}"))?;
     let e = parse_time_expr(end, now).with_context(|| format!("parsing end time {end:?}"))?;
+    if s > e {
+        anyhow::bail!("time range start ({start}) is after end ({end})");
+    }
     Ok((s, e))
 }
 

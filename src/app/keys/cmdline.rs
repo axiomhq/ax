@@ -75,7 +75,17 @@ impl App {
             // the buffer must invalidate the history-nav prefix so
             // the next Up captures a fresh one (vim semantics).
             // Empty cmdline + Backspace cancels, like vim.
-            (Backspace, _) if self.cmdline.buf.is_empty() => self.mode = Mode::Normal,
+            (Backspace, _) if self.cmdline.buf.is_empty() => {
+                // Mirror the Esc/Ctrl-C cancel path: a bare cancel must
+                // also reset cmdline state, hide completions, and
+                // restore focus to whatever opened the cmdline (e.g. a
+                // params pane via `prefill_command`) — otherwise the
+                // originating focus is leaked.
+                self.cmdline.reset();
+                self.cmdline.completions.hide();
+                self.mode = Mode::Normal;
+                self.restore_cmdline_focus();
+            }
             (Backspace, _) => {
                 self.cmdline.reset_history_nav();
                 self.cmdline.backspace();

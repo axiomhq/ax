@@ -213,8 +213,16 @@ impl App {
     fn splice_editor_range(&mut self, range: (usize, usize), insert: &str) {
         let query = self.query_text();
         let (row, start_char) = byte_offset_to_row_col(&query, range.0);
-        let (_, end_char) = byte_offset_to_row_col(&query, range.1);
-        let replace_chars = end_char.saturating_sub(start_char);
+        // Count the chars actually spanned by the byte range. Using
+        // `end_char - start_char` is wrong when the range crosses a
+        // line boundary: the two columns live on different rows, so
+        // their difference isn't the number of chars between the
+        // offsets. Newlines inside the range count as one char each
+        // (which `delete_str` also treats as a single char).
+        let replace_chars = query
+            .get(range.0..range.1)
+            .map(|s| s.chars().count())
+            .unwrap_or(0);
         self.editor
             .move_cursor(CursorMove::Jump(row as u16, start_char as u16));
         self.editor.delete_str(replace_chars);

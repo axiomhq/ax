@@ -135,7 +135,14 @@ impl App {
             self.status = format!("r: line has fewer than {count} char(s) remaining");
             return;
         }
-        let replacement: String = std::iter::repeat_n(ch, count).collect();
+        // `r<Enter>` (newline replace) collapses the `count` deleted
+        // chars into a *single* line break, matching vim's `3r<CR>`.
+        // A normal char replace repeats `count` times.
+        let replacement: String = if ch == '\n' {
+            "\n".to_string()
+        } else {
+            std::iter::repeat_n(ch, count).collect()
+        };
         for _ in 0..count {
             self.editor.delete_next_char();
         }

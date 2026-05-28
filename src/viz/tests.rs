@@ -170,6 +170,30 @@ fn mkseries(name: &str, ys: &[f64]) -> Series {
 }
 
 #[test]
+fn top_list_renders_into_narrow_tiles_without_panic() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::layout::Rect;
+    use ratatui::widgets::Block;
+
+    let series = vec![mkseries("a-really-long-series-name", &[1.0, 2.0, 3.0])];
+    let hidden = vec![false];
+    let opts: BTreeMap<String, String> = BTreeMap::new();
+    // Widths 1..=11 make `inner.width / 3 < 4`; the old
+    // `clamp(4, inner.width / 3)` panicked with `min > max`.
+    for w in [1u16, 2, 4, 8, 11, 12, 40] {
+        let backend = TestBackend::new(w, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let area = Rect::new(0, 0, w, 6);
+                super::top_list::draw_top_list(f, &series, &hidden, &opts, Block::default(), area);
+            })
+            .unwrap();
+    }
+}
+
+#[test]
 fn top_list_sorts_desc_by_default_and_caps_at_n() {
     let s = vec![
         mkseries("a", &[1.0, 1.0, 1.0]), // avg 1

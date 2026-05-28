@@ -349,7 +349,7 @@ pub fn resolve_unit(
 /// don't control) would leave `App.busy = true` forever with no user
 /// cancel path. 30s matches the bare `reqwest::Client` timeout we
 /// configure for the `_v1_datasets` endpoint in `axiom.rs`.
-const QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+pub(in crate::app) const QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Normalise a user-supplied dataset name into the bare name we feed
 /// into APL's bracket-quote literal (`["name"]`).

@@ -453,7 +453,12 @@ pub fn extract_dataset_metric(mpl: &str) -> Result<(String, String)> {
 }
 
 pub fn byte_offset_to_line_col(text: &str, byte_offset: usize) -> (usize, usize) {
-    let clamped = byte_offset.min(text.len());
+    let mut clamped = byte_offset.min(text.len());
+    // Walk back to the nearest char boundary so `&text[..clamped]`
+    // can't panic on an offset that lands mid-character.
+    while clamped > 0 && !text.is_char_boundary(clamped) {
+        clamped -= 1;
+    }
     let prefix = &text[..clamped];
     let line = 1 + prefix.bytes().filter(|&b| b == b'\n').count();
     let column = match prefix.rfind('\n') {

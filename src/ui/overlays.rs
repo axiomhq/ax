@@ -223,8 +223,8 @@ pub(super) fn draw_dashinfo_overlay(
                 // exists; we just can't decorate it like a Known one.
                 let (id_str, name_str) = match c.base() {
                     Some(b) => {
-                        let id_short = if b.id.len() > 12 {
-                            format!("{}...", &b.id[..11])
+                        let id_short = if b.id.chars().count() > 12 {
+                            format!("{}...", crate::util::take_chars(&b.id, 11))
                         } else {
                             b.id.clone()
                         };

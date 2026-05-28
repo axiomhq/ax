@@ -948,10 +948,10 @@ pub(crate) fn humanize_duration_ns(ns: i64) -> String {
 }
 
 fn short_id(id: &str) -> String {
-    if id.len() <= 16 {
+    if id.chars().count() <= 16 {
         id.to_string()
     } else {
-        format!("{}…", &id[..12])
+        format!("{}…", crate::util::take_chars(id, 12))
     }
 }
 

@@ -803,28 +803,67 @@ fn read_duration_ns(cols: &[Vec<Json>], idx: usize, row: usize) -> i64 {
     parse_timespan_ns(s).unwrap_or(0)
 }
 
-/// Parse a Go-style timespan suffix. Returns `None` when the
-/// suffix isn't recognised or the numeric portion doesn't parse.
+/// Parse a Go-style duration string into nanoseconds. Returns `None`
+/// when a segment's number or unit doesn't parse.
+///
+/// Go's `time.Duration.String()` — which the Axiom `duration` column
+/// ships — emits a *compound* form for durations ≥ 1 minute
+/// (`"1m0s"`, `"1h2m3.5s"`, `"90m"`) and a single-unit form below
+/// (`"277.7ms"`, `"41µs"`, `"27ns"`). We parse the general grammar:
+/// an optional leading sign, then one-or-more `<decimal><unit>`
+/// segments summed together. Units: `h`, `m`, `s`, `ms`, `us`/`µs`,
+/// `ns`. (A plain `0` with no unit — Go's zero-duration string — is
+/// handled by the caller, which only reaches here for non-empty
+/// string cells; `read_duration_ns` returns 0 for unparseable cells.)
 fn parse_timespan_ns(s: &str) -> Option<i64> {
     let s = s.trim();
-    // Match the longest suffix first so `µs` / `ms` / `ns` (2
-    // bytes each but `µs` is 3 bytes in UTF-8) match before
-    // bare `s`.
-    let (num, scale_ns) = if let Some(num) = s.strip_suffix("µs") {
-        (num, 1_000_f64)
-    } else if let Some(num) = s.strip_suffix("us") {
-        (num, 1_000_f64)
-    } else if let Some(num) = s.strip_suffix("ns") {
-        (num, 1_f64)
-    } else if let Some(num) = s.strip_suffix("ms") {
-        (num, 1_000_000_f64)
-    } else if let Some(num) = s.strip_suffix('s') {
-        (num, 1_000_000_000_f64)
-    } else {
-        return None;
+    let (neg, mut rest) = match s.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, s),
     };
-    let value: f64 = num.trim().parse().ok()?;
-    Some((value * scale_ns) as i64)
+    if rest.is_empty() {
+        return None;
+    }
+    let mut total_ns = 0_f64;
+    let mut saw_segment = false;
+    while !rest.is_empty() {
+        // Leading decimal: ASCII digits and at most one '.'.
+        let num_len = rest
+            .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .unwrap_or(rest.len());
+        if num_len == 0 {
+            return None; // unit with no number — malformed
+        }
+        let value: f64 = rest[..num_len].parse().ok()?;
+        rest = &rest[num_len..];
+        // Unit suffix: match 2-byte / multi-byte units before the
+        // bare `s` / `m` so `ms` isn't read as `m` + stray `s`, etc.
+        let (scale_ns, unit_len) = if rest.starts_with("ns") {
+            (1_f64, 2)
+        } else if rest.starts_with("µs") {
+            (1_000_f64, "µs".len())
+        } else if rest.starts_with("us") {
+            (1_000_f64, 2)
+        } else if rest.starts_with("ms") {
+            (1_000_000_f64, 2)
+        } else if rest.starts_with('s') {
+            (1_000_000_000_f64, 1)
+        } else if rest.starts_with('m') {
+            (60_000_000_000_f64, 1)
+        } else if rest.starts_with('h') {
+            (3_600_000_000_000_f64, 1)
+        } else {
+            return None; // unrecognised unit
+        };
+        total_ns += value * scale_ns;
+        rest = &rest[unit_len..];
+        saw_segment = true;
+    }
+    if !saw_segment {
+        return None;
+    }
+    let ns = total_ns as i64;
+    Some(if neg { -ns } else { ns })
 }
 
 #[cfg(test)]
@@ -1240,6 +1279,28 @@ mod tests {
         assert_eq!(dur("c"), 250_000);
         assert_eq!(dur("d"), 42);
         assert_eq!(dur("e"), 75_000);
+    }
+
+    #[test]
+    fn parse_timespan_handles_compound_go_durations() {
+        // Single-unit forms (durations < 1 minute).
+        assert_eq!(parse_timespan_ns("277.731738ms"), Some(277_731_738));
+        assert_eq!(parse_timespan_ns("41.5µs"), Some(41_500));
+        assert_eq!(parse_timespan_ns("75us"), Some(75_000));
+        assert_eq!(parse_timespan_ns("27ns"), Some(27));
+        assert_eq!(parse_timespan_ns("3.5s"), Some(3_500_000_000));
+        // Compound forms Go's Duration.String() emits for >= 1 minute.
+        assert_eq!(parse_timespan_ns("90s"), Some(90_000_000_000));
+        assert_eq!(parse_timespan_ns("1m0s"), Some(60_000_000_000));
+        assert_eq!(parse_timespan_ns("2m30s"), Some(150_000_000_000));
+        assert_eq!(
+            parse_timespan_ns("1h2m3.5s"),
+            Some(3_600_000_000_000 + 120_000_000_000 + 3_500_000_000)
+        );
+        // Malformed / unit-less cells degrade to None (caller → 0).
+        assert_eq!(parse_timespan_ns("abc"), None);
+        assert_eq!(parse_timespan_ns(""), None);
+        assert_eq!(parse_timespan_ns("10"), None);
     }
 
     #[test]
