@@ -453,7 +453,7 @@ impl Cache {
         let Some(path) = self.query_path() else {
             return Ok(());
         };
-        atomic_write_text(&path, query)
+        crate::util::atomic::atomic_write_text(&path, query)
     }
 
     /// Persist the buffer's language marker beside the query text.
@@ -466,7 +466,7 @@ impl Cache {
             return Ok(());
         };
         let json = serde_json::json!({ "lang": lang }).to_string();
-        atomic_write_text(&path, &json)
+        crate::util::atomic::atomic_write_text(&path, &json)
     }
 
     /// Path used for the persisted query buffer.
@@ -502,30 +502,7 @@ fn read_data_from_disk(p: &Path) -> Option<CacheData> {
 
 fn atomic_write(path: &Path, data: &CacheData) -> Result<()> {
     let json = serde_json::to_string_pretty(data).context("serializing cache")?;
-    atomic_write_text(path, &json)
-}
-
-fn atomic_write_text(path: &Path, contents: &str) -> Result<()> {
-    use std::io::Write;
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("cache path {:?} has no parent directory", path))?;
-    fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-    // `NamedTempFile::new_in` creates a uniquely-named temp file in the
-    // same directory as the target, so the subsequent `persist` is a
-    // same-filesystem rename (atomic on POSIX). Collisions between
-    // concurrent writers can't happen even if two mcu instances
-    // race — each gets its own temp name.
-    let mut tmp = tempfile::NamedTempFile::new_in(parent)
-        .with_context(|| format!("creating temp file in {}", parent.display()))?;
-    tmp.write_all(contents.as_bytes())
-        .with_context(|| format!("writing {}", tmp.path().display()))?;
-    tmp.as_file()
-        .sync_all()
-        .with_context(|| format!("flushing {}", tmp.path().display()))?;
-    tmp.persist(path)
-        .with_context(|| format!("renaming into {}", path.display()))?;
-    Ok(())
+    crate::util::atomic::atomic_write_text(path, &json)
 }
 
 fn make_edge_route(edge_deployment: Option<&str>, fallback: &str) -> EdgeRoute {
