@@ -149,6 +149,68 @@ fn trace_open_with_explicit_dataset_arg_records_last_trace_dataset() {
 }
 
 #[test]
+fn trace_open_strips_quotes_from_dataset_arg() {
+    // Regression: `dataset='axiom-traces-prod'` (single-quoted, as a
+    // user naturally types APL bracket syntax) must be normalised to
+    // the bare name before it's stashed / built into the APL literal,
+    // otherwise the query becomes `["'axiom-traces-prod'"]` and the
+    // server 500s.
+    let mut app = test_app();
+    app.execute_command("trace abc123 dataset='axiom-traces-prod'");
+    assert_eq!(
+        app.last_trace_dataset.as_deref(),
+        Some("axiom-traces-prod"),
+        "surrounding quotes must be stripped from the dataset arg"
+    );
+}
+
+#[test]
+fn trace_set_dataset_persists_canonical_name() {
+    // `:trace set dataset='axiom-traces-prod'` must store the bare
+    // name so `:trace get` and the fetch path stay quote-free.
+    let mut app = test_app();
+    app.execute_command("trace set dataset='axiom-traces-prod'");
+    assert_eq!(
+        app.settings.read().trace().dataset.as_deref(),
+        Some("axiom-traces-prod")
+    );
+}
+
+#[test]
+fn trace_set_dataset_overrides_sticky_session_value() {
+    // Regression: resolution precedence is arg → last_trace_dataset
+    // → settings, so a stale sticky value used to shadow an explicit
+    // `:trace set dataset=…`. The set must update the sticky value
+    // too, otherwise the change appears to do nothing.
+    let mut app = test_app();
+    app.last_trace_dataset = Some("axiom-traces-prod".to_string());
+    app.execute_command("trace set dataset=axiom-traces-staging");
+    assert_eq!(
+        app.last_trace_dataset.as_deref(),
+        Some("axiom-traces-staging"),
+        "explicit :trace set must win over the sticky session dataset"
+    );
+    assert_eq!(
+        app.settings.read().trace().dataset.as_deref(),
+        Some("axiom-traces-staging")
+    );
+}
+
+#[test]
+fn trace_unset_dataset_clears_sticky_session_value() {
+    // Unsetting the default must also drop the sticky value, so the
+    // next `:trace <id>` falls through to (now-empty) settings.
+    let mut app = test_app();
+    app.settings
+        .write()
+        .set_trace_dataset(Some("axiom-traces-prod".into()));
+    app.last_trace_dataset = Some("axiom-traces-prod".to_string());
+    app.execute_command("trace unset dataset");
+    assert_eq!(app.last_trace_dataset, None);
+    assert_eq!(app.settings.read().trace().dataset, None);
+}
+
+#[test]
 fn trace_open_rejects_unknown_key() {
     let mut app = test_app();
     app.settings.write().set_trace_dataset(Some("ds".into()));
@@ -1738,4 +1800,144 @@ fn enter_on_empty_filter_input_is_a_noop() {
     assert_eq!(v.input_mode, TraceInputMode::Normal);
     // No filter set; status unchanged.
     assert!(v.filter.is_empty());
+}
+
+// ---- Count combinators (vim `10j`) --------------------------------
+
+/// Flat trace of `n` sibling roots, each on its own service so
+/// `gt`-style tests can reuse it too.
+fn flat_view(n: usize) -> TraceView {
+    let rows: Vec<(String, Option<&str>, String, String)> = (0..n)
+        .map(|i| (format!("s{i}"), None, format!("n{i}"), format!("svc{i}")))
+        .collect();
+    // build_view_from_rows wants &str tuples; adapt.
+    let refs: Vec<(&str, Option<&str>, &str, &str)> = rows
+        .iter()
+        .map(|(id, p, name, svc)| (id.as_str(), *p, name.as_str(), svc.as_str()))
+        .collect();
+    build_view_from_rows(&refs)
+}
+
+#[test]
+fn count_prefix_moves_multiple_rows() {
+    let mut app = test_app();
+    app.trace_view = Some(flat_view(20));
+    app.view_mode = ViewMode::Trace;
+    app.focus = Pane::TraceTree;
+    app.last_trace_body_height = 25;
+    // `10j` → cursor on row 10.
+    type_chars(&mut app, "10");
+    app.on_key(key(KeyCode::Char('j')));
+    assert_eq!(app.trace_view.as_ref().unwrap().cursor, 10);
+    // Count must reset: a plain `j` now moves one.
+    app.on_key(key(KeyCode::Char('j')));
+    assert_eq!(app.trace_view.as_ref().unwrap().cursor, 11);
+}
+
+#[test]
+fn count_prefix_with_arrow_key() {
+    let mut app = test_app();
+    app.trace_view = Some(flat_view(20));
+    app.view_mode = ViewMode::Trace;
+    app.focus = Pane::TraceTree;
+    app.last_trace_body_height = 25;
+    type_chars(&mut app, "5");
+    app.on_key(key(KeyCode::Down));
+    assert_eq!(app.trace_view.as_ref().unwrap().cursor, 5);
+}
+
+#[test]
+fn count_prefix_k_moves_up() {
+    let mut app = test_app();
+    app.trace_view = Some(flat_view(20));
+    app.view_mode = ViewMode::Trace;
+    app.focus = Pane::TraceTree;
+    app.last_trace_body_height = 25;
+    if let Some(v) = app.trace_view.as_mut() {
+        v.cursor = 15;
+    }
+    type_chars(&mut app, "10");
+    app.on_key(key(KeyCode::Char('k')));
+    assert_eq!(app.trace_view.as_ref().unwrap().cursor, 5);
+}
+
+#[test]
+fn count_prefix_clamps_at_end() {
+    let mut app = test_app();
+    app.trace_view = Some(flat_view(20));
+    app.view_mode = ViewMode::Trace;
+    app.focus = Pane::TraceTree;
+    app.last_trace_body_height = 25;
+    type_chars(&mut app, "999");
+    app.on_key(key(KeyCode::Char('j')));
+    // Clamped to the last row, no panic.
+    assert_eq!(app.trace_view.as_ref().unwrap().cursor, 19);
+}
+
+#[test]
+fn count_prefix_capital_g_jumps_to_line() {
+    let mut app = test_app();
+    app.trace_view = Some(flat_view(20));
+    app.view_mode = ViewMode::Trace;
+    app.focus = Pane::TraceTree;
+    app.last_trace_body_height = 25;
+    // `3G` → 1-indexed visible line 3 == row index 2.
+    type_chars(&mut app, "3");
+    app.on_key(key(KeyCode::Char('G')));
+    assert_eq!(app.trace_view.as_ref().unwrap().cursor, 2);
+    // Bare `G` still goes to the last row.
+    app.on_key(key(KeyCode::Char('G')));
+    assert_eq!(app.trace_view.as_ref().unwrap().cursor, 19);
+}
+
+#[test]
+fn count_prefix_gg_jumps_to_line() {
+    let mut app = test_app();
+    app.trace_view = Some(flat_view(20));
+    app.view_mode = ViewMode::Trace;
+    app.focus = Pane::TraceTree;
+    app.last_trace_body_height = 25;
+    // `5gg` → line 5 == row index 4. The count must survive the
+    // first `g` of the two-step.
+    type_chars(&mut app, "5");
+    app.on_key(key(KeyCode::Char('g')));
+    app.on_key(key(KeyCode::Char('g')));
+    assert_eq!(app.trace_view.as_ref().unwrap().cursor, 4);
+}
+
+#[test]
+fn lone_zero_is_ignored_as_count() {
+    let mut app = test_app();
+    app.trace_view = Some(flat_view(20));
+    app.view_mode = ViewMode::Trace;
+    app.focus = Pane::TraceTree;
+    app.last_trace_body_height = 25;
+    // A bare `0` isn't a motion / count seed; `j` then moves 1.
+    app.on_key(key(KeyCode::Char('0')));
+    app.on_key(key(KeyCode::Char('j')));
+    assert_eq!(app.trace_view.as_ref().unwrap().cursor, 1);
+}
+
+#[test]
+fn digits_in_filter_mode_are_typed_not_counted() {
+    let mut app = test_app();
+    let mut view = build_view_from_rows(&[
+        ("r", None, "root", "api"),
+        ("c", Some("r"), "code503", "db"),
+    ]);
+    view.model.spans[1]
+        .attributes
+        .insert("http.status_code".into(), serde_json::json!(503));
+    app.trace_view = Some(view);
+    app.view_mode = ViewMode::Trace;
+    app.focus = Pane::TraceTree;
+    app.last_trace_body_height = 10;
+    app.on_key(key(KeyCode::Char('/')));
+    type_chars(&mut app, "503");
+    let v = app.trace_view.as_ref().unwrap();
+    assert_eq!(
+        v.filter, "503",
+        "digits must extend the filter, not a count"
+    );
+    assert_eq!(v.pending_count, None);
 }

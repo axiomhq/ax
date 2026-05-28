@@ -75,6 +75,16 @@ impl App {
                 },
             },
         };
+        // Strip any surrounding quotes the user (or a prior sticky
+        // value) baked into the name. Done here — the single
+        // resolution chokepoint — so the cleaned name flows into both
+        // `pending.dataset` (the APL literal) and the sticky
+        // `last_trace_dataset`, which re-cleans itself on the next
+        // call too. See `helpers::normalize_dataset_name`.
+        let dataset = crate::app::helpers::normalize_dataset_name(&dataset);
+        if dataset.is_empty() {
+            return Err("trace dataset is empty".to_string());
+        }
 
         // ---- Deployment resolution -------------------------------
         //

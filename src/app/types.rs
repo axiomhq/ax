@@ -561,6 +561,12 @@ pub struct TraceView {
     /// `App.table_pending_g` — set true on a bare `z`, consumed
     /// (or cleared) by the very next keypress.
     pub pending_z: bool,
+    /// Vim-style numeric count prefix accumulated across digit
+    /// keystrokes (`10j` → move ten rows). `None` between
+    /// sequences; built up by digit keys and consumed by the next
+    /// motion. Lives on the view because it's trace-mode keystroke
+    /// state, parallel to [`Self::pending_z`].
+    pub pending_count: Option<usize>,
     /// Lazy per-span lowercased "search blob" — one string per
     /// span (indexed by span_idx) covering name, service, every
     /// attribute / resource value, and event names + attribute
@@ -593,6 +599,7 @@ impl TraceView {
             filter: String::new(),
             input_mode: TraceInputMode::Normal,
             pending_z: false,
+            pending_count: None,
             search_blobs: None,
             filter_matches: None,
         }

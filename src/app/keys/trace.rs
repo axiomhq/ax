@@ -41,6 +41,11 @@ use crate::app::ViewMode;
 use crate::app::types::TraceInputMode;
 use crate::trace::{SpanJson, build_search_blob, deepest_visible_ancestor, span_matches_query};
 
+/// Upper bound on the accumulated motion count. A trace never has
+/// anywhere near this many spans; the cap just stops a wedged key
+/// from overflowing `usize` on multiplication.
+const MAX_TRACE_COUNT: usize = 1_000_000;
+
 impl App {
     pub(super) fn handle_trace_key(&mut self, key: KeyEvent) {
         use KeyCode::*;
@@ -67,6 +72,41 @@ impl App {
             return;
         }
 
+        // ---- count prefix (vim `10j`) -------------------------
+        // Digit keys accumulate a numeric count; the next motion
+        // consumes it. A leading `0` isn't a motion in the tree
+        // (no "line 0"), so it's ignored unless it extends an
+        // existing count (`10`). A digit also breaks any pending
+        // `g` / `z` sequence.
+        if let (Char(c), M::NONE) = (key.code, key.modifiers)
+            && c.is_ascii_digit()
+        {
+            let d = (c as u8 - b'0') as usize;
+            let has_count = self
+                .trace_view
+                .as_ref()
+                .is_some_and(|v| v.pending_count.is_some());
+            if d == 0 && !has_count {
+                return;
+            }
+            self.table_pending_g = false;
+            if let Some(v) = self.trace_view.as_mut() {
+                let cur = v.pending_count.unwrap_or(0);
+                v.pending_count = Some((cur.saturating_mul(10) + d).min(MAX_TRACE_COUNT));
+                v.pending_z = false;
+            }
+            return;
+        }
+
+        // Snapshot + consume the count for this (non-digit) key.
+        // The only arm that must keep it across keystrokes is the
+        // `g`-latch setter (so `10gg` works), which restores it.
+        let explicit_count = self.trace_view.as_ref().and_then(|v| v.pending_count);
+        if let Some(v) = self.trace_view.as_mut() {
+            v.pending_count = None;
+        }
+        let count = explicit_count.unwrap_or(1);
+
         // `gg` / `gt` / `gT` two-step. Any non-`g`-prefixed key
         // clears the latch the same way the legend / table panes do.
         let was_pending_g = self.table_pending_g;
@@ -78,24 +118,40 @@ impl App {
             v.pending_z = false;
         }
 
+        let count_i = count.min(i32::MAX as usize) as i32;
         match (key.code, key.modifiers) {
             (Esc, _) => self.exit_trace_view(),
             (Char(':'), _) => self.prefill_command(""),
             (Char('?'), _) => self.open_help(),
-            (Char('j'), M::NONE) | (Down, _) => self.move_trace_cursor(1),
-            (Char('k'), M::NONE) | (Up, _) => self.move_trace_cursor(-1),
-            (Char('g'), M::NONE) if was_pending_g => self.set_trace_cursor_first_visible(),
-            (Char('g'), M::NONE) => self.table_pending_g = true,
+            (Char('j'), M::NONE) | (Down, _) => self.move_trace_cursor(count_i),
+            (Char('k'), M::NONE) | (Up, _) => self.move_trace_cursor(-count_i),
+            // `{n}gg` jumps to visible line `n` (1-indexed); bare
+            // `gg` to the first row.
+            (Char('g'), M::NONE) if was_pending_g => match explicit_count {
+                Some(n) => self.set_trace_cursor_line(n),
+                None => self.set_trace_cursor_first_visible(),
+            },
+            (Char('g'), M::NONE) => {
+                self.table_pending_g = true;
+                // Preserve the count so `10gg` reaches line 10.
+                if let Some(v) = self.trace_view.as_mut() {
+                    v.pending_count = explicit_count;
+                }
+            }
             (Char('t'), M::NONE) if was_pending_g => self.jump_service(1),
             (Char('T'), _) if was_pending_g => self.jump_service(-1),
-            (Char('G'), _) => self.set_trace_cursor_last_visible(),
+            // `{n}G` jumps to visible line `n`; bare `G` to the last.
+            (Char('G'), _) => match explicit_count {
+                Some(n) => self.set_trace_cursor_line(n),
+                None => self.set_trace_cursor_last_visible(),
+            },
             (Char('d'), M::CONTROL) => {
                 let step = (self.trace_visible_height() as i32 / 2).max(1);
-                self.move_trace_cursor(step);
+                self.move_trace_cursor(step.saturating_mul(count_i));
             }
             (Char('u'), M::CONTROL) => {
                 let step = (self.trace_visible_height() as i32 / 2).max(1);
-                self.move_trace_cursor(-step);
+                self.move_trace_cursor(-step.saturating_mul(count_i));
             }
 
             // ---- Folds ----
@@ -264,6 +320,28 @@ impl App {
         } else {
             0
         };
+    }
+
+    /// Jump to 1-indexed visible line `line` (vim `{n}G` / `{n}gg`),
+    /// clamped to the last visible row. Operates in visible-row
+    /// space so folds / filters don't throw the numbering off.
+    fn set_trace_cursor_line(&mut self, line: usize) {
+        let view = self.trace_view.as_ref().expect("guarded by caller");
+        let visible = view.visible_rows();
+        if visible.is_empty() {
+            return;
+        }
+        let vis_idx = line.saturating_sub(1).min(visible.len() - 1);
+        let tree = visible[vis_idx];
+        let visible_h = self.trace_visible_height() as usize;
+        let view = self.trace_view.as_mut().expect("guarded by caller");
+        view.cursor = tree;
+        let scroll = view.scroll as usize;
+        if vis_idx < scroll {
+            view.scroll = vis_idx as u16;
+        } else if visible_h > 0 && vis_idx >= scroll + visible_h {
+            view.scroll = (vis_idx + 1).saturating_sub(visible_h) as u16;
+        }
     }
 
     // ============================================================

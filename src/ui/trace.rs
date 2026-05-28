@@ -41,7 +41,13 @@ use crate::trace::{Span as TraceSpan, SpanEvent, TreeRow};
 const DETAIL_MIN_COLS: u16 = 20;
 const TREE_DEFAULT_PCT: u16 = 65;
 const DUR_COL_WIDTH: u16 = 9;
-const BAR_COL_WIDTH: u16 = 18;
+// The waterfall bar is no longer a fixed width — it claims whatever
+// space is left after the (capped) label column and the duration
+// column, so the timeline is as wide as the pane allows. The label
+// column is capped so a wide terminal grows the *bar*, not the name
+// column, and floored so names stay readable on narrow ones.
+const LABEL_MAX_COLS: usize = 48;
+const LABEL_MIN_COLS: usize = 12;
 
 /// Entry point — called by `src/ui/mod.rs` when
 /// `app.view_mode == ViewMode::Trace`.
@@ -344,10 +350,9 @@ fn draw_filter_prompt(f: &mut Frame, area: Rect, view: &TraceView) {
 /// Compose one span row:
 /// `<indent>▸ [<svc>] <name>  <bar>  <duration>`
 ///
-/// Layout reservations (right-to-left, in cells):
-/// * `DUR_COL_WIDTH` for the duration column.
-/// * `BAR_COL_WIDTH` for the waterfall bar.
-/// * Remainder for indent + marker + service tag + name.
+/// Layout (left-to-right): a capped label column, a single space,
+/// the waterfall bar (claims the remaining width), a single space,
+/// then the right-aligned `DUR_COL_WIDTH` duration column.
 #[allow(clippy::too_many_arguments)]
 fn build_tree_row(
     span: &TraceSpan,
@@ -378,15 +383,20 @@ fn build_tree_row(
     let label_text = format!("{indent}{marker}[{service}] {name}");
     let dur_text = humanize_duration_ns(span.duration_ns);
 
-    // Cell budget for the label segment.
-    let reserved = DUR_COL_WIDTH as usize + BAR_COL_WIDTH as usize + 2; // 2 spaces between cols
-    let label_budget = width.saturating_sub(reserved);
+    // Column budget: `<label> <bar> <dur>` with a single space
+    // between each. The label is capped (so wide terminals grow the
+    // bar, not the name) and floored (so it stays legible); the bar
+    // takes everything left over.
+    let avail = width.saturating_sub(DUR_COL_WIDTH as usize + 2);
+    let label_budget = (avail * 2 / 5).clamp(LABEL_MIN_COLS.min(avail), LABEL_MAX_COLS);
+    let bar_cells = avail.saturating_sub(label_budget).min(u16::MAX as usize) as u16;
     let label_display = truncate_for_display(&label_text, label_budget);
     let label_pad = label_budget.saturating_sub(visual_width(&label_display));
 
-    // Bar geometry: project the span onto BAR_COL_WIDTH cells.
-    let (bar_off, bar_w) = bar_extent(span.start_ns, span.end_ns, t0, t1, BAR_COL_WIDTH);
-    let bar_string = render_bar(bar_off, bar_w, BAR_COL_WIDTH);
+    // Bar geometry: project the span onto `bar_cells` cells at
+    // 1/8-cell resolution on the trailing edge.
+    let (start_e, end_e) = bar_eighths(span.start_ns, span.end_ns, t0, t1, bar_cells);
+    let bar_string = render_bar_string(start_e, end_e, bar_cells);
 
     // Style resolution.
     let row_style = if selected && focused {
@@ -439,59 +449,81 @@ fn build_tree_row(
     Line::from(spans)
 }
 
-/// Bar projection. Returns `(col_offset, col_width)` within the
-/// `bar_width`-cell column, with these guarantees:
+/// Project a span's `[start_ns, end_ns]` onto a `bar_cells`-wide
+/// column at **1/8-cell** resolution, returning `(start_eighth,
+/// end_eighth)` with `0 <= start_e <= end_e <= bar_cells * 8`.
 ///
-/// * Inputs that produce a non-zero pixel width are clamped to
-///   `>= 1` so non-degenerate spans always render *something*.
-/// * Inputs with `total <= 0` (degenerate trace) produce a single
-///   1-cell tick at offset 0.
-/// * `end_ns < start_ns` (skew anomaly) folds to `(0, 0)` —
-///   nothing to render is correct.
-/// * Right-edge overflow (`end_ns > t1`) is clamped to
-///   `bar_width`.
-pub(crate) fn bar_extent(
+/// The leading edge is floored to a whole cell: terminal block
+/// glyphs fill from the left, so a left-anchored fill renders as a
+/// clean solid bar without reverse-video tricks (which break on
+/// unknown terminal backgrounds). The *trailing* edge keeps 1/8
+/// precision — with the bar now claiming most of the pane width,
+/// the cell-aligned start is a sub-2% positional error while the
+/// duration reads precisely.
+///
+/// Guarantees:
+/// * `bar_cells == 0` or `end_ns < start_ns` (skew) → `(0, 0)`.
+/// * Degenerate trace (`t0 == t1`) → `(0, 1)` (a 1/8 tick).
+/// * Any non-degenerate span yields `end_e - start_e >= 1` so a
+///   sub-cell span still shows a 1/8 tick rather than vanishing.
+/// * `end_ns > t1` (clock skew) clamps to `bar_cells * 8`.
+pub(crate) fn bar_eighths(
     start_ns: i64,
     end_ns: i64,
     t0: i64,
     t1: i64,
-    bar_width: u16,
-) -> (u16, u16) {
-    if bar_width == 0 || end_ns < start_ns {
+    bar_cells: u16,
+) -> (u32, u32) {
+    if bar_cells == 0 || end_ns < start_ns {
         return (0, 0);
     }
+    let total_e = bar_cells as i64 * 8;
     let total = (t1.saturating_sub(t0)).max(0);
     if total == 0 {
-        // Degenerate trace duration — render a tick mark at 0.
+        // Degenerate trace duration — a single 1/8 tick at the start.
         return (0, 1);
     }
-    let bw = bar_width as f64;
+    let total_f = total as f64;
     let s_rel = (start_ns.saturating_sub(t0)).max(0) as f64;
     let e_rel = (end_ns.saturating_sub(t0)).max(0) as f64;
-    let total_f = total as f64;
-    let off = (s_rel / total_f * bw).floor() as i64;
-    let end = (e_rel / total_f * bw).ceil() as i64;
-    let off = off.clamp(0, bar_width as i64) as u16;
-    let end_c = end.clamp(0, bar_width as i64) as u16;
-    let mut w = end_c.saturating_sub(off);
-    if w == 0 && off < bar_width {
-        // Sub-cell width — give the row a 1-cell tick.
-        w = 1;
+    // Floor the start to a whole cell, capped at the last cell so
+    // there's always room for at least a 1/8 tick.
+    let start_cell = (s_rel / total_f * bar_cells as f64)
+        .floor()
+        .clamp(0.0, (bar_cells - 1) as f64) as i64;
+    let start_e = start_cell * 8;
+    // Round the end to the nearest 1/8, clamped into the column.
+    let mut end_e = (e_rel / total_f * total_e as f64).round() as i64;
+    end_e = end_e.clamp(start_e, total_e);
+    if end_e <= start_e {
+        end_e = start_e + 1; // guarantee a visible tick
     }
-    (off, w)
+    (start_e as u32, end_e as u32)
 }
 
-/// Materialise the bar cells. We use the half-block characters to
-/// hint at sub-cell precision without going full braille (which
-/// renders poorly on many terminal fonts).
-fn render_bar(offset: u16, width: u16, total: u16) -> String {
-    let mut out = String::with_capacity(total as usize);
-    for i in 0..total {
-        if i >= offset && i < offset + width {
-            out.push('█');
-        } else {
+/// Render the bar as a solid run of block glyphs. Because the start
+/// is cell-aligned, every filled cell is a left-anchored fill: a
+/// full `█` for interior cells and a left-eighth block
+/// (`▏▎▍▌▋▊▉`) for the trailing partial cell. Empty cells are
+/// spaces. One colour throughout — the caller styles the whole
+/// string.
+fn render_bar_string(start_e: u32, end_e: u32, bar_cells: u16) -> String {
+    // Index `n-1` → a cell filled `n` eighths from the left.
+    const EIGHTHS: [char; 8] = ['▏', '▎', '▍', '▌', '▋', '▊', '▉', '█'];
+    let mut out = String::with_capacity(bar_cells as usize);
+    for i in 0..bar_cells as u32 {
+        let c0 = i * 8;
+        let lo = start_e.max(c0);
+        let hi = end_e.min(c0 + 8);
+        if hi <= lo {
             out.push(' ');
+            continue;
         }
+        // Start is cell-aligned, so `lo == c0` for every filled
+        // cell — the fill is always left-anchored. `hi - c0` is the
+        // eighths filled in this cell (1..=8).
+        let filled = (hi - c0).clamp(1, 8) as usize;
+        out.push(EIGHTHS[filled - 1]);
     }
     out
 }
@@ -835,75 +867,73 @@ mod tests {
     }
 
     #[test]
-    fn bar_extent_full_span_covers_column() {
-        let (o, w) = bar_extent(0, 100, 0, 100, 20);
-        assert_eq!(o, 0);
-        assert_eq!(w, 20);
+    fn bar_eighths_full_span_covers_column() {
+        // Whole trace → fills all 20 cells = 160 eighths.
+        assert_eq!(bar_eighths(0, 100, 0, 100, 20), (0, 160));
     }
 
     #[test]
-    fn bar_extent_mid_half() {
-        let (o, w) = bar_extent(25, 75, 0, 100, 20);
-        // 25/100 * 20 = 5; 75/100 * 20 = 15 → width 10.
-        assert_eq!(o, 5);
-        assert_eq!(w, 10);
+    fn bar_eighths_mid_half() {
+        // start 25% floors to cell 5 (eighth 40); end 75% → eighth 120.
+        assert_eq!(bar_eighths(25, 75, 0, 100, 20), (40, 120));
     }
 
     #[test]
-    fn bar_extent_at_t0() {
-        let (o, w) = bar_extent(0, 10, 0, 100, 20);
-        assert_eq!(o, 0);
-        assert!(w >= 1, "non-zero span must produce a visible cell");
+    fn bar_eighths_at_t0() {
+        let (s, e) = bar_eighths(0, 10, 0, 100, 20);
+        assert_eq!(s, 0);
+        assert!(e >= 1, "non-zero span must produce a visible tick");
     }
 
     #[test]
-    fn bar_extent_at_t1() {
-        let (o, w) = bar_extent(90, 100, 0, 100, 20);
-        assert_eq!(o + w, 20, "right edge clamps to bar width");
+    fn bar_eighths_at_t1() {
+        // 90%..100% → start floors to cell 18 (eighth 144), end 160.
+        let (s, e) = bar_eighths(90, 100, 0, 100, 20);
+        assert_eq!(s, 144);
+        assert_eq!(e, 160, "right edge clamps to bar_cells*8");
     }
 
     #[test]
-    fn bar_extent_zero_duration_span() {
-        let (o, w) = bar_extent(50, 50, 0, 100, 20);
-        // start == end, but it lies inside the bar → 1-cell tick.
-        assert_eq!(w, 1);
-        assert_eq!(o, 10);
+    fn bar_eighths_zero_duration_span() {
+        // start == end mid-trace: start floors to its cell, end gets
+        // a guaranteed 1/8 tick beyond it.
+        let (s, e) = bar_eighths(50, 50, 0, 100, 20);
+        assert_eq!(s, 80); // cell 10
+        assert_eq!(e, 81); // +1 eighth tick
     }
 
     #[test]
-    fn bar_extent_sub_cell_width() {
-        // 1ns out of 1e9: pixel width < 1, should round up to 1.
-        let (_, w) = bar_extent(100, 101, 0, 1_000_000_000, 20);
-        assert_eq!(w, 1);
+    fn bar_eighths_sub_cell_rounds_to_tick() {
+        // 1ns out of 1e9 across 20 cells: end rounds to 0 eighths,
+        // bumped to a 1/8 tick.
+        let (s, e) = bar_eighths(100, 101, 0, 1_000_000_000, 20);
+        assert_eq!((s, e), (0, 1));
     }
 
     #[test]
-    fn bar_extent_degenerate_total() {
-        // t0 == t1 (degenerate trace duration) — single tick.
-        let (o, w) = bar_extent(0, 0, 100, 100, 20);
-        assert_eq!((o, w), (0, 1));
+    fn bar_eighths_degenerate_total() {
+        // t0 == t1 — single 1/8 tick.
+        assert_eq!(bar_eighths(0, 0, 100, 100, 20), (0, 1));
     }
 
     #[test]
-    fn bar_extent_zero_bar_width() {
+    fn bar_eighths_zero_bar_width() {
         // Tiny terminal: no bar column at all.
-        let (o, w) = bar_extent(0, 100, 0, 100, 0);
-        assert_eq!((o, w), (0, 0));
+        assert_eq!(bar_eighths(0, 100, 0, 100, 0), (0, 0));
     }
 
     #[test]
-    fn bar_extent_inverted_bounds_collapse() {
+    fn bar_eighths_inverted_bounds_collapse() {
         // end_ns < start_ns is anomalous; expect (0, 0).
-        let (o, w) = bar_extent(100, 50, 0, 200, 20);
-        assert_eq!((o, w), (0, 0));
+        assert_eq!(bar_eighths(100, 50, 0, 200, 20), (0, 0));
     }
 
     #[test]
-    fn bar_extent_overflow_t1_clamps() {
-        // Caller may pass end_ns > t1 from clock skew; helper
-        // trusts t1 as the right edge.
-        let (o, w) = bar_extent(0, 200, 0, 100, 20);
-        assert_eq!(o + w, 20);
+    fn bar_eighths_overflow_t1_clamps() {
+        // Caller may pass end_ns > t1 from clock skew; helper trusts
+        // t1 as the right edge.
+        let (_, e) = bar_eighths(0, 200, 0, 100, 20);
+        assert_eq!(e, 160);
     }
 
     #[test]
@@ -932,9 +962,29 @@ mod tests {
     }
 
     #[test]
-    fn render_bar_only_paints_inside_window() {
-        let s = render_bar(2, 3, 8);
-        assert_eq!(s, "  ███   ");
+    fn render_bar_string_full_run() {
+        assert_eq!(render_bar_string(0, 24, 3), "███");
+    }
+
+    #[test]
+    fn render_bar_string_offset_and_gap() {
+        // Empty cell 0, full cell 1, empty cell 2.
+        assert_eq!(render_bar_string(8, 16, 3), " █ ");
+    }
+
+    #[test]
+    fn render_bar_string_trailing_partial() {
+        // One cell filled 4/8 → the 4-eighth left block.
+        assert_eq!(render_bar_string(0, 4, 1), "▌");
+        // 1/8 tick → the thinnest left block.
+        assert_eq!(render_bar_string(0, 1, 1), "▏");
+        // Two full cells + a 3/8 trailing partial.
+        assert_eq!(render_bar_string(0, 19, 3), "██▍");
+    }
+
+    #[test]
+    fn render_bar_string_empty_when_no_fill() {
+        assert_eq!(render_bar_string(0, 0, 3), "   ");
     }
 
     #[test]

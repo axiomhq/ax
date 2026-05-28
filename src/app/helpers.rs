@@ -351,6 +351,37 @@ pub fn resolve_unit(
 /// configure for the `_v1_datasets` endpoint in `axiom.rs`.
 const QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Normalise a user-supplied dataset name into the bare name we feed
+/// into APL's bracket-quote literal (`["name"]`).
+///
+/// APL accepts both `['name']` and `["name"]`, so users naturally
+/// type the dataset *with* quotes (e.g. `:trace <id>
+/// dataset='axiom-traces-prod'`). If we then wrap that value in our
+/// own `serde_json`-escaped bracket literal we get a double-quoted
+/// mess (`["'axiom-traces-prod'"]`) that the server rejects with a
+/// 500. Stripping one matching layer of surrounding single or double
+/// quotes (plus surrounding whitespace) makes the name canonical no
+/// matter how it arrived — CLI arg, `:trace set`, or the sticky
+/// in-session value.
+///
+/// Only a *single* matched pair is removed, and only when the inner
+/// content is non-empty, so a legitimately quote-free name passes
+/// through untouched and a pathological `""` doesn't collapse to a
+/// surprising empty string.
+pub(super) fn normalize_dataset_name(raw: &str) -> String {
+    let s = raw.trim();
+    for q in ['\'', '"'] {
+        if let Some(inner) = s
+            .strip_prefix(q)
+            .and_then(|r| r.strip_suffix(q))
+            .filter(|inner| !inner.is_empty())
+        {
+            return inner.to_string();
+        }
+    }
+    s.to_string()
+}
+
 /// Execute an APL query through the control-plane client, with the
 /// same wall-clock cap as [`run_query_task`]. No dataset / edge
 /// resolution — APL routes through
@@ -583,6 +614,45 @@ pub(super) fn demo_series() -> Vec<Series> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_dataset_strips_one_quote_layer() {
+        // The bug: a single-quoted name double-wrapped into
+        // `["'name'"]`. After normalisation it's the bare name.
+        assert_eq!(
+            normalize_dataset_name("'axiom-traces-prod'"),
+            "axiom-traces-prod"
+        );
+        assert_eq!(
+            normalize_dataset_name("\"axiom-traces-prod\""),
+            "axiom-traces-prod"
+        );
+        // Already-clean names pass through.
+        assert_eq!(
+            normalize_dataset_name("axiom-traces-prod"),
+            "axiom-traces-prod"
+        );
+        // Surrounding whitespace trimmed.
+        assert_eq!(normalize_dataset_name("  'ds'  "), "ds");
+        // Only one layer removed (nested quoting is unusual but we
+        // don't recurse — the inner pair survives).
+        assert_eq!(normalize_dataset_name("''ds''"), "'ds'");
+        // A lone quote char isn't a matched pair — left alone.
+        assert_eq!(normalize_dataset_name("ds'"), "ds'");
+        // Empty inner content doesn't collapse to "".
+        assert_eq!(normalize_dataset_name("''"), "''");
+        assert_eq!(normalize_dataset_name("\"\""), "\"\"");
+    }
+
+    #[test]
+    fn normalized_dataset_produces_single_quoted_apl_literal() {
+        // Regression for the trace-fetch 500: the bracket literal must
+        // wrap the bare name exactly once, not `["'name'"]`.
+        let clean = normalize_dataset_name("'axiom-traces-prod'");
+        let lit = serde_json::to_string(&clean).unwrap();
+        assert_eq!(lit, "\"axiom-traces-prod\"");
+        assert_eq!(format!("[{lit}]"), "[\"axiom-traces-prod\"]");
+    }
 
     #[test]
     fn humanize_time_range_relative_with_now_end() {

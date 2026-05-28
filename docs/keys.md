@@ -120,9 +120,11 @@ Esc	back to editor
 Left pane (tree+waterfall) bindings:
 j / Down	move cursor to next visible span
 k / Up		move cursor to previous visible span
+{n}j / {n}k	move n visible rows (count prefix, e.g. 10j)
 gg		jump to first visible span
 G		jump to last visible span
-Ctrl-d / Ctrl-u	half-page step down / up
+{n}G / {n}gg	jump to visible line n (1-indexed)
+Ctrl-d / Ctrl-u	half-page step down / up ({n} multiplies)
 h / Left	collapse subtree under cursor (▾ marker)
 l / Right	expand subtree under cursor (▸ marker)
 zM		collapse every parent (cursor snaps up to a visible ancestor)

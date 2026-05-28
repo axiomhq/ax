@@ -647,7 +647,16 @@ impl App {
                     return;
                 }
             };
-            staged.push((key, v.trim().to_string()));
+            // Canonicalise the dataset name so a quoted value
+            // (`dataset='axiom-traces-prod'`) doesn't get persisted
+            // with quotes and later double-wrapped into the APL
+            // literal. Deployment is a config key, never an APL
+            // literal, so it's left verbatim.
+            let value = match key {
+                TraceKey::Dataset => crate::app::helpers::normalize_dataset_name(v),
+                _ => v.trim().to_string(),
+            };
+            staged.push((key, value));
         }
         // Apply staged updates in order; later pairs win on dup keys.
         // Stage the save result before re-borrowing `self` for
@@ -664,6 +673,15 @@ impl App {
             // disk write failed they should retry. Surface the error.
             self.set_error(format!(":trace set: save failed: {e}"));
             return;
+        }
+        // Sync the sticky in-session dataset to an explicit set so it
+        // takes effect immediately. Resolution precedence is arg →
+        // `last_trace_dataset` → settings; without this, a stale
+        // sticky value (left by an earlier `:trace <id>`) would keep
+        // shadowing the new default and `:trace set dataset=…` would
+        // appear to do nothing. Last write wins on duplicate keys.
+        if let Some((_, value)) = staged.iter().rev().find(|(k, _)| *k == TraceKey::Dataset) {
+            self.last_trace_dataset = Some(value.clone());
         }
         self.cmd_trace_get(&[]);
     }
@@ -712,6 +730,13 @@ impl App {
         if let Err(e) = save_result {
             self.set_error(format!(":trace unset: save failed: {e}"));
             return;
+        }
+        // Drop the sticky dataset when the default is unset, so the
+        // next `:trace <id>` falls through to settings (now empty)
+        // and surfaces the "no trace dataset" error instead of
+        // silently reusing the cleared value.
+        if staged.contains(&TraceKey::Dataset) {
+            self.last_trace_dataset = None;
         }
         self.cmd_trace_get(&[]);
     }
